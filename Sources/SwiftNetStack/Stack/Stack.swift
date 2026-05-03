@@ -1,0 +1,440 @@
+import Foundation
+import Darwin
+
+// MARK: - Stack Config
+
+public struct StackConfig {
+    public var socketPath: String = "/tmp/bdp-stack.sock"
+    public var gatewayMAC: Data = Data([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee])
+    public var gatewayIP: UInt32 = ipToUInt32("192.168.65.1")
+    public var subnetCIDR: String = "192.168.65.0/24"
+    public var mtu: Int = 1500
+    public var bpt: TimeInterval = 0.001
+    public var tcpBufSize: Int = 64 * 1024
+    public var portForwards: [ForwarderMapping] = []
+    public var debug: Bool = false
+
+    public init() {}
+    public static func defaultConfig() -> StackConfig { StackConfig() }
+}
+
+// MARK: - Stack
+
+public final class Stack {
+    let cfg: StackConfig
+    var conn: VZDebugConn?
+    let arp: ARPResolver
+    let tcpState: TCPState
+    let udpMux: UDPMux
+    let dhcpSrv: DHCPServer
+    let dnsProxy: DNSProxy
+    let natTable: NATTable
+    var fwd: Forwarder?
+    var icmpFwd: ICMPForwarder?
+    let udpNAT: UDPNATTable
+
+    public var bytesIn: UInt64 = 0
+    public var bytesOut: UInt64 = 0
+
+    public init(cfg: StackConfig, tcpState: TCPState) {
+        self.cfg = cfg
+        self.arp = ARPResolver()
+        self.tcpState = tcpState
+        self.udpMux = UDPMux()
+        self.natTable = NATTable()
+        self.udpNAT = UDPNATTable()
+
+        // DHCP
+        let dhcpCfg = DHCPServerConfig(
+            gatewayIP: cfg.gatewayIP,
+            subnetMask: ipToUInt32("255.255.255.0"),
+            dnsIP: cfg.gatewayIP,
+            domainName: "bdp.local",
+            poolStart: ipToUInt32("192.168.65.2"),
+            poolSize: 50
+        )
+        self.dhcpSrv = DHCPServer(cfg: dhcpCfg)
+        udpMux.register(port: serverPort, handler: dhcpSrv.handler())
+
+        // DNS Proxy
+        self.dnsProxy = DNSProxy(listenIP: cfg.gatewayIP, upstreamAddr: "")
+        udpMux.register(port: dnsPort, handler: dnsProxy.handler())
+
+        // Port forwarding
+        if !cfg.portForwards.isEmpty {
+            self.fwd = Forwarder(gatewayIP: cfg.gatewayIP, mappings: cfg.portForwards)
+            // Set DHCP lease callback for ARP learning
+            dhcpSrv.onLease = { [weak self] clientIP, clientMAC in
+                let macData = Data([clientMAC.b0, clientMAC.b1, clientMAC.b2,
+                                    clientMAC.b3, clientMAC.b4, clientMAC.b5])
+                self?.arp.set(ip: clientIP, mac: macData)
+            }
+        }
+
+        // ICMP forwarder
+        self.icmpFwd = ICMPForwarder()
+
+        // ARP: static gateway entry
+        arp.set(ip: cfg.gatewayIP, mac: cfg.gatewayMAC)
+
+        // TCP write callback
+        tcpState.setWriteFunc { [weak self] seg in
+            return self?.sendSegment(seg)
+        }
+    }
+
+    // MARK: - Connection
+
+    public func setConn(_ conn: VZDebugConn) {
+        self.conn = conn
+    }
+
+    // MARK: - Run
+
+    public func run() throws {
+        if self.conn == nil && !cfg.socketPath.isEmpty {
+            guard let conn = VZDebugConn.listen(socketPath: cfg.socketPath) else {
+                throw NSError(domain: "Stack", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Failed to listen on \(cfg.socketPath)"])
+            }
+            self.conn = conn
+        }
+
+        let interval = cfg.bpt
+        var tickCount = 0
+
+        while true {
+            let now = Date()
+            tickCount += 1
+            deliberate(now: now)
+            // Sleep for the remainder of the BPT interval
+            let elapsed = Date().timeIntervalSince(now)
+            let remaining = interval - elapsed
+            if remaining > 0 {
+                Thread.sleep(forTimeInterval: remaining)
+            }
+        }
+    }
+
+    // MARK: - Deliberate
+
+    public func deliberate(now: Date) {
+        // Phase 1: Read all available Ethernet frames
+        if let conn = conn {
+            let frames = conn.readAllFrames()
+            for frame in frames {
+                bytesIn += UInt64(frame.payload.count)
+                processFrame(frame)
+            }
+        }
+
+        // Phase 1.5: Pre-process ACKs
+        tcpState.preProcessACKs()
+
+        // Phase 2: Forwarder accept + poll
+        if let fwd = fwd {
+            fwd.pollAccept(tcpState: tcpState)
+            fwd.poll()
+        }
+
+        // Phase 3: NAT poll
+        natTable.poll()
+
+        // Phase 4: UDP NAT poll
+        udpNAT.poll()
+
+        // Phase 5: TCP deliberation
+        tcpState.deliberate(now: now)
+
+        // Phase 6: ICMP forwarder poll
+        if let icmpFwd = icmpFwd {
+            icmpFwd.poll()
+            icmpFwd.cleanup(timeout: 30)
+        }
+
+        // Phase 7: Forwarder proxy VM→Host
+        fwd?.proxyVMToHost()
+
+        // Phase 8: NAT proxy VM→Host
+        natTable.proxyVMToHost()
+
+        // Phase 9: UDP NAT flush egress
+        udpNAT.flushEgress()
+
+        // Phase 10: DNS poll
+        dnsProxy.poll()
+
+        // Phase 11: Write DNS responses
+        for dg in dnsProxy.consumeResponses() {
+            sendDatagram(dg)
+        }
+
+        // Phase 12: Write remaining TCP outputs (should be empty with writeFunc)
+        for seg in tcpState.consumeOutputs() {
+            if let err = sendSegment(seg) {
+                if (err as NSError).domain == NSPOSIXErrorDomain &&
+                    (err as NSError).code == Int(ENOBUFS) {
+                    break
+                }
+            }
+        }
+
+        // Phase 13: Write outgoing UDP datagrams
+        for dg in udpMux.consumeOutputs() {
+            sendDatagram(dg)
+        }
+
+        // Phase 14: Write ICMP replies
+        if let icmpFwd = icmpFwd {
+            for reply in icmpFwd.consumeReplies() {
+                sendICMPReply(reply)
+            }
+        }
+
+        // Phase 15: UDP NAT deliver to VM
+        for dg in udpNAT.deliverToVM() {
+            sendDatagram(dg)
+        }
+
+        // Phase 16: Forwarder cleanup
+        fwd?.cleanup()
+
+        // Phase 17: NAT cleanup
+        natTable.cleanup()
+
+        // Phase 18: UDP NAT cleanup
+        udpNAT.cleanup(now: now)
+
+        FlowStats.global.printIfDue()
+    }
+
+    // MARK: - Frame Processing
+
+    func processFrame(_ frame: Frame) {
+        switch frame.etherType {
+        case etherTypeARP:
+            processARP(frame)
+        case etherTypeIPv4:
+            processIPv4(frame)
+        default:
+            break
+        }
+    }
+
+    func processARP(_ frame: Frame) {
+        guard let arpPkt = ARPPacket.parse([UInt8](frame.payload)) else { return }
+
+        // Learn sender's MAC
+        arp.set(ip: ipFromData(arpPkt.senderIP), mac: arpPkt.senderMAC)
+
+        // Reply to ARP requests for our gateway IP
+        if arpPkt.operation == arpRequest && ipFromData(arpPkt.targetIP) == cfg.gatewayIP {
+            let reply = buildARPReply(
+                senderMAC: cfg.gatewayMAC, senderIP: ipData(from: cfg.gatewayIP),
+                targetMAC: arpPkt.senderMAC, targetIP: arpPkt.senderIP
+            )
+            let outFrame = Frame(
+                dstMAC: arpPkt.senderMAC, srcMAC: cfg.gatewayMAC,
+                etherType: etherTypeARP, payload: Data(reply.serialize())
+            )
+            if let err = conn?.write(frame: outFrame) {
+                NSLog("write ARP reply: %@", err.localizedDescription)
+            }
+            bytesOut += UInt64(outFrame.payload.count)
+        }
+    }
+
+    func processIPv4(_ frame: Frame) {
+        guard let pkt = IPv4Packet.parse([UInt8](frame.payload)) else { return }
+
+        // Learn source IP→MAC
+        arp.set(ip: pkt.srcIP, mac: frame.srcMAC)
+
+        // TCP to external IPs → NAT
+        if pkt.protocol == protocolTCP && !pkt.isForUs(cfg.gatewayIP) {
+            processNAT(frame, pkt)
+            return
+        }
+
+        // ICMP to external IPs → forwarder
+        if pkt.protocol == protocolICMP && !pkt.isForUs(cfg.gatewayIP) {
+            processICMPForward(frame, pkt)
+            return
+        }
+
+        // UDP to external IPs → UDP NAT
+        if pkt.protocol == protocolUDP && !pkt.isForUs(cfg.gatewayIP) {
+            processUDPNAT(frame, pkt)
+            return
+        }
+
+        guard pkt.isForUs(cfg.gatewayIP) else { return }
+
+        switch pkt.protocol {
+        case protocolICMP:
+            processICMP(frame, pkt)
+        case protocolTCP:
+            processTCP(frame, pkt)
+        case protocolUDP:
+            processUDP(frame, pkt)
+        default:
+            break
+        }
+    }
+
+    // MARK: - Protocol Handlers
+
+    func processICMP(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let icmp = ICMPPacket.parse(pkt.payload) else { return }
+        guard icmp.type == icmpTypeEchoRequest else { return }
+
+        let reply = buildEchoReply(icmp)
+        let ipReply = IPv4Packet(
+            version: 4, ihl: 20, tos: 0, totalLen: 0, id: pkt.id,
+            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
+            checksum: 0, srcIP: pkt.dstIP, dstIP: pkt.srcIP,
+            payload: reply.serialize()
+        )
+        _ = writeIPv4Packet(dstMAC: frame.srcMAC, pkt: ipReply)
+    }
+
+    func processICMPForward(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let icmpFwd = icmpFwd else { return }
+        guard let icmpPkt = ICMPPacket.parse(pkt.payload) else { return }
+        guard icmpPkt.type == icmpTypeEchoRequest else { return }
+
+        let id = UInt16(icmpPkt.restHdr >> 16)
+        let seq = UInt16(icmpPkt.restHdr & 0xFFFF)
+        icmpFwd.forward(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
+                        id: id, seq: seq, payload: icmpPkt.payload)
+    }
+
+    func processUDPNAT(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let (hdr, payload) = parseUDP(pkt.payload) else { return }
+        let dg = UDPDatagram(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
+                             srcPort: hdr.srcPort, dstPort: hdr.dstPort,
+                             payload: payload)
+        _ = udpNAT.intercept(dg)
+    }
+
+    func processTCP(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let seg = TCPSegment.parse(pkt.payload, srcIP: pkt.srcIP, dstIP: pkt.dstIP) else { return }
+        tcpState.injectSegment(seg)
+    }
+
+    func processUDP(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let (hdr, payload) = parseUDP(pkt.payload) else { return }
+        let dg = UDPDatagram(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
+                             srcPort: hdr.srcPort, dstPort: hdr.dstPort,
+                             payload: payload)
+        udpMux.deliver(dg)
+    }
+
+    func processNAT(_ frame: Frame, _ pkt: IPv4Packet) {
+        guard let seg = TCPSegment.parse(pkt.payload, srcIP: pkt.srcIP, dstIP: pkt.dstIP) else { return }
+        _ = natTable.intercept(seg, tcpState: tcpState)
+    }
+
+    // MARK: - Output Helpers
+
+    func sendSegment(_ seg: TCPSegment) -> Error? {
+        let dstIP = seg.tuple.dstIP
+        guard let dstMAC = arp.lookup(ip: dstIP) else {
+            FlowStats.global.outARPMiss += 1
+            return nil
+        }
+
+        var tcpBytes = seg.raw
+        if tcpBytes.isEmpty {
+            tcpBytes = seg.header.marshal() + seg.payload
+        }
+        let cs = tcpChecksum(srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP, tcpData: tcpBytes)
+        tcpBytes[16] = UInt8(cs >> 8)
+        tcpBytes[17] = UInt8(cs & 0xFF)
+
+        let verify = tcpChecksum(srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP, tcpData: tcpBytes)
+        if verify != 0 {
+            FlowStats.global.outCSError += 1
+            return NSError(domain: "TCP", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "TCP checksum error: \(verify)"])
+        }
+
+        let ipPkt = IPv4Packet(
+            version: 4, ihl: 20, tos: 0, totalLen: 0,
+            id: UInt16(UInt64(Date().timeIntervalSince1970 * 1e9) & 0xFFFF),
+            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
+            checksum: 0, srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP,
+            payload: tcpBytes
+        )
+
+        FlowStats.global.outSegs += 1
+        FlowStats.global.outBytes += Int64(seg.payload.count)
+        return writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
+    }
+
+    func sendDatagram(_ dg: UDPDatagram) {
+        let dstMAC: Data
+        if let mac = arp.lookup(ip: dg.dstIP) {
+            dstMAC = mac
+        } else {
+            dstMAC = broadcastMAC
+        }
+
+        let udpBytes = buildDatagram(srcPort: dg.srcPort, dstPort: dg.dstPort, payload: dg.payload)
+
+        let ipPkt = IPv4Packet(
+            version: 4, ihl: 20, tos: 0, totalLen: 0,
+            id: UInt16(UInt64(Date().timeIntervalSince1970 * 1e9) & 0xFFFF),
+            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
+            checksum: 0, srcIP: dg.srcIP, dstIP: dg.dstIP,
+            payload: udpBytes
+        )
+        _ = writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
+    }
+
+    func sendICMPReply(_ reply: ICMPReply) {
+        guard let dstMAC = arp.lookup(ip: reply.dstIP) else {
+            NSLog("ICMP reply: no ARP entry for %@", ipString(reply.dstIP))
+            return
+        }
+
+        let icmpData = buildICMPReplyData(id: reply.id, seq: reply.seq, payload: reply.payload)
+
+        let ipPkt = IPv4Packet(
+            version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0,
+            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
+            checksum: 0, srcIP: reply.srcIP, dstIP: reply.dstIP,
+            payload: icmpData
+        )
+        _ = writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
+    }
+
+    func writeIPv4Packet(dstMAC: Data, pkt: IPv4Packet) -> Error? {
+        guard let conn = conn else { return nil }
+        let ipBytes = pkt.serialize()
+        let frame = Frame(dstMAC: dstMAC, srcMAC: cfg.gatewayMAC,
+                          etherType: etherTypeIPv4, payload: Data(ipBytes))
+        if let err = conn.write(frame: frame) {
+            if (err as NSError).domain == NSPOSIXErrorDomain &&
+                (err as NSError).code == Int(ENOBUFS) {
+                FlowStats.global.outBufFull += 1
+            }
+            return err
+        }
+        bytesOut += UInt64(ipBytes.count)
+        return nil
+    }
+}
+
+// MARK: - IP Helpers
+
+func ipFromData(_ data: Data) -> UInt32 {
+    guard data.count >= 4 else { return 0 }
+    return UInt32(data[0]) << 24 | UInt32(data[1]) << 16 |
+           UInt32(data[2]) << 8 | UInt32(data[3])
+}
+
+func ipData(from ip: UInt32) -> Data {
+    Data([UInt8(ip >> 24), UInt8(ip >> 16 & 0xFF),
+          UInt8(ip >> 8 & 0xFF), UInt8(ip & 0xFF)])
+}

@@ -1,0 +1,9 @@
+.build/
+.DS_Store
+._*
+*.xcodeproj/
+*.xcworkspace/
+Packages/
+.build-*
+/tmp/
+*.dSYM/

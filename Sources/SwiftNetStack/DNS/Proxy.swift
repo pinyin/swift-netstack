@@ -10,11 +10,11 @@ private final class PendingDNSQuery {
     let dstIP: UInt32
     let srcPort: UInt16
     let dstPort: UInt16
-    let query: [UInt8]
+    let query: Data
     var fd: Int32 = -1
     var sentAt: Date = Date()
 
-    init(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: UInt16, query: [UInt8]) {
+    init(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: UInt16, query: Data) {
         self.srcIP = srcIP
         self.dstIP = dstIP
         self.srcPort = srcPort
@@ -154,7 +154,7 @@ final class DNSProxy {
                 let resp = UDPDatagram(
                     srcIP: pq.dstIP, dstIP: pq.srcIP,
                     srcPort: dnsPort, dstPort: pq.srcPort,
-                    payload: Array(recvBuf[0..<n])
+                    payload: Data(recvBuf[0..<n])
                 )
                 ready.append(resp)
                 completed.append(id)
@@ -198,13 +198,13 @@ final class DNSProxy {
 
     private func servfail(_ dg: UDPDatagram) -> UDPDatagram? {
         guard dg.payload.count >= 4 else { return nil }
-        var resp = dg.payload
+        var resp = [UInt8](dg.payload)
         resp[2] = 0x81
         resp[3] = 0x82
         return UDPDatagram(
             srcIP: dg.dstIP, dstIP: dg.srcIP,
             srcPort: dnsPort, dstPort: dg.srcPort,
-            payload: resp
+            payload: Data(resp)
         )
     }
 

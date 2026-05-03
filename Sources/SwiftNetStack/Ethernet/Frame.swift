@@ -23,23 +23,37 @@ struct Frame: CustomStringConvertible {
     static let headerSize = 14
 
     static func parse(_ data: [UInt8]) -> Frame? {
+        // Legacy path: bridge through Data (one copy). Prefer parse(Data) for hot path.
+        parse(Data(data))
+    }
+
+    static func parse(_ data: Data) -> Frame? {
         guard data.count >= headerSize else { return nil }
         return Frame(
-            dstMAC: Data(data[0..<6]),
-            srcMAC: Data(data[6..<12]),
+            dstMAC: data.subdata(in: 0..<6),
+            srcMAC: data.subdata(in: 6..<12),
             etherType: UInt16(data[12]) << 8 | UInt16(data[13]),
-            payload: Data(data[headerSize...])
+            payload: data.subdata(in: headerSize..<data.count)
         )
     }
 
     func serialize() -> [UInt8] {
-        var buf = [UInt8](repeating: 0, count: Frame.headerSize + payload.count)
-        for i in 0..<min(6, dstMAC.count) { buf[i] = dstMAC[i] }
-        for i in 0..<min(6, srcMAC.count) { buf[6 + i] = srcMAC[i] }
-        buf[12] = UInt8(etherType >> 8)
-        buf[13] = UInt8(etherType & 0xFF)
-        for i in 0..<payload.count { buf[Frame.headerSize + i] = payload[i] }
-        return buf
+        let nb = NetBuf(capacity: Frame.headerSize + payload.count, headroom: Frame.headerSize)
+        payload.withUnsafeBytes { _ = nb.append(bytes: $0.baseAddress!, count: payload.count) }
+        _ = prependEtherHeader(into: nb)
+        return nb.toArray()
+    }
+
+    /// Prepend Ethernet header (14 bytes) into a NetBuf's headroom.
+    /// The payload should already be in the NetBuf's data region.
+    @discardableResult
+    func prependEtherHeader(into buf: NetBuf) -> Bool {
+        guard let ptr = buf.prependPointer(count: Frame.headerSize) else { return false }
+        dstMAC.withUnsafeBytes { r in memcpy(ptr, r.baseAddress!, min(6, dstMAC.count)) }
+        srcMAC.withUnsafeBytes { r in memcpy(ptr.advanced(by: 6), r.baseAddress!, min(6, srcMAC.count)) }
+        ptr[12] = UInt8(etherType >> 8)
+        ptr[13] = UInt8(etherType & 0xFF)
+        return true
     }
 
     var description: String {
@@ -49,6 +63,19 @@ struct Frame: CustomStringConvertible {
 
 func macStr(_ mac: Data) -> String {
     mac.prefix(6).map { String(format: "%02x", $0) }.joined(separator: ":")
+}
+
+/// Prepend Ethernet header (14 bytes) directly into a NetBuf's headroom.
+/// Usually called after IP+payload are already in the NetBuf.
+/// Returns false if headroom is insufficient.
+@discardableResult
+func prependEthernetHeader(into buf: NetBuf, dstMAC: Data, srcMAC: Data, etherType: UInt16) -> Bool {
+    guard let ptr = buf.prependPointer(count: 14) else { return false }
+    dstMAC.withUnsafeBytes { r in memcpy(ptr, r.baseAddress!, min(6, dstMAC.count)) }
+    srcMAC.withUnsafeBytes { r in memcpy(ptr.advanced(by: 6), r.baseAddress!, min(6, srcMAC.count)) }
+    ptr[12] = UInt8(etherType >> 8)
+    ptr[13] = UInt8(etherType & 0xFF)
+    return true
 }
 
 // MARK: - ARP Packet
@@ -80,15 +107,23 @@ struct ARPPacket {
     }
 
     func serialize() -> [UInt8] {
-        var buf = [UInt8](repeating: 0, count: 28)
-        buf[0] = UInt8(hardwareType >> 8); buf[1] = UInt8(hardwareType & 0xFF)
-        buf[2] = UInt8(protocolType >> 8); buf[3] = UInt8(protocolType & 0xFF)
-        buf[4] = hardwareLen; buf[5] = protocolLen
-        buf[6] = UInt8(operation >> 8); buf[7] = UInt8(operation & 0xFF)
-        for i in 0..<min(6, senderMAC.count) { buf[8 + i] = senderMAC[i] }
-        for i in 0..<min(4, senderIP.count) { buf[14 + i] = senderIP[i] }
-        for i in 0..<min(6, targetMAC.count) { buf[18 + i] = targetMAC[i] }
-        for i in 0..<min(4, targetIP.count) { buf[24 + i] = targetIP[i] }
+        let nb = NetBuf(capacity: 28, headroom: 0)
+        return serialize(into: nb).toArray()
+    }
+
+    /// Write ARP packet into the data region of a NetBuf.
+    /// Returns the NetBuf for chaining.
+    @discardableResult
+    func serialize(into buf: NetBuf) -> NetBuf {
+        guard let ptr = buf.appendPointer(count: 28) else { return buf }
+        ptr[0] = UInt8(hardwareType >> 8); ptr[1] = UInt8(hardwareType & 0xFF)
+        ptr[2] = UInt8(protocolType >> 8); ptr[3] = UInt8(protocolType & 0xFF)
+        ptr[4] = hardwareLen; ptr[5] = protocolLen
+        ptr[6] = UInt8(operation >> 8); ptr[7] = UInt8(operation & 0xFF)
+        senderMAC.withUnsafeBytes { r in memcpy(ptr.advanced(by: 8), r.baseAddress!, min(6, senderMAC.count)) }
+        senderIP.withUnsafeBytes { r in memcpy(ptr.advanced(by: 14), r.baseAddress!, min(4, senderIP.count)) }
+        targetMAC.withUnsafeBytes { r in memcpy(ptr.advanced(by: 18), r.baseAddress!, min(6, targetMAC.count)) }
+        targetIP.withUnsafeBytes { r in memcpy(ptr.advanced(by: 24), r.baseAddress!, min(4, targetIP.count)) }
         return buf
     }
 }

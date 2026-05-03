@@ -66,34 +66,58 @@ struct TCPHeader {
 
     static func parse(_ data: [UInt8]) -> TCPHeader? {
         guard data.count >= 20 else { return nil }
-        let raw = data
         return TCPHeader(
-            srcPort: UInt16(raw[0]) << 8 | UInt16(raw[1]),
-            dstPort: UInt16(raw[2]) << 8 | UInt16(raw[3]),
-            seqNum: UInt32(raw[4]) << 24 | UInt32(raw[5]) << 16 | UInt32(raw[6]) << 8 | UInt32(raw[7]),
-            ackNum: UInt32(raw[8]) << 24 | UInt32(raw[9]) << 16 | UInt32(raw[10]) << 8 | UInt32(raw[11]),
-            dataOffset: (raw[12] >> 4) * 4,
-            flags: raw[13],
-            windowSize: UInt16(raw[14]) << 8 | UInt16(raw[15]),
-            checksum: UInt16(raw[16]) << 8 | UInt16(raw[17]),
-            urgentPtr: UInt16(raw[18]) << 8 | UInt16(raw[19])
+            srcPort: UInt16(data[0]) << 8 | UInt16(data[1]),
+            dstPort: UInt16(data[2]) << 8 | UInt16(data[3]),
+            seqNum: UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7]),
+            ackNum: UInt32(data[8]) << 24 | UInt32(data[9]) << 16 | UInt32(data[10]) << 8 | UInt32(data[11]),
+            dataOffset: (data[12] >> 4) * 4,
+            flags: data[13],
+            windowSize: UInt16(data[14]) << 8 | UInt16(data[15]),
+            checksum: UInt16(data[16]) << 8 | UInt16(data[17]),
+            urgentPtr: UInt16(data[18]) << 8 | UInt16(data[19])
+        )
+    }
+
+    static func parse(_ data: Data) -> TCPHeader? {
+        guard data.count >= 20 else { return nil }
+        return TCPHeader(
+            srcPort: UInt16(data[0]) << 8 | UInt16(data[1]),
+            dstPort: UInt16(data[2]) << 8 | UInt16(data[3]),
+            seqNum: UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7]),
+            ackNum: UInt32(data[8]) << 24 | UInt32(data[9]) << 16 | UInt32(data[10]) << 8 | UInt32(data[11]),
+            dataOffset: (data[12] >> 4) * 4,
+            flags: data[13],
+            windowSize: UInt16(data[14]) << 8 | UInt16(data[15]),
+            checksum: UInt16(data[16]) << 8 | UInt16(data[17]),
+            urgentPtr: UInt16(data[18]) << 8 | UInt16(data[19])
         )
     }
 
     func marshal() -> [UInt8] {
-        var d = [UInt8](repeating: 0, count: 20)
-        d[0] = UInt8(srcPort >> 8); d[1] = UInt8(srcPort & 0xFF)
-        d[2] = UInt8(dstPort >> 8); d[3] = UInt8(dstPort & 0xFF)
-        d[4] = UInt8(seqNum >> 24); d[5] = UInt8(seqNum >> 16 & 0xFF)
-        d[6] = UInt8(seqNum >> 8 & 0xFF); d[7] = UInt8(seqNum & 0xFF)
-        d[8] = UInt8(ackNum >> 24); d[9] = UInt8(ackNum >> 16 & 0xFF)
-        d[10] = UInt8(ackNum >> 8 & 0xFF); d[11] = UInt8(ackNum & 0xFF)
-        d[12] = (5 << 4)
-        d[13] = flags
-        d[14] = UInt8(windowSize >> 8); d[15] = UInt8(windowSize & 0xFF)
-        d[16] = 0; d[17] = 0 // checksum placeholder
-        d[18] = UInt8(urgentPtr >> 8); d[19] = UInt8(urgentPtr & 0xFF)
-        return d
+        let nb = NetBuf(capacity: 20, headroom: 20)
+        marshal(into: nb)
+        return nb.toArray()
+    }
+
+    /// Write the TCP header (20 bytes) into a NetBuf at the current offset,
+    /// consuming 20 bytes of headroom (using prependPointer).
+    @discardableResult
+    func marshal(into buf: NetBuf) -> Bool {
+        let hdrLen = 20
+        guard let ptr = buf.prependPointer(count: hdrLen) else { return false }
+        ptr[0] = UInt8(srcPort >> 8); ptr[1] = UInt8(srcPort & 0xFF)
+        ptr[2] = UInt8(dstPort >> 8); ptr[3] = UInt8(dstPort & 0xFF)
+        ptr[4] = UInt8(seqNum >> 24); ptr[5] = UInt8(seqNum >> 16 & 0xFF)
+        ptr[6] = UInt8(seqNum >> 8 & 0xFF); ptr[7] = UInt8(seqNum & 0xFF)
+        ptr[8] = UInt8(ackNum >> 24); ptr[9] = UInt8(ackNum >> 16 & 0xFF)
+        ptr[10] = UInt8(ackNum >> 8 & 0xFF); ptr[11] = UInt8(ackNum & 0xFF)
+        ptr[12] = (5 << 4)
+        ptr[13] = flags
+        ptr[14] = UInt8(windowSize >> 8); ptr[15] = UInt8(windowSize & 0xFF)
+        ptr[16] = 0; ptr[17] = 0 // checksum placeholder
+        ptr[18] = UInt8(urgentPtr >> 8); ptr[19] = UInt8(urgentPtr & 0xFF)
+        return true
     }
 }
 
@@ -101,19 +125,32 @@ struct TCPHeader {
 
 struct TCPSegment {
     let header: TCPHeader
-    let payload: [UInt8]
+    let payload: Data
     let tuple: Tuple
     let raw: [UInt8]
+    var netBuf: NetBuf? = nil
 
     static func parse(_ data: [UInt8], srcIP: UInt32, dstIP: UInt32) -> TCPSegment? {
+        // Legacy path: copy to Data first. Prefer parse(Data) for hot path.
+        parse(Data(data), srcIP: srcIP, dstIP: dstIP)
+    }
+
+    /// Zero-copy parse: payload is a Data slice sharing the input buffer.
+    static func parse(_ data: Data, srcIP: UInt32, dstIP: UInt32) -> TCPSegment? {
         guard let h = TCPHeader.parse(data) else { return nil }
         let offset = Int(h.dataOffset)
         let clippedOffset = min(offset, data.count)
+        let payload: Data
+        if clippedOffset < data.count {
+            payload = data.subdata(in: clippedOffset..<data.count)
+        } else {
+            payload = Data()
+        }
         return TCPSegment(
             header: h,
-            payload: Array(data[clippedOffset...]),
+            payload: payload,
             tuple: Tuple(srcIP: srcIP, dstIP: dstIP, srcPort: h.srcPort, dstPort: h.dstPort),
-            raw: data
+            raw: [UInt8](data)
         )
     }
 }
@@ -154,6 +191,52 @@ func buildSegmentWithWScale(tuple: Tuple, seq: UInt32, ack: UInt32, flags: UInt8
     buildSegment(tuple: tuple, seq: seq, ack: ack, flags: flags, window: window, wscale: wscale, payload: payload)
 }
 
+// MARK: - NetBuf Segment Builder
+
+/// Build a TCP segment in a NetBuf with headroom reserved for IP (20B) + Ethernet (14B) headers.
+/// Returns a NetBuf with: [14B Eth headroom | 20B IP headroom | TCP header | payload].
+/// The caller can then prepend IP and Ethernet headers without any copies.
+func buildSegmentNetBuf(tuple: Tuple, seq: UInt32, ack: UInt32, flags: UInt8, window: UInt16, wscale: UInt8, payload: NetBuf) -> NetBuf {
+    let hasOptions = wscale > 0
+    let tcpHdrLen = hasOptions ? 24 : 20
+    let ipHdrLen = 20
+    let ethHdrLen = 14
+    let totalHeadroom = ethHdrLen + ipHdrLen + tcpHdrLen
+
+    let nb = NetBuf(capacity: totalHeadroom + payload.length, headroom: totalHeadroom)
+
+    // Append payload first (at offset = totalHeadroom)
+    _ = nb.append(copying: payload)
+
+    // Prepend TCP header (consumes tcpHdrLen from headroom)
+    guard let ptr = nb.prependPointer(count: tcpHdrLen) else { return nb }
+    ptr[0] = UInt8(tuple.srcPort >> 8); ptr[1] = UInt8(tuple.srcPort & 0xFF)
+    ptr[2] = UInt8(tuple.dstPort >> 8); ptr[3] = UInt8(tuple.dstPort & 0xFF)
+    ptr[4] = UInt8(seq >> 24); ptr[5] = UInt8(seq >> 16 & 0xFF)
+    ptr[6] = UInt8(seq >> 8 & 0xFF); ptr[7] = UInt8(seq & 0xFF)
+    ptr[8] = UInt8(ack >> 24); ptr[9] = UInt8(ack >> 16 & 0xFF)
+    ptr[10] = UInt8(ack >> 8 & 0xFF); ptr[11] = UInt8(ack & 0xFF)
+    ptr[12] = UInt8(tcpHdrLen / 4) << 4
+    ptr[13] = flags
+    ptr[14] = UInt8(window >> 8); ptr[15] = UInt8(window & 0xFF)
+    ptr[16] = 0; ptr[17] = 0 // checksum placeholder
+    ptr[18] = 0; ptr[19] = 0 // urgent pointer
+
+    if hasOptions {
+        ptr[20] = 3  // Kind: Window Scale
+        ptr[21] = 3  // Length: 3
+        ptr[22] = wscale
+        ptr[23] = 1  // NOP
+    }
+    return nb
+}
+
+/// Build a TCP segment from [UInt8] payload via NetBuf (backward compat).
+func buildSegmentViaNetBuf(tuple: Tuple, seq: UInt32, ack: UInt32, flags: UInt8, window: UInt16, wscale: UInt8, payload: [UInt8]) -> [UInt8] {
+    let payloadBuf = NetBuf(copying: payload)
+    return buildSegmentNetBuf(tuple: tuple, seq: seq, ack: ack, flags: flags, window: window, wscale: wscale, payload: payloadBuf).toArray()
+}
+
 // MARK: - Window Scale Parsing
 
 func parseWindowScale(_ data: [UInt8]) -> UInt8 {
@@ -185,28 +268,52 @@ func seqGE(_ a: UInt32, _ b: UInt32) -> Bool { Int32(bitPattern: a &- b) >= 0 }
 // MARK: - TCP Checksum
 
 func tcpChecksum(srcIP: UInt32, dstIP: UInt32, tcpData: [UInt8]) -> UInt16 {
-    var pseudoHdr = [UInt8](repeating: 0, count: 12)
-    pseudoHdr[0] = UInt8(srcIP >> 24); pseudoHdr[1] = UInt8(srcIP >> 16 & 0xFF)
-    pseudoHdr[2] = UInt8(srcIP >> 8 & 0xFF); pseudoHdr[3] = UInt8(srcIP & 0xFF)
-    pseudoHdr[4] = UInt8(dstIP >> 24); pseudoHdr[5] = UInt8(dstIP >> 16 & 0xFF)
-    pseudoHdr[6] = UInt8(dstIP >> 8 & 0xFF); pseudoHdr[7] = UInt8(dstIP & 0xFF)
-    pseudoHdr[8] = 0
-    pseudoHdr[9] = 6 // TCP protocol
-    let tcpLen = UInt16(tcpData.count)
-    pseudoHdr[10] = UInt8(tcpLen >> 8); pseudoHdr[11] = UInt8(tcpLen & 0xFF)
+    tcpData.withUnsafeBytes { tcpChecksum(srcIP: srcIP, dstIP: dstIP, tcpDataPtr: $0.baseAddress!, tcpDataCount: tcpData.count) }
+}
 
-    return onesComplementSum(pseudoHdr + tcpData)
+/// Zero-allocation TCP checksum over pseudo-header + TCP data.
+func tcpChecksum(srcIP: UInt32, dstIP: UInt32, tcpDataPtr: UnsafeRawPointer, tcpDataCount: Int) -> UInt16 {
+    var sum: UInt32 = 0
+
+    // Pseudo-header
+    sum += UInt32(srcIP >> 16)
+    sum += UInt32(srcIP & 0xFFFF)
+    sum += UInt32(dstIP >> 16)
+    sum += UInt32(dstIP & 0xFFFF)
+    sum += 6  // TCP protocol
+    sum += UInt32(tcpDataCount)
+
+    // TCP data
+    let bytes = tcpDataPtr.assumingMemoryBound(to: UInt8.self)
+    var i = 0
+    while i < tcpDataCount - 1 {
+        sum += UInt32(UInt16(bytes[i]) << 8 | UInt16(bytes[i + 1]))
+        i += 2
+    }
+    if tcpDataCount % 2 == 1 {
+        sum += UInt32(bytes[tcpDataCount - 1]) << 8
+    }
+
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    return ~UInt16(sum & 0xFFFF)
 }
 
 func onesComplementSum(_ data: [UInt8]) -> UInt16 {
+    data.withUnsafeBytes { onesComplementSum(ptr: $0.baseAddress!, count: data.count) }
+}
+
+func onesComplementSum(ptr: UnsafeRawPointer, count: Int) -> UInt16 {
     var sum: UInt32 = 0
+    let bytes = ptr.assumingMemoryBound(to: UInt8.self)
     var i = 0
-    while i < data.count - 1 {
-        sum += UInt32(UInt16(data[i]) << 8 | UInt16(data[i + 1]))
+    while i < count - 1 {
+        sum += UInt32(UInt16(bytes[i]) << 8 | UInt16(bytes[i + 1]))
         i += 2
     }
-    if data.count % 2 == 1 {
-        sum += UInt32(data[data.count - 1]) << 8
+    if count % 2 == 1 {
+        sum += UInt32(bytes[count - 1]) << 8
     }
     while sum > 0xFFFF {
         sum = (sum & 0xFFFF) + (sum >> 16)
@@ -303,13 +410,30 @@ final class TCPConn {
     }
 
     func writeRecvBuf(_ data: [UInt8]) -> Int {
-        var n = data.count
+        return data.withUnsafeBytes { ptr in
+            writeRecvBuf(ptr: ptr.baseAddress!, count: data.count)
+        }
+    }
+
+    func writeRecvBuf(_ data: Data) -> Int {
+        return data.withUnsafeBytes { ptr in
+            writeRecvBuf(ptr: ptr.baseAddress!, count: data.count)
+        }
+    }
+
+    func writeRecvBuf(ptr: UnsafeRawPointer, count: Int) -> Int {
         let writable = recvWritable()
+        var n = count
         if n > writable { n = writable }
         guard n > 0 else { return 0 }
         let first = min(n, recvBuf.count - recvTail)
-        for i in 0..<first { recvBuf[recvTail + i] = data[i] }
-        for i in 0..<(n - first) { recvBuf[i] = data[first + i] }
+        recvBuf.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            memcpy(base.advanced(by: recvTail), ptr, first)
+            if n > first {
+                memcpy(base, ptr.advanced(by: first), n - first)
+            }
+        }
         recvTail = (recvTail + n) % recvBuf.count
         recvSize += n
         return n
@@ -320,20 +444,72 @@ final class TCPConn {
         if n > recvSize { n = recvSize }
         guard n > 0 else { return 0 }
         let first = min(n, recvBuf.count - recvHead)
-        for i in 0..<first { buf[i] = recvBuf[recvHead + i] }
-        for i in 0..<(n - first) { buf[first + i] = recvBuf[i] }
+        buf.withUnsafeMutableBytes { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            recvBuf.withUnsafeBytes { src in
+                guard let srcBase = src.baseAddress else { return }
+                memcpy(dstBase, srcBase.advanced(by: recvHead), first)
+                if n > first {
+                    memcpy(dstBase.advanced(by: first), srcBase, n - first)
+                }
+            }
+        }
         recvHead = (recvHead + n) % recvBuf.count
         recvSize -= n
         return n
     }
 
     func peekRecvData() -> [UInt8] {
-        guard recvSize > 0 else { return [] }
+        peekRecvDataNetBuf(headroom: 0).toArray()
+    }
+
+    /// Copy data from the recv circular buffer into a contiguous NetBuf.
+    /// Handles wrap-around correctly. Optional headroom for future header prepending.
+    func peekRecvDataNetBuf(headroom: Int = 0) -> NetBuf {
+        guard recvSize > 0 else { return NetBuf(capacity: 0) }
+        let nb = NetBuf(capacity: headroom + recvSize, headroom: headroom)
+        guard let ptr = nb.appendPointer(count: recvSize) else { return nb }
+        let first = min(recvSize, recvBuf.count - recvHead)
+        recvBuf.withUnsafeBytes { src in
+            guard let srcBase = src.baseAddress else { return }
+            memcpy(ptr, srcBase.advanced(by: recvHead), first)
+            if recvSize > first {
+                memcpy(ptr.advanced(by: first), srcBase, recvSize - first)
+            }
+        }
+        return nb
+    }
+
+    func withRecvData<T>(_ body: (UnsafePointer<UInt8>, Int) throws -> T) rethrows -> T {
+        guard recvSize > 0 else {
+            return try body(UnsafePointer<UInt8>(bitPattern: 0)!, 0)
+        }
         let end = recvHead + recvSize
         if end <= recvBuf.count {
-            return Array(recvBuf[recvHead..<end])
+            return try recvBuf.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else {
+                    return try body(UnsafePointer<UInt8>(bitPattern: 0)!, 0)
+                }
+                return try body(base.advanced(by: recvHead).assumingMemoryBound(to: UInt8.self), recvSize)
+            }
         }
-        return Array(recvBuf[recvHead...])
+        // Wrapping case: linearize into temp buffer
+        let first = recvBuf.count - recvHead
+        var tmp = [UInt8](repeating: 0, count: recvSize)
+        recvBuf.withUnsafeBytes { src in
+            guard let srcBase = src.baseAddress else { return }
+            tmp.withUnsafeMutableBytes { dst in
+                guard let dstBase = dst.baseAddress else { return }
+                memcpy(dstBase, srcBase.advanced(by: recvHead), first)
+                memcpy(dstBase.advanced(by: first), srcBase, recvSize - first)
+            }
+        }
+        return try tmp.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else {
+                return try body(UnsafePointer<UInt8>(bitPattern: 0)!, 0)
+            }
+            return try body(base.assumingMemoryBound(to: UInt8.self), recvSize)
+        }
     }
 
     func consumeRecvData(_ n: Int) {
@@ -343,13 +519,24 @@ final class TCPConn {
     }
 
     func writeSendBuf(_ data: [UInt8]) -> Int {
+        return data.withUnsafeBytes { ptr in
+            writeSendBuf(ptr: ptr.baseAddress!, count: data.count)
+        }
+    }
+
+    func writeSendBuf(ptr: UnsafeRawPointer, count: Int) -> Int {
         let space = sendBuf.count - sendSize
         guard space > 0 else { return 0 }
-        var n = data.count
+        var n = count
         if n > space { n = space }
         let first = min(n, sendBuf.count - sendTail)
-        for i in 0..<first { sendBuf[sendTail + i] = data[i] }
-        for i in 0..<(n - first) { sendBuf[i] = data[first + i] }
+        sendBuf.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            memcpy(base.advanced(by: sendTail), ptr, first)
+            if n > first {
+                memcpy(base, ptr.advanced(by: first), n - first)
+            }
+        }
         sendTail = (sendTail + n) % sendBuf.count
         sendSize += n
         return n
@@ -366,17 +553,30 @@ final class TCPConn {
     }
 
     func peekSendData(max: Int) -> [UInt8] {
+        peekSendDataNetBuf(max: max, headroom: 0).toArray()
+    }
+
+    /// Copy up to `max` bytes of unacked data from the send circular buffer
+    /// into a contiguous NetBuf. Handles wrap-around correctly.
+    /// `headroom` bytes are reserved for future IP+Ethernet header prepending.
+    func peekSendDataNetBuf(max: Int, headroom: Int = 0) -> NetBuf {
         let avail = sendAvail
         let sent = Int(sndNxt - sndUna)
-        guard sent < avail, avail > 0, max > 0 else { return [] }
+        guard sent < avail, avail > 0, max > 0 else { return NetBuf(capacity: 0) }
         let remaining = avail - sent
         var n = remaining
         if n > max { n = max }
+        let nb = NetBuf(capacity: headroom + n, headroom: headroom)
+        guard let ptr = nb.appendPointer(count: n) else { return nb }
         let start = (sendHead + sent) % sendBuf.count
-        let end = start + n
-        if end <= sendBuf.count {
-            return Array(sendBuf[start..<end])
+        let first = min(n, sendBuf.count - start)
+        sendBuf.withUnsafeBytes { src in
+            guard let srcBase = src.baseAddress else { return }
+            memcpy(ptr, srcBase.advanced(by: start), first)
+            if n > first {
+                memcpy(ptr.advanced(by: first), srcBase, n - first)
+            }
         }
-        return Array(sendBuf[start...])
+        return nb
     }
 }

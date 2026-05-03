@@ -83,7 +83,7 @@ struct FuzzRNG {
         synBytes[16] = UInt8(synCs >> 8); synBytes[17] = UInt8(synCs & 0xFF)
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0xF01,
                                 flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: synBytes)
+                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(synBytes))
         _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                        etherType: etherTypeIPv4, payload: Data(synIP.serialize())))
         waitForDeliberation(0.1)
@@ -119,7 +119,7 @@ struct FuzzRNG {
             let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0,
                                    id: UInt16(0xF00 | i), flags: 0, fragOffset: 0,
                                    ttl: 64, protocol: protocolTCP,
-                                   checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: raw)
+                                   checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(raw))
             _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
         }
@@ -158,7 +158,7 @@ struct FuzzRNG {
                 id: fuzzID, flags: fuzzFlags, fragOffset: fuzzFragOff,
                 ttl: fuzzTTL, protocol: fuzzProtocol,
                 checksum: 0, srcIP: fuzzSrcIP, dstIP: fuzzDstIP,
-                payload: fuzzPayload
+                payload: Data(fuzzPayload)
             )
 
             _ = connB.write(frame: Frame(
@@ -217,11 +217,11 @@ struct FuzzRNG {
             }
             let full = Array(buf[0..<offset])
 
-            let udpData = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: full)
+            let udpData = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data(full))
             let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16(0xD00 | i),
                                    flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                    checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                   payload: udpData)
+                                   payload: Data(udpData))
             _ = connB.write(frame: Frame(dstMAC: broadcastMAC, srcMAC: Data([mac.b0, mac.b1, mac.b2, mac.b3, mac.b4, mac.b5]),
                                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
         }
@@ -253,11 +253,11 @@ struct FuzzRNG {
             }
 
             let udpData = buildDatagram(srcPort: rng.nextUInt16(), dstPort: dnsPort,
-                                         payload: dnsQuery)
+                                         payload: Data(dnsQuery))
             let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16(0xE00 | i),
                                    flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                    checksum: 0, srcIP: vmIP, dstIP: gwIP,
-                                   payload: udpData)
+                                   payload: Data(udpData))
             _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
         }
@@ -295,7 +295,7 @@ struct FuzzRNG {
             let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16(0xA00 | i),
                                    flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                    checksum: 0, srcIP: vmIP, dstIP: gwIP,
-                                   payload: udpData)
+                                   payload: Data(udpData))
             _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
         }
@@ -346,7 +346,7 @@ struct FuzzRNG {
         synBytes[16] = UInt8(synCs >> 8); synBytes[17] = UInt8(synCs & 0xFF)
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x666,
                                 flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: synBytes)
+                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(synBytes))
         _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                        etherType: etherTypeIPv4, payload: Data(synIP.serialize())))
         waitForDeliberation(0.1)
@@ -361,7 +361,7 @@ struct FuzzRNG {
                 let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: rng.nextUInt16(),
                                        flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
                                        checksum: 0, srcIP: rng.nextUInt32(), dstIP: rng.nextUInt32(),
-                                       payload: raw)
+                                       payload: Data(raw))
                 _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                               etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
             case 1: // Fuzzed UDP
@@ -369,7 +369,7 @@ struct FuzzRNG {
                 let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: rng.nextUInt16(),
                                        flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                        checksum: 0, srcIP: rng.nextUInt32(), dstIP: rng.nextUInt32(),
-                                       payload: raw)
+                                       payload: Data(raw))
                 _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                               etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
             case 2: // Raw ARP

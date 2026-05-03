@@ -13,7 +13,7 @@ func edgeFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
     raw[16] = UInt8(cs >> 8); raw[17] = UInt8(cs & 0xFF)
     let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16((srcPort & 0xFF00) | (dstPort & 0xFF)),
                            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: raw)
+                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: Data(raw))
     _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                   etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
 }
@@ -265,7 +265,7 @@ func edgeFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
                           seqNum: 6000, ackNum: 0,
                           dataOffset: 24, flags: TCPFlag.syn,
                           windowSize: 65535, checksum: 0, urgentPtr: 0),
-        payload: [], tuple: tuple, raw: raw
+        payload: Data(), tuple: tuple, raw: raw
     )
     ts.injectSegment(synSeg)
     ts.deliberate(now: Date())

@@ -160,7 +160,9 @@ public final class TCPState {
         advanceFinWait2()
         advanceTimeWait()
         reclaimClosed()
+#if DEBUG
         checkInvariants()
+#endif
     }
 
     // MARK: - Lookup Helpers

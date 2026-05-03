@@ -30,8 +30,11 @@ final class UDPNATEntry {
 
 final class UDPNATTable {
     var entries: [UDPNATKey: UDPNATEntry] = [:]
+    private var readBuf: [UInt8]
 
-    init() {}
+    init() {
+        readBuf = [UInt8](repeating: 0, count: 65536)
+    }
 
     func intercept(_ dg: UDPDatagram) -> Bool {
         let key = UDPNATKey(srcIP: dg.srcIP, dstIP: dg.dstIP,
@@ -118,10 +121,9 @@ final class UDPNATTable {
     // MARK: - I/O
 
     private func readHost(_ entry: UDPNATEntry) {
-        var buf = [UInt8](repeating: 0, count: entry.maxPayload)
-        let bufCount = buf.count
-        let n = buf.withUnsafeMutableBytes { ptr in
-            Darwin.read(entry.hostFD, ptr.baseAddress!, bufCount)
+        let readMax = min(entry.maxPayload, readBuf.count)
+        let n = readBuf.withUnsafeMutableBytes { ptr in
+            Darwin.read(entry.hostFD, ptr.baseAddress!, readMax)
         }
 
         if n < 0 {
@@ -136,7 +138,7 @@ final class UDPNATTable {
         let ingress = UDPDatagram(
             srcIP: entry.key.dstIP, dstIP: entry.key.srcIP,
             srcPort: entry.key.dstPort, dstPort: entry.key.srcPort,
-            payload: Array(buf[0..<n])
+            payload: Data(readBuf[0..<n])
         )
         entry.ingressQ.append(ingress)
     }

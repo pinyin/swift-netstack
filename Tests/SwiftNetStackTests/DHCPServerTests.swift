@@ -4,7 +4,7 @@ import Testing
 
 // MARK: - DHCP Helpers
 
-func buildDHCPDiscover(txID: UInt32, mac: MACAddr) -> [UInt8] {
+func buildDHCPDiscover(txID: UInt32, mac: MACAddr) -> Data {
     var buf = [UInt8](repeating: 0, count: 300)
     buf[0] = 1 // BOOTREQUEST
     buf[1] = 1 // Ethernet
@@ -23,10 +23,10 @@ func buildDHCPDiscover(txID: UInt32, mac: MACAddr) -> [UInt8] {
     offset = writeOption(&buf, offset: offset, optType: 55, val: [1, 3, 6]) // parameter request list
     buf[offset] = optEnd
 
-    return Array(buf[..<(offset + 1)])
+    return Data(buf[..<(offset + 1)])
 }
 
-func buildDHCPRequest(txID: UInt32, mac: MACAddr, reqIP: UInt32, serverIP: UInt32) -> [UInt8] {
+func buildDHCPRequest(txID: UInt32, mac: MACAddr, reqIP: UInt32, serverIP: UInt32) -> Data {
     var buf = [UInt8](repeating: 0, count: 300)
     buf[0] = 1; buf[1] = 1; buf[2] = 6
     buf[4] = UInt8(txID >> 24); buf[5] = UInt8(txID >> 16 & 0xFF)
@@ -47,10 +47,10 @@ func buildDHCPRequest(txID: UInt32, mac: MACAddr, reqIP: UInt32, serverIP: UInt3
                                UInt8(serverIP >> 8 & 0xFF), UInt8(serverIP & 0xFF)])
     buf[offset] = optEnd
 
-    return Array(buf[..<(offset + 1)])
+    return Data(buf[..<(offset + 1)])
 }
 
-func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
+func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> Data {
     var buf = [UInt8](repeating: 0, count: 300)
     buf[0] = 1; buf[1] = 1; buf[2] = 6
     buf[4] = UInt8(txID >> 24); buf[5] = UInt8(txID >> 16 & 0xFF)
@@ -64,7 +64,7 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     offset = writeOption(&buf, offset: offset, optType: optMessageType, val: [msgRelease])
     buf[offset] = optEnd
 
-    return Array(buf[..<(offset + 1)])
+    return Data(buf[..<(offset + 1)])
 }
 
 // MARK: - Test DHCP Discover
@@ -94,8 +94,9 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
             "expected DHCPOFFER, got \(String(describing: msgType))")
 
     // Check yiaddr is non-zero
-    let yiaddr = UInt32(offer.payload[16]) << 24 | UInt32(offer.payload[17]) << 16 |
-                 UInt32(offer.payload[18]) << 8 | UInt32(offer.payload[19])
+    let offerPayload = [UInt8](offer.payload)
+    let yiaddr = UInt32(offerPayload[16]) << 24 | UInt32(offerPayload[17]) << 16 |
+                 UInt32(offerPayload[18]) << 8 | UInt32(offerPayload[19])
     #expect(yiaddr != 0, "expected non-zero yiaddr")
 
     // Verify subnet mask option
@@ -133,8 +134,9 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     let responses = handler(discover)
     #expect(responses.count == 1, "expected 1 DISCOVER response, got \(responses.count)")
 
-    let yiaddr = UInt32(responses[0].payload[16]) << 24 | UInt32(responses[0].payload[17]) << 16 |
-                 UInt32(responses[0].payload[18]) << 8 | UInt32(responses[0].payload[19])
+    let rPayload = [UInt8](responses[0].payload)
+    let yiaddr = UInt32(rPayload[16]) << 24 | UInt32(rPayload[17]) << 16 |
+                 UInt32(rPayload[18]) << 8 | UInt32(rPayload[19])
 
     // Now REQUEST the same IP
     let request = UDPDatagram(
@@ -259,8 +261,9 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
         payload: buildDHCPDiscover(txID: 0xCCCC, mac: mac)
     )
     let responses = handler(discover)
-    let yiaddr = UInt32(responses[0].payload[16]) << 24 | UInt32(responses[0].payload[17]) << 16 |
-                 UInt32(responses[0].payload[18]) << 8 | UInt32(responses[0].payload[19])
+    let rPayload2 = [UInt8](responses[0].payload)
+    let yiaddr = UInt32(rPayload2[16]) << 24 | UInt32(rPayload2[17]) << 16 |
+                 UInt32(rPayload2[18]) << 8 | UInt32(rPayload2[19])
 
     // Request (ACK triggers onLease)
     let request = UDPDatagram(
@@ -285,7 +288,7 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     // Too short
     let short = UDPDatagram(
         srcIP: 0, dstIP: 0, srcPort: clientPort, dstPort: serverPort,
-        payload: [UInt8](repeating: 0, count: 100)
+        payload: Data([UInt8](repeating: 0, count: 100))
     )
     #expect(handler(short).isEmpty, "should ignore short packet")
 
@@ -296,7 +299,7 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     badOp[240] = optEnd
     let badReq = UDPDatagram(
         srcIP: 0, dstIP: 0, srcPort: clientPort, dstPort: serverPort,
-        payload: Array(badOp[..<241])
+        payload: Data(badOp[..<241])
     )
     #expect(handler(badReq).isEmpty, "should ignore non-request op code")
 
@@ -309,7 +312,7 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     unknownType[off] = optEnd
     let unk = UDPDatagram(
         srcIP: 0, dstIP: 0, srcPort: clientPort, dstPort: serverPort,
-        payload: Array(unknownType[..<(off + 1)])
+        payload: Data(unknownType[..<(off + 1)])
     )
     #expect(handler(unk).isEmpty, "should ignore unknown message type")
 }
@@ -329,14 +332,14 @@ func buildDHCPRelease(txID: UInt32, mac: MACAddr) -> [UInt8] {
     offset = writeOption(&buf, offset: offset, optType: optSubnetMask, val: [255, 255, 255, 0])
     buf[offset] = optEnd
 
-    let routerOpt = srv.getOption(Array(buf[..<(offset + 1)]), optType: optRouter)
+    let routerOpt = srv.getOption(Data(buf[..<(offset + 1)]), optType: optRouter)
     #expect(routerOpt == [192, 168, 1, 1], "router option mismatch")
 
-    let subnetOpt = srv.getOption(Array(buf[..<(offset + 1)]), optType: optSubnetMask)
+    let subnetOpt = srv.getOption(Data(buf[..<(offset + 1)]), optType: optSubnetMask)
     #expect(subnetOpt == [255, 255, 255, 0], "subnet mask mismatch")
 
     // Non-existent option → nil
-    let nonexistent = srv.getOption(Array(buf[..<(offset + 1)]), optType: optDNSServer)
+    let nonexistent = srv.getOption(Data(buf[..<(offset + 1)]), optType: optDNSServer)
     #expect(nonexistent == nil, "should return nil for missing option")
 }
 

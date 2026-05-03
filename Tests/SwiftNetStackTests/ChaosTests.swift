@@ -61,7 +61,7 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
     }
     let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16((srcPort & 0xFF00) | (dstPort & 0xFF)),
                            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: adj)
+                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: Data(adj))
     _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                   etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
 }
@@ -99,7 +99,7 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
         let shortIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 6, id: 1,
                                  flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
                                  checksum: 0, srcIP: vmIP, dstIP: gwIP,
-                                 payload: [0x00, 0x01, 0x00, 0x02, 0x00, 0x03])
+                                 payload: Data([0x00, 0x01, 0x00, 0x02, 0x00, 0x03]))
         rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(shortIP.serialize()))
 
@@ -115,7 +115,7 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
         let shortUDP_IP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 3, id: 2,
                                       flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                       checksum: 0, srcIP: vmIP, dstIP: gwIP,
-                                      payload: [0x00, 0x01, 0x02])
+                                      payload: Data([0x00, 0x01, 0x02]))
         rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(shortUDP_IP.serialize()))
 
@@ -329,17 +329,17 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
         badRaw[16] = 0xFF; badRaw[17] = 0xFF // intentionally wrong checksum
         let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x99,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: badRaw)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(badRaw))
         rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(ipPkt.serialize()))
 
         // IPv4 with bad checksum
         var badIPPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x100,
                                    flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                   checksum: 0xFFFF, srcIP: vmIP, dstIP: gwIP, payload: [])
+                                   checksum: 0xFFFF, srcIP: vmIP, dstIP: gwIP, payload: Data())
         badIPPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x100,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0xFFFF, srcIP: vmIP, dstIP: gwIP, payload: [])
+                               checksum: 0xFFFF, srcIP: vmIP, dstIP: gwIP, payload: Data())
         rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(badIPPkt.serialize()))
 
@@ -364,7 +364,7 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
         rawSYN[14] = 0; rawSYN[15] = 0 // window = 0
         let ipSYN = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x200,
                                 flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: rawSYN)
+                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(rawSYN))
         rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(ipSYN.serialize()))
         waitForDeliberation(0.1)
@@ -387,7 +387,7 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
             rawACK[16] = UInt8(csACK >> 8); rawACK[17] = UInt8(csACK & 0xFF)
             let ipACK = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x201,
                                     flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                    checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: rawACK)
+                                    checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(rawACK))
             rawFrame(connB: connB, dstMAC: gwMAC, srcMAC: vmMAC,
                      etherType: etherTypeIPv4, payload: Data(ipACK.serialize()))
             waitForDeliberation(0.05)
@@ -455,22 +455,22 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
 @Test func testChaosMalformedDHCP() throws {
     runChaosTest { stack, connB in
         // Empty DHCP
-        let emptyUDP = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: [])
+        let emptyUDP = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data())
         let emptyIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x500,
                                   flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                   checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                  payload: emptyUDP)
+                                  payload: Data(emptyUDP))
         rawFrame(connB: connB, dstMAC: broadcastMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(emptyIP.serialize()))
 
         // DHCP without magic cookie
         var badDHCP = [UInt8](repeating: 0, count: 240)
         badDHCP[0] = 1; badDHCP[1] = 1; badDHCP[2] = 6
-        let badUDP = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: badDHCP)
+        let badUDP = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data(badDHCP))
         let badIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x501,
                                 flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                 checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                payload: badUDP)
+                                payload: Data(badUDP))
         rawFrame(connB: connB, dstMAC: broadcastMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(badIP.serialize()))
 
@@ -481,11 +481,11 @@ func tcpFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
         dhcpReply[236] = 0x63; dhcpReply[237] = 0x82; dhcpReply[238] = 0x53; dhcpReply[239] = 0x63
         dhcpReply[240] = 53; dhcpReply[241] = 1; dhcpReply[242] = 2 // DHCPOFFER
         dhcpReply[243] = 255
-        let replyUDP = buildDatagram(srcPort: serverPort, dstPort: clientPort, payload: Array(dhcpReply[0..<244]))
+        let replyUDP = buildDatagram(srcPort: serverPort, dstPort: clientPort, payload: Data(dhcpReply[0..<244]))
         let replyIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x502,
                                   flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                   checksum: 0, srcIP: gwIP, dstIP: ipToUInt32("255.255.255.255"),
-                                  payload: replyUDP)
+                                  payload: Data(replyUDP))
         rawFrame(connB: connB, dstMAC: broadcastMAC, srcMAC: gwMAC,
                  etherType: etherTypeIPv4, payload: Data(replyIP.serialize()))
 

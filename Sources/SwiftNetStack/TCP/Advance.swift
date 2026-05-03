@@ -425,12 +425,40 @@ extension TCPState {
         let idleTicks = Int64(cfg.idleTimeout / (TimeInterval(timerWheel.slotSize) / 1e9))
         guard idleTicks > 0 else { return }
 
-        synSent = synSent.filter { tick - $0.value.lastActivityTick <= idleTicks }
-        synRcvd = synRcvd.filter { tick - $0.value.lastActivityTick <= idleTicks }
-        established = established.filter { tick - $0.value.lastActivityTick <= idleTicks }
-        closeWait = closeWait.filter { tick - $0.value.lastActivityTick <= idleTicks }
-        finWait1 = finWait1.filter { tick - $0.value.lastActivityTick <= idleTicks }
-        finWait2 = finWait2.filter { tick - $0.value.lastActivityTick <= idleTicks }
+        // Only reallocate dicts when connections actually need pruning.
+        // In-place removal avoids the per-round filter allocation cost.
+        var removeSynSent: [Tuple] = []
+        var removeSynRcvd: [Tuple] = []
+        var removeEstablished: [Tuple] = []
+        var removeCloseWait: [Tuple] = []
+        var removeFinWait1: [Tuple] = []
+        var removeFinWait2: [Tuple] = []
+
+        for (tuple, conn) in synSent {
+            if tick - conn.lastActivityTick > idleTicks { removeSynSent.append(tuple) }
+        }
+        for (tuple, conn) in synRcvd {
+            if tick - conn.lastActivityTick > idleTicks { removeSynRcvd.append(tuple) }
+        }
+        for (tuple, conn) in established {
+            if tick - conn.lastActivityTick > idleTicks { removeEstablished.append(tuple) }
+        }
+        for (tuple, conn) in closeWait {
+            if tick - conn.lastActivityTick > idleTicks { removeCloseWait.append(tuple) }
+        }
+        for (tuple, conn) in finWait1 {
+            if tick - conn.lastActivityTick > idleTicks { removeFinWait1.append(tuple) }
+        }
+        for (tuple, conn) in finWait2 {
+            if tick - conn.lastActivityTick > idleTicks { removeFinWait2.append(tuple) }
+        }
+
+        for t in removeSynSent { synSent[t] = nil }
+        for t in removeSynRcvd { synRcvd[t] = nil }
+        for t in removeEstablished { established[t] = nil }
+        for t in removeCloseWait { closeWait[t] = nil }
+        for t in removeFinWait1 { finWait1[t] = nil }
+        for t in removeFinWait2 { finWait2[t] = nil }
     }
 
     // MARK: - Output Helpers
@@ -448,25 +476,32 @@ extension TCPState {
             if canSend <= 0 { break }
             if canSend > mss { canSend = mss }
 
-            let data = conn.peekSendData(max: canSend)
-            if data.isEmpty { break }
+            // NetBuf zero-copy: single copy from circular buffer with headroom
+            // for Eth (14) + IP (20) + TCP (20) headers
+            let headroom = 14 + 20 + 20
+            let nb = conn.peekSendDataNetBuf(max: canSend, headroom: headroom)
+            if nb.length == 0 { break }
 
+            let payloadLen = nb.length
+            let payloadData = nb.toArray()
             let flags = TCPFlag.ack | TCPFlag.psh
             let win = conn.scaledWindow(syn: false)
-            let rawSeg = buildSegment(tuple: conn.tuple, seq: conn.sndNxt, ack: conn.rcvNxt,
-                                       flags: flags, window: win, wscale: 0, payload: data)
 
-            let seg = TCPSegment(
-                header: TCPHeader(
-                    srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
-                    seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
-                    dataOffset: 20, flags: flags,
-                    windowSize: win, checksum: 0, urgentPtr: 0
-                ),
-                payload: data,
-                tuple: conn.tuple,
-                raw: rawSeg
+            let tcpHdr = TCPHeader(
+                srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
+                seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
+                dataOffset: 20, flags: flags,
+                windowSize: win, checksum: 0, urgentPtr: 0
             )
+            tcpHdr.marshal(into: nb)
+
+            var seg = TCPSegment(
+                header: tcpHdr,
+                payload: Data(payloadData),
+                tuple: conn.tuple,
+                raw: []
+            )
+            seg.netBuf = nb
 
             if let wf = writeFunc {
                 if wf(seg) != nil {
@@ -476,7 +511,7 @@ extension TCPState {
                 outputs.append(seg)
             }
 
-            conn.sndNxt += UInt32(data.count)
+            conn.sndNxt += UInt32(payloadLen)
             sentData = true
             segCount += 1
         }
@@ -510,7 +545,7 @@ extension TCPState {
                 dataOffset: 20, flags: TCPFlag.ack,
                 windowSize: win, checksum: 0, urgentPtr: 0
             ),
-            payload: [],
+            payload: Data(),
             tuple: conn.tuple,
             raw: rawSeg
         )
@@ -535,7 +570,7 @@ extension TCPState {
                 dataOffset: conn.rcvShift > 0 ? 24 : 20, flags: TCPFlag.syn,
                 windowSize: win, checksum: 0, urgentPtr: 0
             ),
-            payload: [],
+            payload: Data(),
             tuple: conn.tuple,
             raw: rawSeg
         )
@@ -565,7 +600,7 @@ extension TCPState {
                 flags: TCPFlag.syn | TCPFlag.ack,
                 windowSize: win, checksum: 0, urgentPtr: 0
             ),
-            payload: [],
+            payload: Data(),
             tuple: conn.tuple,
             raw: rawSeg
         )
@@ -593,7 +628,7 @@ extension TCPState {
                 dataOffset: 20, flags: TCPFlag.fin | TCPFlag.ack,
                 windowSize: win, checksum: 0, urgentPtr: 0
             ),
-            payload: [],
+            payload: Data(),
             tuple: conn.tuple,
             raw: rawSeg
         )

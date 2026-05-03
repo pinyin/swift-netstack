@@ -14,7 +14,7 @@ func fakeNATTCPSegment(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: U
         dataOffset: 20, flags: flags,
         windowSize: 65535, checksum: 0, urgentPtr: 0
     )
-    return TCPSegment(header: header, payload: payload, tuple: tuple, raw: raw)
+    return TCPSegment(header: header, payload: Data(payload), tuple: tuple, raw: raw)
 }
 
 // MARK: - Test NAT Intercept New SYN

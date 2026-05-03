@@ -39,7 +39,7 @@ final class Forwarder {
     var entries: [Int32: ForwarderEntry] = [:]
     var nextPort: UInt32 = 0
     var tcpState: TCPState?
-    let hostBuf: [UInt8]
+    var hostBuf: [UInt8]
 
     init(gatewayIP: UInt32, mappings: [ForwarderMapping]) {
         self.gatewayIP = gatewayIP
@@ -180,12 +180,9 @@ final class Forwarder {
         let space = conn.sendSpace
         if space == 0 { return }
 
-        var buf = hostBuf
-        if space < buf.count { buf = Array(buf[0..<space]) }
-
-        let bufCount = buf.count
-        let n = buf.withUnsafeMutableBytes { ptr in
-            Darwin.read(entry.hostFD, ptr.baseAddress!, bufCount)
+        let readMax = min(space, hostBuf.count)
+        let n = hostBuf.withUnsafeMutableBytes { ptr in
+            Darwin.read(entry.hostFD, ptr.baseAddress!, readMax)
         }
 
         if n < 0 {
@@ -200,7 +197,9 @@ final class Forwarder {
             return
         }
 
-        _ = conn.writeSendBuf(Array(buf[0..<n]))
+        _ = hostBuf.withUnsafeBytes { ptr in
+            conn.writeSendBuf(ptr: ptr.baseAddress!, count: n)
+        }
     }
 
     private func maybeClose(_ entry: ForwarderEntry) {

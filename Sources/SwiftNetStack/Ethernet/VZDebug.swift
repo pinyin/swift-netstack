@@ -126,7 +126,9 @@ public final class VZDebugConn {
         }
         if n == 0 { return nil }
 
-        return Frame.parse(Array(buf[0..<n]))
+        // One copy into Data; downstream parsing uses zero-copy Data slices
+        let frameData = Data(bytes: buf, count: n)
+        return Frame.parse(frameData)
     }
 
     func readAllFrames() -> [Frame] {
@@ -148,6 +150,31 @@ public final class VZDebugConn {
         return nil
     }
 
+    func write(netBuf: NetBuf) -> Error? {
+        return netBuf.withUnsafeReadableBytes { ptr in
+            guard let base = ptr.baseAddress else {
+                return NSError(domain: NSPOSIXErrorDomain, code: Int(ENOMEM))
+            }
+            let result = Darwin.write(fd, base, netBuf.length)
+            if result < 0 {
+                return NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            return nil
+        }
+    }
+
+    // MARK: - Poll
+
+    /// Wait for readable data on the socket.
+    /// - Parameter timeout: seconds to wait; 0 = non-blocking check.
+    /// - Returns: true if data is available to read, false on timeout.
+    func waitForData(timeout: TimeInterval) -> Bool {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        let timeoutMs = Int32(timeout * 1000)
+        let ret = poll(&pfd, 1, timeoutMs)
+        return ret > 0 && (pfd.revents & Int16(POLLIN)) != 0
+    }
+
     // MARK: - Loopback for Testing
 
     static func newLoopbackPair() -> (VZDebugConn, VZDebugConn)? {
@@ -156,7 +183,7 @@ public final class VZDebugConn {
         guard result >= 0 else { return nil }
 
         // Increase socket buffer sizes to handle batch testing without ENOBUFS
-        var bufSize: Int32 = 1_048_576  // 1 MB
+        var bufSize: Int32 = 4_194_304  // 4 MB
         _ = setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
         _ = setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
         _ = setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))

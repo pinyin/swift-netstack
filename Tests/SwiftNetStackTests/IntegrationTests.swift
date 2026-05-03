@@ -116,11 +116,11 @@ func buildARPRequestFrame(targetIP: UInt32) -> Frame {
 func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: UInt16 = 1) -> Frame {
     let icmp = ICMPPacket(type: icmpTypeEchoRequest, code: 0, checksum: 0,
                           restHdr: UInt32(id) << 16 | UInt32(seq),
-                          payload: Array("pingdata".utf8))
+                          payload: Data("pingdata".utf8))
     let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x42,
                            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
                            checksum: 0, srcIP: srcIP, dstIP: dstIP,
-                           payload: icmp.serialize())
+                           payload: Data(icmp.serialize()))
     return Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                  etherType: etherTypeIPv4, payload: Data(ipPkt.serialize()))
 }
@@ -202,11 +202,11 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         let discoverFull = Array(discover[..<(off + 1)])
 
         // Wrap in UDP → IPv4 → Frame
-        let udpDiscover = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: discoverFull)
+        let udpDiscover = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data(discoverFull))
         let ipDiscover = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x101,
                                      flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                      checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                     payload: udpDiscover)
+                                     payload: Data(udpDiscover))
         let frameDiscover = Frame(dstMAC: broadcastMAC, srcMAC: Data([mac.b0, mac.b1, mac.b2, mac.b3, mac.b4, mac.b5]),
                                    etherType: etherTypeIPv4, payload: Data(ipDiscover.serialize()))
 
@@ -258,11 +258,11 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         request[off] = optEnd
         let requestFull = Array(request[..<(off + 1)])
 
-        let udpRequest = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: requestFull)
+        let udpRequest = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data(requestFull))
         let ipRequest = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x102,
                                     flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                     checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                    payload: udpRequest)
+                                    payload: Data(udpRequest))
         let frameRequest = Frame(dstMAC: broadcastMAC, srcMAC: Data([mac.b0, mac.b1, mac.b2, mac.b3, mac.b4, mac.b5]),
                                   etherType: etherTypeIPv4, payload: Data(ipRequest.serialize()))
 
@@ -290,10 +290,10 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         dnsQuery[29] = 0x00; dnsQuery[30] = 0x01  // QCLASS = IN
         let queryFull = Array(dnsQuery[0..<31])
 
-        let udpData = buildDatagram(srcPort: 54321, dstPort: dnsPort, payload: queryFull)
+        let udpData = buildDatagram(srcPort: 54321, dstPort: dnsPort, payload: Data(queryFull))
         let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x201,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: udpData)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(udpData))
         let frame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize()))
 
@@ -330,7 +330,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
 
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x301,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: synWithCS)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(synWithCS))
         let synFrame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                               etherType: etherTypeIPv4, payload: Data(synIP.serialize()))
 
@@ -371,7 +371,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
 
         let ackIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x302,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: ackWithCS)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(ackWithCS))
         let ackFrame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                               etherType: etherTypeIPv4, payload: Data(ackIP.serialize()))
 
@@ -401,7 +401,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         synBytes[16] = UInt8(synCs >> 8); synBytes[17] = UInt8(synCs & 0xFF)
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x401,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: synBytes)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(synBytes))
         _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                        etherType: etherTypeIPv4, payload: Data(synIP.serialize())))
         waitForDeliberation(0.1)
@@ -431,7 +431,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         dataBytes[16] = UInt8(dataCs >> 8); dataBytes[17] = UInt8(dataCs & 0xFF)
         let dataIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x402,
                                 flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: dataBytes)
+                                checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(dataBytes))
         _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                        etherType: etherTypeIPv4, payload: Data(dataIP.serialize())))
         waitForDeliberation(0.1)
@@ -503,7 +503,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         synBytes[16] = UInt8(synCs >> 8); synBytes[17] = UInt8(synCs & 0xFF)
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x501,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: extIP, payload: synBytes)
+                               checksum: 0, srcIP: vmIP, dstIP: extIP, payload: Data(synBytes))
         let synFrame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                               etherType: etherTypeIPv4, payload: Data(synIP.serialize()))
 
@@ -528,10 +528,10 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         let dstPort: UInt16 = 443
 
         let payload = Array("udp-payload".utf8)
-        let udpData = buildDatagram(srcPort: srcPort, dstPort: dstPort, payload: payload)
+        let udpData = buildDatagram(srcPort: srcPort, dstPort: dstPort, payload: Data(payload))
         let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x601,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
-                               checksum: 0, srcIP: vmIP, dstIP: extIP, payload: udpData)
+                               checksum: 0, srcIP: vmIP, dstIP: extIP, payload: Data(udpData))
         let frame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                           etherType: etherTypeIPv4, payload: Data(ipPkt.serialize()))
 
@@ -564,7 +564,7 @@ func buildICMPEchoFrame(srcIP: UInt32, dstIP: UInt32, id: UInt16 = 0x1234, seq: 
         synBytes[16] = UInt8(synCs >> 8); synBytes[17] = UInt8(synCs & 0xFF)
         let synIP = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0x701,
                                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: synBytes)
+                               checksum: 0, srcIP: vmIP, dstIP: gwIP, payload: Data(synBytes))
         let synFrame = Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                               etherType: etherTypeIPv4, payload: Data(synIP.serialize()))
         _ = connB.write(frame: synFrame)

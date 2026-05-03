@@ -40,6 +40,13 @@ public final class Stack {
     public var bytesIn: UInt64 = 0
     public var bytesOut: UInt64 = 0
 
+    // Diagnostic counters (removable)
+    public var diagRoundCount: Int = 0
+    public var diagFrameCount: Int = 0
+    public var diagMaxFramesPerRound: Int = 0
+    public var diagTotalDeliberateUs: UInt64 = 0
+    public var diagTotalProcessFrameUs: UInt64 = 0
+
     public init(cfg: StackConfig, tcpState: TCPState) {
         self.cfg = cfg
         self.arp = ARPResolver()
@@ -93,6 +100,13 @@ public final class Stack {
         self.conn = conn
     }
 
+    /// Poll the underlying socket for readability.
+    /// - Parameter timeout: seconds to wait; 0 = non-blocking check.
+    /// - Returns: true if data is available to read.
+    public func waitForData(timeout: TimeInterval) -> Bool {
+        conn?.waitForData(timeout: timeout) ?? false
+    }
+
     // MARK: - Run
 
     public func run() throws {
@@ -105,32 +119,40 @@ public final class Stack {
         }
 
         let interval = cfg.bpt
-        var tickCount = 0
 
         while true {
-            let now = Date()
-            tickCount += 1
-            deliberate(now: now)
-            // Sleep for the remainder of the BPT interval
-            let elapsed = Date().timeIntervalSince(now)
-            let remaining = interval - elapsed
-            if remaining > 0 {
-                Thread.sleep(forTimeInterval: remaining)
+            deliberate(now: Date())
+
+            // Check if more data is immediately available (non-blocking poll).
+            // If so, loop immediately — no fixed tick, event-driven.
+            if let conn = conn, conn.waitForData(timeout: 0) {
+                continue
             }
+
+            // No pending input. Block until data arrives, or BPT expires.
+            // BPT serves as the maximum wait ceiling, ensuring timer
+            // expiration and other internal events are handled promptly.
+            _ = conn?.waitForData(timeout: interval)
         }
     }
 
     // MARK: - Deliberate
 
     public func deliberate(now: Date) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
         // Phase 1: Read all available Ethernet frames
         if let conn = conn {
             let frames = conn.readAllFrames()
+            diagFrameCount += frames.count
+            if frames.count > diagMaxFramesPerRound { diagMaxFramesPerRound = frames.count }
             for frame in frames {
                 bytesIn += UInt64(frame.payload.count)
                 processFrame(frame)
             }
         }
+
+        let t1 = CFAbsoluteTimeGetCurrent()
 
         // Phase 2: Forwarder accept + poll
         if let fwd = fwd {
@@ -213,6 +235,11 @@ public final class Stack {
         arp.cleanup(now: now)
 
         FlowStats.global.printIfDue()
+
+        let t2 = CFAbsoluteTimeGetCurrent()
+        diagRoundCount += 1
+        diagTotalProcessFrameUs += UInt64((t1 - t0) * 1_000_000)
+        diagTotalDeliberateUs += UInt64((t2 - t0) * 1_000_000)
     }
 
     // MARK: - Frame Processing
@@ -252,7 +279,8 @@ public final class Stack {
     }
 
     func processIPv4(_ frame: Frame) {
-        guard let pkt = IPv4Packet.parse([UInt8](frame.payload)) else { return }
+        // Zero-copy: pass frame.payload (Data) directly to IPv4Packet.parse(Data)
+        guard let pkt = IPv4Packet.parse(frame.payload) else { return }
 
         // Learn source IP→MAC
         arp.set(ip: pkt.srcIP, mac: frame.srcMAC)
@@ -300,7 +328,7 @@ public final class Stack {
             version: 4, ihl: 20, tos: 0, totalLen: 0, id: pkt.id,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
             checksum: 0, srcIP: pkt.dstIP, dstIP: pkt.srcIP,
-            payload: reply.serialize()
+            payload: Data(reply.serialize())
         )
         _ = writeIPv4Packet(dstMAC: frame.srcMAC, pkt: ipReply)
     }
@@ -313,7 +341,7 @@ public final class Stack {
         let id = UInt16(icmpPkt.restHdr >> 16)
         let seq = UInt16(icmpPkt.restHdr & 0xFFFF)
         icmpFwd.forward(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
-                        id: id, seq: seq, payload: icmpPkt.payload)
+                        id: id, seq: seq, payload: [UInt8](icmpPkt.payload))
     }
 
     func processUDPNAT(_ frame: Frame, _ pkt: IPv4Packet) {
@@ -325,8 +353,10 @@ public final class Stack {
     }
 
     func processTCP(_ frame: Frame, _ pkt: IPv4Packet) {
-        // Verify TCP checksum on ingress
-        let cs = tcpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, tcpData: pkt.payload)
+        // Verify TCP checksum on ingress (zero-copy: Data withUnsafeBytes)
+        let cs = pkt.payload.withUnsafeBytes { ptr in
+            tcpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, tcpDataPtr: ptr.baseAddress!, tcpDataCount: pkt.payload.count)
+        }
         guard cs == 0 else { return }
 
         guard let seg = TCPSegment.parse(pkt.payload, srcIP: pkt.srcIP, dstIP: pkt.dstIP) else { return }
@@ -337,7 +367,9 @@ public final class Stack {
         guard let (hdr, payload) = parseUDP(pkt.payload) else { return }
         // Verify UDP checksum if present (non-zero)
         if hdr.checksum != 0 {
-            let cs = udpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, udpData: pkt.payload)
+            let cs = pkt.payload.withUnsafeBytes { ptr in
+                udpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, udpDataPtr: ptr.baseAddress!, udpDataCount: pkt.payload.count)
+            }
             guard cs == 0 else { return }
         }
         let dg = UDPDatagram(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
@@ -360,6 +392,40 @@ public final class Stack {
             return nil
         }
 
+        // NetBuf fast path: segment was built with buildSegmentNetBuf
+        // Layout: [14 Eth headroom | 20 IP headroom | TCP header | payload]
+        if let nb = seg.netBuf {
+            let srcIP = seg.tuple.srcIP
+            let tcpLen = nb.length
+
+            // Compute TCP checksum directly on NetBuf (zero-allocation)
+            let cs = nb.withUnsafeReadableBytes { ptr in
+                tcpChecksum(srcIP: srcIP, dstIP: dstIP, tcpDataPtr: ptr.baseAddress!, tcpDataCount: tcpLen)
+            }
+            nb.setUInt16BE(at: 16, cs)  // checksum at offset 16 in TCP header
+
+            // Prepend IP header into headroom (20 bytes)
+            let ipPkt = IPv4Packet(
+                version: 4, ihl: 20, tos: 0, totalLen: 0,
+                id: nextIPID,
+                flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
+                checksum: 0, srcIP: srcIP, dstIP: dstIP,
+                payload: Data()
+            )
+            nextIPID = nextIPID &+ 1
+            _ = ipPkt.serialize(into: nb)
+
+            // Prepend Ethernet header into headroom (14 bytes)
+            _ = prependEthernetHeader(into: nb, dstMAC: dstMAC, srcMAC: cfg.gatewayMAC, etherType: etherTypeIPv4)
+
+            // Write directly from NetBuf to socket
+            let payloadBytes = tcpLen - Int(seg.header.dataOffset)
+            FlowStats.global.outSegs += 1
+            FlowStats.global.outBytes += Int64(payloadBytes)
+            return writeNetBuf(nb)
+        }
+
+        // Legacy path (fallback for segments without netBuf)
         var tcpBytes = seg.raw
         if tcpBytes.isEmpty {
             tcpBytes = seg.header.marshal() + seg.payload
@@ -368,25 +434,32 @@ public final class Stack {
         tcpBytes[16] = UInt8(cs >> 8)
         tcpBytes[17] = UInt8(cs & 0xFF)
 
-        let verify = tcpChecksum(srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP, tcpData: tcpBytes)
-        if verify != 0 {
-            FlowStats.global.outCSError += 1
-            return NSError(domain: "TCP", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "TCP checksum error: \(verify)"])
-        }
-
         let ipPkt = IPv4Packet(
             version: 4, ihl: 20, tos: 0, totalLen: 0,
             id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
             checksum: 0, srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP,
-            payload: tcpBytes
+            payload: Data(tcpBytes)
         )
         nextIPID = nextIPID &+ 1
 
         FlowStats.global.outSegs += 1
         FlowStats.global.outBytes += Int64(seg.payload.count)
         return writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
+    }
+
+    /// Write a NetBuf directly to the connection socket.
+    func writeNetBuf(_ nb: NetBuf) -> Error? {
+        guard let conn = conn else { return nil }
+        if let err = conn.write(netBuf: nb) {
+            if (err as NSError).domain == NSPOSIXErrorDomain &&
+                (err as NSError).code == Int(ENOBUFS) {
+                FlowStats.global.outBufFull += 1
+            }
+            return err
+        }
+        bytesOut += UInt64(nb.length)
+        return nil
     }
 
     func sendDatagram(_ dg: UDPDatagram) {
@@ -404,7 +477,7 @@ public final class Stack {
             id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
             checksum: 0, srcIP: dg.srcIP, dstIP: dg.dstIP,
-            payload: udpBytes
+            payload: Data(udpBytes)
         )
         nextIPID = nextIPID &+ 1
 
@@ -423,7 +496,7 @@ public final class Stack {
             version: 4, ihl: 20, tos: 0, totalLen: 0, id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
             checksum: 0, srcIP: reply.srcIP, dstIP: reply.dstIP,
-            payload: icmpData
+            payload: Data(icmpData)
         )
         nextIPID = nextIPID &+ 1
 

@@ -42,7 +42,7 @@ import Testing
     #expect(parsed.srcPort == 1234)
     #expect(parsed.dstPort == 53)
     #expect(parsed.length == UInt16(8 + payload.count))
-    #expect(pd == payload, "payload mismatch")
+    #expect(pd == Data(payload), "payload mismatch")
 }
 
 // MARK: - ParseUDP Truncated Length
@@ -78,7 +78,7 @@ import Testing
 
 @Test func testBuildDatagram() {
     let payload: [UInt8] = [0x01, 0x02, 0x03]
-    let data = buildDatagram(srcPort: 53, dstPort: 12345, payload: payload)
+    let data = buildDatagram(srcPort: 53, dstPort: 12345, payload: Data(payload))
 
     #expect(data.count == 8 + payload.count)
     #expect(data[0] == 0x00 && data[1] == 0x35) // srcPort=53
@@ -90,7 +90,7 @@ import Testing
 // MARK: - BuildDatagram Empty Payload
 
 @Test func testBuildDatagramEmptyPayload() {
-    let data = buildDatagram(srcPort: 67, dstPort: 68, payload: [])
+    let data = buildDatagram(srcPort: 67, dstPort: 68, payload: Data())
     #expect(data.count == 8)
     #expect(data[0] == 0x00 && data[1] == 0x43) // srcPort=67
     #expect(data[4] == 0x00 && data[5] == 0x08) // length=8
@@ -107,13 +107,13 @@ import Testing
         #expect(dg.dstPort == 80)
         return [UDPDatagram(srcIP: dg.dstIP, dstIP: dg.srcIP,
                             srcPort: dg.dstPort, dstPort: dg.srcPort,
-                            payload: Array("response".utf8))]
+                            payload: Data("response".utf8))]
     }
 
     let dg = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
         srcPort: 12345, dstPort: 80,
-        payload: Array("request".utf8)
+        payload: Data("request".utf8)
     )
 
     mux.deliver(dg)
@@ -133,7 +133,7 @@ import Testing
     let dg = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
         srcPort: 12345, dstPort: 9999,
-        payload: Array("drop".utf8)
+        payload: Data("drop".utf8)
     )
 
     mux.deliver(dg)
@@ -149,18 +149,18 @@ import Testing
     mux.register(port: 53) { dg in
         return [UDPDatagram(srcIP: dg.dstIP, dstIP: dg.srcIP,
                             srcPort: 53, dstPort: dg.srcPort,
-                            payload: Array("dns-resp".utf8))]
+                            payload: Data("dns-resp".utf8))]
     }
     mux.register(port: 67) { dg in
         return [UDPDatagram(srcIP: dg.dstIP, dstIP: dg.srcIP,
                             srcPort: 67, dstPort: dg.srcPort,
-                            payload: Array("dhcp-resp".utf8))]
+                            payload: Data("dhcp-resp".utf8))]
     }
 
     mux.deliver(UDPDatagram(srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
-                             srcPort: 12345, dstPort: 53, payload: Array("dns".utf8)))
+                             srcPort: 12345, dstPort: 53, payload: Data("dns".utf8)))
     mux.deliver(UDPDatagram(srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
-                             srcPort: 12346, dstPort: 67, payload: Array("dhcp".utf8)))
+                             srcPort: 12346, dstPort: 67, payload: Data("dhcp".utf8)))
 
     let responses = mux.consumeOutputs()
     #expect(responses.count == 2)
@@ -173,10 +173,10 @@ import Testing
 
     mux.register(port: 80) { dg in
         return [UDPDatagram(srcIP: dg.dstIP, dstIP: dg.srcIP,
-                            srcPort: 80, dstPort: dg.srcPort, payload: [])]
+                            srcPort: 80, dstPort: dg.srcPort, payload: Data())]
     }
 
-    mux.deliver(UDPDatagram(srcIP: 0, dstIP: 0, srcPort: 0, dstPort: 80, payload: []))
+    mux.deliver(UDPDatagram(srcIP: 0, dstIP: 0, srcPort: 0, dstPort: 80, payload: Data()))
     let first = mux.consumeOutputs()
     #expect(first.count == 1)
     let second = mux.consumeOutputs()

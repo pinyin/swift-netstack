@@ -123,23 +123,23 @@ final class DHCPServer {
 
     func buildOffer(_ dg: UDPDatagram, clientMAC: MACAddr) -> UDPDatagram? {
         guard let ip = allocateIP(clientMAC) else { return nil }
-        let txID = Array(dg.payload[4..<8])
+        let txID = [UInt8](dg.payload.subdata(in: 4..<8))
         let responsePayload = buildResponse(msgOffer, txID: txID, clientMAC: clientMAC, assignedIP: ip)
         let broadcastIP = ipToUInt32("255.255.255.255")
         return UDPDatagram(srcIP: cfg.gatewayIP, dstIP: broadcastIP,
                            srcPort: serverPort, dstPort: clientPort,
-                           payload: responsePayload)
+                           payload: Data(responsePayload))
     }
 
     func buildAck(_ dg: UDPDatagram, clientMAC: MACAddr) -> UDPDatagram? {
-        let txID = Array(dg.payload[4..<8])
+        let txID = [UInt8](dg.payload.subdata(in: 4..<8))
 
         var reqIP: UInt32 = 0
         if let reqIPOpt = getOption(dg.payload, optType: optRequestedIP), reqIPOpt.count >= 4 {
             reqIP = UInt32(reqIPOpt[0]) << 24 | UInt32(reqIPOpt[1]) << 16 |
                     UInt32(reqIPOpt[2]) << 8 | UInt32(reqIPOpt[3])
         } else {
-            let p = dg.payload
+            let p = [UInt8](dg.payload)
             reqIP = UInt32(p[12]) << 24 | UInt32(p[13]) << 16 |
                     UInt32(p[14]) << 8 | UInt32(p[15])
         }
@@ -159,7 +159,7 @@ final class DHCPServer {
 
         return UDPDatagram(srcIP: cfg.gatewayIP, dstIP: dstIP,
                            srcPort: serverPort, dstPort: clientPort,
-                           payload: responsePayload)
+                           payload: Data(responsePayload))
     }
 
     // MARK: - buildResponse (append-based, no fixed buffer)
@@ -266,7 +266,7 @@ final class DHCPServer {
 
     // MARK: - Option Parsing
 
-    func getOption(_ data: [UInt8], optType: UInt8) -> [UInt8]? {
+    func getOption(_ data: Data, optType: UInt8) -> [UInt8]? {
         guard data.count >= 240 else { return nil }
         let cookie = UInt32(data[236]) << 24 | UInt32(data[237]) << 16 |
                      UInt32(data[238]) << 8 | UInt32(data[239])

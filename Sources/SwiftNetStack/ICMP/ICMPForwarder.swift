@@ -122,11 +122,15 @@ func buildICMPEchoRequest(id: UInt16, seq: UInt16, payload: [UInt8]) -> [UInt8] 
     var buf = [UInt8](repeating: 0, count: 8 + payload.count)
     buf[0] = 8 // Echo Request
     buf[1] = 0 // Code
-    // buf[2..<4] = checksum (computed below)
     buf[4] = UInt8(id >> 8); buf[5] = UInt8(id & 0xFF)
     buf[6] = UInt8(seq >> 8); buf[7] = UInt8(seq & 0xFF)
-    for i in 0..<payload.count { buf[8 + i] = payload[i] }
-
+    if !payload.isEmpty {
+        buf.withUnsafeMutableBytes { dst in
+            payload.withUnsafeBytes { src in
+                memcpy(dst.baseAddress!.advanced(by: 8), src.baseAddress!, payload.count)
+            }
+        }
+    }
     let cs = ipChecksum(buf)
     buf[2] = UInt8(cs >> 8); buf[3] = UInt8(cs & 0xFF)
     return buf
@@ -138,8 +142,13 @@ func buildICMPReplyData(id: UInt16, seq: UInt16, payload: [UInt8]) -> [UInt8] {
     buf[1] = 0 // Code
     buf[4] = UInt8(id >> 8); buf[5] = UInt8(id & 0xFF)
     buf[6] = UInt8(seq >> 8); buf[7] = UInt8(seq & 0xFF)
-    for i in 0..<payload.count { buf[8 + i] = payload[i] }
-
+    if !payload.isEmpty {
+        buf.withUnsafeMutableBytes { dst in
+            payload.withUnsafeBytes { src in
+                memcpy(dst.baseAddress!.advanced(by: 8), src.baseAddress!, payload.count)
+            }
+        }
+    }
     let cs = ipChecksum(buf)
     buf[2] = UInt8(cs >> 8); buf[3] = UInt8(cs & 0xFF)
     return buf

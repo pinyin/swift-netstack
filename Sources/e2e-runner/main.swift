@@ -152,7 +152,12 @@ func runE2ETests() -> Int32 {
     deliberationQueue.async {
         while runningFlag.value {
             stack.deliberate(now: Date())
-            Thread.sleep(forTimeInterval: 0.001)
+            // Event-driven: if more data is already available, loop immediately.
+            // Otherwise block until data arrives or BPT expires (1ms).
+            if stack.waitForData(timeout: 0) {
+                continue
+            }
+            _ = stack.waitForData(timeout: 0.001)
         }
     }
 

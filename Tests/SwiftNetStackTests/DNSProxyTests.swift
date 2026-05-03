@@ -50,7 +50,7 @@ func makeServfailProxy() -> DNSProxy {
         srcIP: ipToUInt32("192.168.65.2"),
         dstIP: ipToUInt32("192.168.65.1"),
         srcPort: 12345, dstPort: dnsPort,
-        payload: query
+        payload: Data(query)
     )
 
     let handler = proxy.handler()
@@ -91,7 +91,7 @@ func makeServfailProxy() -> DNSProxy {
         srcIP: ipToUInt32("192.168.65.2"),
         dstIP: ipToUInt32("192.168.65.1"),
         srcPort: 12345, dstPort: dnsPort,
-        payload: query
+        payload: Data(query)
     )
 
     let proxy = makeServfailProxy()
@@ -125,11 +125,11 @@ func makeServfailProxy() -> DNSProxy {
 
     let dg1 = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
-        srcPort: 12345, dstPort: dnsPort, payload: query1
+        srcPort: 12345, dstPort: dnsPort, payload: Data(query1)
     )
     let dg2 = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
-        srcPort: 12346, dstPort: dnsPort, payload: query2
+        srcPort: 12346, dstPort: dnsPort, payload: Data(query2)
     )
 
     let handler = proxy.handler()
@@ -147,7 +147,7 @@ func makeServfailProxy() -> DNSProxy {
     let proxy = makeServfailProxy()
     let dg = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
-        srcPort: 12345, dstPort: dnsPort, payload: []
+        srcPort: 12345, dstPort: dnsPort, payload: Data()
     )
 
     let handler = proxy.handler()
@@ -166,7 +166,7 @@ func makeServfailProxy() -> DNSProxy {
     let dg = UDPDatagram(
         srcIP: ipToUInt32("192.168.65.2"), dstIP: ipToUInt32("192.168.65.1"),
         srcPort: 12345, dstPort: dnsPort,
-        payload: makeTestDNSQuery("example.com")
+        payload: Data(makeTestDNSQuery("example.com"))
     )
 
     let handler = proxy.handler()

@@ -12,7 +12,7 @@ import Testing
     let dg = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("test-dns-query".utf8)
+        payload: Data("test-dns-query".utf8)
     )
 
     let handled = table.intercept(dg)
@@ -34,12 +34,12 @@ import Testing
     let dg1 = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("query-1".utf8)
+        payload: Data("query-1".utf8)
     )
     let dg2 = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("query-2".utf8)
+        payload: Data("query-2".utf8)
     )
 
     table.intercept(dg1)
@@ -60,12 +60,12 @@ import Testing
     let dg1 = UDPDatagram(
         srcIP: srcIP, dstIP: ipToUInt32("8.8.8.8"),
         srcPort: 12345, dstPort: 53,
-        payload: Array("query-1".utf8)
+        payload: Data("query-1".utf8)
     )
     let dg2 = UDPDatagram(
         srcIP: srcIP, dstIP: ipToUInt32("1.1.1.1"),
         srcPort: 12345, dstPort: 53,
-        payload: Array("query-2".utf8)
+        payload: Data("query-2".utf8)
     )
 
     table.intercept(dg1)
@@ -84,12 +84,12 @@ import Testing
     let dg1 = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("query-1".utf8)
+        payload: Data("query-1".utf8)
     )
     let dg2 = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12346, dstPort: 53,
-        payload: Array("query-2".utf8)
+        payload: Data("query-2".utf8)
     )
 
     table.intercept(dg1)
@@ -108,7 +108,7 @@ import Testing
     let dg = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("test".utf8)
+        payload: Data("test".utf8)
     )
 
     table.intercept(dg)
@@ -132,7 +132,7 @@ import Testing
     let dg = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("test".utf8)
+        payload: Data("test".utf8)
     )
     table.intercept(dg)
 
@@ -154,7 +154,7 @@ import Testing
     let dg = UDPDatagram(
         srcIP: srcIP, dstIP: dstIP,
         srcPort: 12345, dstPort: 53,
-        payload: Array("test".utf8)
+        payload: Data("test".utf8)
     )
     table.intercept(dg)
 
@@ -177,7 +177,7 @@ import Testing
         UDPDatagram(
             srcIP: dstIP, dstIP: srcIP,
             srcPort: 53, dstPort: 12345,
-            payload: Array("dns-response".utf8)
+            payload: Data("dns-response".utf8)
         )
     ]
     table.entries[key] = entry

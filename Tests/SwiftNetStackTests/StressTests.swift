@@ -52,7 +52,7 @@ func stressFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
     raw[16] = UInt8(cs >> 8); raw[17] = UInt8(cs & 0xFF)
     let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16((srcPort & 0xFF00) | (dstPort & 0xFF)),
                            flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
-                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: raw)
+                           checksum: 0, srcIP: srcIP, dstIP: dstIP, payload: Data(raw))
     _ = connB.write(frame: Frame(dstMAC: gwMAC, srcMAC: vmMAC,
                                   etherType: etherTypeIPv4, payload: Data(ipPkt.serialize())))
 }
@@ -294,11 +294,11 @@ func stressFrame(connB: VZDebugConn, srcIP: UInt32, dstIP: UInt32,
             discover[off] = optEnd
             let full = Array(discover[..<(off + 1)])
 
-            let udpData = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: full)
+            let udpData = buildDatagram(srcPort: clientPort, dstPort: serverPort, payload: Data(full))
             let ipPkt = IPv4Packet(version: 4, ihl: 20, tos: 0, totalLen: 0, id: UInt16(0x300 + i),
                                    flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
                                    checksum: 0, srcIP: 0, dstIP: ipToUInt32("255.255.255.255"),
-                                   payload: udpData)
+                                   payload: Data(udpData))
             let frame = Frame(dstMAC: broadcastMAC, srcMAC: Data([mac.b0, mac.b1, mac.b2, mac.b3, mac.b4, mac.b5]),
                               etherType: etherTypeIPv4, payload: Data(ipPkt.serialize()))
             _ = connB.write(frame: frame)

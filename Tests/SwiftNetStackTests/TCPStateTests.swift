@@ -16,7 +16,7 @@ func fakeSegment(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: UInt16,
         dataOffset: dataOffset, flags: flags,
         windowSize: window, checksum: 0, urgentPtr: 0
     )
-    return TCPSegment(header: header, payload: payload, tuple: tuple, raw: raw)
+    return TCPSegment(header: header, payload: Data(payload), tuple: tuple, raw: raw)
 }
 
 func fakeSegmentWithWindow(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: UInt16,
@@ -30,7 +30,7 @@ func fakeSegmentWithWindow(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPor
         dataOffset: 20, flags: flags,
         windowSize: window, checksum: 0, urgentPtr: 0
     )
-    return TCPSegment(header: header, payload: payload, tuple: tuple, raw: raw)
+    return TCPSegment(header: header, payload: Data(payload), tuple: tuple, raw: raw)
 }
 
 func doHandshake(_ ts: TCPState, vmIP: UInt32, gwIP: UInt32, srcPort: UInt16, dstPort: UInt16) {
@@ -334,7 +334,7 @@ func makeConfig(listenPort: UInt16 = 8080, gatewayIP: UInt32 = 0) -> TCPConfig {
         if !out.payload.isEmpty {
             totalDataLen += out.payload.count
             #expect(out.payload.count == 22, "data payload length = \(out.payload.count), expected 22")
-            #expect(out.payload == testData, "data payload mismatch")
+            #expect([UInt8](out.payload) == testData, "data payload mismatch")
         }
     }
     #expect(totalDataLen == 22, "total data sent = \(totalDataLen) bytes, expected 22")
@@ -657,7 +657,7 @@ func makeConfig(listenPort: UInt16 = 8080, gatewayIP: UInt32 = 0) -> TCPConfig {
     let synHdr = TCPHeader(srcPort: 12345, dstPort: 8080, seqNum: 1000, ackNum: 0,
                            dataOffset: 24, flags: TCPFlag.syn,
                            windowSize: 65535, checksum: 0, urgentPtr: 0)
-    let synSeg = TCPSegment(header: synHdr, payload: [], tuple: tuple, raw: synRaw)
+    let synSeg = TCPSegment(header: synHdr, payload: Data(), tuple: tuple, raw: synRaw)
     ts.injectSegment(synSeg)
     ts.deliberate(now: Date())
 

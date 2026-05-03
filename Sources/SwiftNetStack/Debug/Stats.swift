@@ -28,14 +28,16 @@ final class FlowStats {
     var outBufFull: Int64 = 0
     var outCSError: Int64 = 0
 
-    private var lastPrint: Date = Date()
+    private var tickCount: Int = 0
+    private var lastPrintTick: Int = 0
 
     nonisolated(unsafe) static let global = FlowStats()
 
     func printIfDue() {
-        guard Date().timeIntervalSince(lastPrint) >= 1.0 else { return }
+        tickCount += 1
+        guard tickCount - lastPrintTick >= 1000 else { return }
         print()
-        lastPrint = Date()
+        lastPrintTick = tickCount
     }
 
     func print() {

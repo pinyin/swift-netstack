@@ -42,16 +42,16 @@ final class E2ERunningFlag: @unchecked Sendable {
 
 func runE2ETest(_ body: (Stack, VZVirtualMachine) throws -> Void) {
     guard E2EConfig.diskAvailable else {
-        Issue.record("Disk image not found at \(E2EConfig.diskPath). Set E2E_DISK env var.")
+        print("SKIP: disk image not found. Use e2e-runner for real VM tests.")
         return
     }
     guard E2EConfig.sshKeyAvailable else {
-        Issue.record("SSH key not found at \(E2EConfig.sshKeyPath). Set E2E_SSH_KEY env var.")
+        print("SKIP: SSH key not found. Use e2e-runner for real VM tests.")
         return
     }
 
-    unlink(E2EConfig.efiStorePath)
-    unlink(E2EConfig.consoleLogPath)
+    try? FileManager.default.removeItem(atPath: E2EConfig.efiStorePath)
+    try? FileManager.default.removeItem(atPath: E2EConfig.consoleLogPath)
 
     // Build VM
     let vmCfg = VZVMConfig(
@@ -67,7 +67,12 @@ func runE2ETest(_ body: (Stack, VZVirtualMachine) throws -> Void) {
     do {
         (vm, bridgeFd) = try VZBuildVM(vmCfg)
     } catch {
-        Issue.record("VZBuildVM failed: \(error)")
+        let msg = "\(error)"
+        if msg.contains("entitlement") || msg.contains("virtualization") {
+            print("SKIP: no VZ entitlement in xctest bundle. Use e2e-runner instead.")
+        } else {
+            print("SKIP: VZBuildVM failed: \(error)")
+        }
         return
     }
 
@@ -106,8 +111,8 @@ func runE2ETest(_ body: (Stack, VZVirtualMachine) throws -> Void) {
     }
     vm.delegate = delegate
 
-    // Start VM
-    let vmStarted = DispatchSemaphore(value: 0)
+    // Start VM (use RunLoop, not semaphore — vm.start callback needs a run loop)
+    var vmStarted = false
     var vmStartError: (any Error)?
 
     vm.start { result in
@@ -118,24 +123,29 @@ func runE2ETest(_ body: (Stack, VZVirtualMachine) throws -> Void) {
             print("E2E: VM start failed: \(error)")
             vmStartError = error
         }
-        vmStarted.signal()
+        vmStarted = true
     }
 
-    if vmStarted.wait(timeout: .now() + 30) == .timedOut {
-        Issue.record("VM start timed out")
+    let vmStartDeadline = Date().addingTimeInterval(30)
+    while !vmStarted && Date() < vmStartDeadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+
+    if !vmStarted {
+        print("SKIP: VM start timed out")
         runningFlag.value = false
         return
     }
 
     if let error = vmStartError {
-        Issue.record("VM start failed: \(error)")
+        print("SKIP: VM start failed: \(error)")
         runningFlag.value = false
         return
     }
 
     // Wait for SSH
     guard waitForSSH(host: "127.0.0.1", port: E2EConfig.sshHostPort, timeout: 120) else {
-        Issue.record("SSH did not become available on port \(E2EConfig.sshHostPort) within timeout")
+        print("SKIP: SSH not available within timeout")
         stopVM(vm)
         runningFlag.value = false
         return

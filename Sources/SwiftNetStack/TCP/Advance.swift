@@ -28,6 +28,18 @@ extension TCPState {
                 conn.retransmitCount += 1
                 conn.retransmitAt = 0
             }
+            if let conn = finWait1[tuple] {
+                conn.sndNxt = conn.sndUna
+                conn.retransmitAt = 0
+            }
+            if let conn = finWait2[tuple] {
+                conn.sndNxt = conn.sndUna
+                conn.retransmitAt = 0
+            }
+            if let conn = closeWait[tuple] {
+                conn.sndNxt = conn.sndUna
+                conn.retransmitAt = 0
+            }
             if timeWait[tuple] != nil {
                 timeWait[tuple] = nil
             }
@@ -111,6 +123,10 @@ extension TCPState {
                     conn.sndUna = seg.header.ackNum
                     conn.sndNxt = conn.iss + 1
                     conn.sndWnd = UInt32(seg.header.windowSize)
+                    let ws = parseWindowScale(seg.raw)
+                    if ws > 0 {
+                        conn.sndShift = ws
+                    }
                     acked = true
                 }
             }
@@ -204,13 +220,17 @@ extension TCPState {
 
             if forward {
                 established[tuple] = nil
-                conn.pendingSegs = []
+                conn.pendingSegs = conn.pendingSegs.filter { seg in
+                    !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+                }
                 closeWait[tuple] = conn
                 continue
             }
 
             sendDataAndAcks(conn)
-            conn.pendingSegs = []
+            conn.pendingSegs = conn.pendingSegs.filter { seg in
+                !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+            }
         }
     }
 
@@ -241,7 +261,9 @@ extension TCPState {
             if closeWait[tuple] == nil { continue }
 
             sendDataAndAcks(conn)
-            conn.pendingSegs = []
+            conn.pendingSegs = conn.pendingSegs.filter { seg in
+                !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+            }
         }
     }
 
@@ -315,7 +337,9 @@ extension TCPState {
 
             if hasPeerFin && hasAckOfFin {
                 finWait1[tuple] = nil
-                conn.pendingSegs = []
+                conn.pendingSegs = conn.pendingSegs.filter { seg in
+                    !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+                }
                 conn.timeWaitUntil = tick + msToTicks(60000)
                 timerWheel.schedule(tuple: conn.tuple, tick: conn.timeWaitUntil)
                 timeWait[tuple] = conn
@@ -325,7 +349,9 @@ extension TCPState {
 
             if hasAckOfFin {
                 finWait1[tuple] = nil
-                conn.pendingSegs = []
+                conn.pendingSegs = conn.pendingSegs.filter { seg in
+                    !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+                }
                 finWait2[tuple] = conn
                 if hasPeerFin { sendACK(conn) }
                 continue
@@ -335,7 +361,9 @@ extension TCPState {
                 sendDataAndAcks(conn)
             }
             sendFIN(conn)
-            conn.pendingSegs = []
+            conn.pendingSegs = conn.pendingSegs.filter { seg in
+                !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+            }
         }
     }
 
@@ -364,7 +392,9 @@ extension TCPState {
 
             if forward {
                 finWait2[tuple] = nil
-                conn.pendingSegs = []
+                conn.pendingSegs = conn.pendingSegs.filter { seg in
+                    !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+                }
                 conn.timeWaitUntil = tick + msToTicks(60000)
                 timerWheel.schedule(tuple: conn.tuple, tick: conn.timeWaitUntil)
                 timeWait[tuple] = conn
@@ -372,7 +402,9 @@ extension TCPState {
                 continue
             }
 
-            conn.pendingSegs = []
+            conn.pendingSegs = conn.pendingSegs.filter { seg in
+                !seg.payload.isEmpty && seg.header.seqNum != conn.rcvNxt
+            }
         }
     }
 
@@ -437,7 +469,7 @@ extension TCPState {
             )
 
             if let wf = writeFunc {
-                if let err = wf(seg) {
+                if wf(seg) != nil {
                     break
                 }
             } else {
@@ -509,7 +541,7 @@ extension TCPState {
         )
 
         if let wf = writeFunc {
-            if let _ = wf(seg) { return }
+            if wf(seg) != nil { return }
         } else {
             outputs.append(seg)
         }
@@ -539,7 +571,7 @@ extension TCPState {
         )
 
         if let wf = writeFunc {
-            if let _ = wf(seg) { return }
+            if wf(seg) != nil { return }
         } else {
             outputs.append(seg)
         }
@@ -567,7 +599,7 @@ extension TCPState {
         )
 
         if let wf = writeFunc {
-            if let _ = wf(seg) { return }
+            if wf(seg) != nil { return }
         } else {
             outputs.append(seg)
         }
@@ -589,21 +621,38 @@ extension TCPState {
 
     func checkInvariants() {
         let all: [[Tuple: TCPConn]] = [synSent, synRcvd, established, closeWait, lastAck, finWait1, finWait2, timeWait]
+        var drop: Set<Tuple> = []
+
         for coll in all {
             for (tuple, conn) in coll {
                 if seqGT(conn.sndUna, conn.sndNxt) {
-                    fatalError("SND_UNA > SND_NXT in \(tuple)")
+                    NSLog("TCP invariant: SND_UNA > SND_NXT in \(tuple), dropping connection")
+                    drop.insert(tuple)
                 }
                 if Int(conn.sndNxt - conn.sndUna) > conn.sendSize + 2 {
-                    fatalError("inflight exceeds sendSize+2 in \(tuple)")
+                    NSLog("TCP invariant: inflight exceeds sendSize+2 in \(tuple), dropping connection")
+                    drop.insert(tuple)
                 }
                 if conn.sendSize < 0 || conn.sendSize > conn.sendBuf.count {
-                    fatalError("sendSize out of bounds in \(tuple)")
+                    NSLog("TCP invariant: sendSize out of bounds in \(tuple), dropping connection")
+                    drop.insert(tuple)
                 }
                 if conn.recvSize < 0 || conn.recvSize > conn.recvBuf.count {
-                    fatalError("recvSize out of bounds in \(tuple)")
+                    NSLog("TCP invariant: recvSize out of bounds in \(tuple), dropping connection")
+                    drop.insert(tuple)
                 }
             }
+        }
+
+        for tuple in drop {
+            synSent[tuple] = nil
+            synRcvd[tuple] = nil
+            established[tuple] = nil
+            closeWait[tuple] = nil
+            lastAck[tuple] = nil
+            finWait1[tuple] = nil
+            finWait2[tuple] = nil
+            timeWait[tuple] = nil
         }
     }
 }

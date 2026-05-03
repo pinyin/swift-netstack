@@ -1,0 +1,3 @@
+import SwiftNetStack
+
+BenchRunner.run()

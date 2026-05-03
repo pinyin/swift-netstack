@@ -82,27 +82,6 @@ public final class TCPState {
         pending.append(seg)
     }
 
-    // MARK: - PreProcess ACKs
-
-    func preProcessACKs() {
-        for seg in pending {
-            let tuple = seg.tuple.reversed()
-
-            if synSent[tuple] != nil { continue }
-            if synRcvd[tuple] != nil { continue }
-
-            guard let conn = findConn(tuple) else { continue }
-            if seg.header.isACK() && seqGT(seg.header.ackNum, conn.sndUna) {
-                let ackDelta = seg.header.ackNum - conn.sndUna
-                conn.ackSendBuf(seg.header.ackNum)
-                conn.sndWnd = UInt32(seg.header.windowSize) << conn.sndShift
-                if seqGT(conn.sndUna, conn.sndNxt) {
-                    conn.sndNxt = conn.sndUna
-                }
-            }
-        }
-    }
-
     // MARK: - App-layer API
 
     func appWrite(tuple: Tuple, data: [UInt8]) {
@@ -187,7 +166,7 @@ public final class TCPState {
     // MARK: - Lookup Helpers
 
     func findConn(_ tuple: Tuple) -> TCPConn? {
-        let all: [[Tuple: TCPConn]] = [synSent, synRcvd, established, closeWait, lastAck, finWait1, finWait2, timeWait]
+        let all: [[Tuple: TCPConn]] = [synSent, synRcvd, established, closeWait, lastAck, finWait1, finWait2]
         for coll in all {
             if let conn = coll[tuple] { return conn }
         }
@@ -209,8 +188,7 @@ public final class TCPState {
             if SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!) == errSecSuccess {
                 return
             }
-            // Fallback: use time-based value
-            ptr.storeBytes(of: UInt32(Date().timeIntervalSince1970 * 1e9), as: UInt32.self)
+            ptr.storeBytes(of: arc4random(), as: UInt32.self)
         }
         return b
     }

@@ -35,23 +35,40 @@ final class TimerWheel {
         guard currentTick > lastTick else { return [] }
 
         var expired: [Tuple] = []
-        let start = Int(lastTick % Int64(numSlots))
-        let end = Int(currentTick % Int64(numSlots))
 
-        var i = start + 1
-        while true {
-            let slot = i % numSlots
-            var remaining: [SlotEntry] = []
-            for entry in slots[slot] {
-                if entry.tick <= currentTick {
-                    expired.append(entry.tuple)
-                } else {
-                    remaining.append(entry)
+        // If we skipped a full wheel cycle (e.g. sleep/wake >30s),
+        // scan all slots to avoid losing timers permanently.
+        if currentTick - lastTick >= Int64(numSlots) {
+            for slot in 0..<numSlots {
+                var remaining: [SlotEntry] = []
+                for entry in slots[slot] {
+                    if entry.tick <= currentTick {
+                        expired.append(entry.tuple)
+                    } else {
+                        remaining.append(entry)
+                    }
                 }
+                slots[slot] = remaining
             }
-            slots[slot] = remaining
-            if slot == end { break }
-            i += 1
+        } else {
+            let start = Int(lastTick % Int64(numSlots))
+            let end = Int(currentTick % Int64(numSlots))
+
+            var i = start + 1
+            while true {
+                let slot = i % numSlots
+                var remaining: [SlotEntry] = []
+                for entry in slots[slot] {
+                    if entry.tick <= currentTick {
+                        expired.append(entry.tuple)
+                    } else {
+                        remaining.append(entry)
+                    }
+                }
+                slots[slot] = remaining
+                if slot == end { break }
+                i += 1
+            }
         }
 
         lastTick = currentTick

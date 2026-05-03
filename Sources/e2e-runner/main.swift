@@ -7,12 +7,14 @@ import SwiftNetStack
 struct E2EConfig {
     static let diskPath: String = {
         if let env = ProcessInfo.processInfo.environment["E2E_DISK"] { return env }
-        return "/Users/pinyin/tmp/bdp-netstack-image-arm64/disk.raw"
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.swift-netstack/e2e-disk.raw"
     }()
 
     static let sshKeyPath: String = {
         if let env = ProcessInfo.processInfo.environment["E2E_SSH_KEY"] { return env }
-        return "/Users/pinyin/developer/POC/bdp-netstack/test/image/test_key"
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.swift-netstack/e2e-test-key"
     }()
 
     static let efiStorePath = "/tmp/vz-e2e-efi.bin"
@@ -239,6 +241,16 @@ func runE2ETests() -> Int32 {
         fputs("  FAIL: \(error)\n", stderr); failed += 1
     }
 
+    // Test 4: TCP throughput benchmark (dd over SSH)
+    fputs("=== Test 4: TCP Throughput ===\n", stderr)
+    if let (up, down) = benchTCPThroughput(sshPort: E2EConfig.sshHostPort, sshKey: E2EConfig.sshKeyPath) {
+        fputs("  Upload:   \(String(format: "%.1f", up)) Mbps\n", stderr)
+        fputs("  Download: \(String(format: "%.1f", down)) Mbps\n", stderr)
+        fputs("  PASS (throughput measured)\n", stderr); passed += 1
+    } else {
+        fputs("  FAIL: could not measure throughput\n", stderr); failed += 1
+    }
+
     // Cleanup
     stopVM(vm)
     runningFlag.value = false
@@ -246,6 +258,67 @@ func runE2ETests() -> Int32 {
 
     fputs("\n=== Results: \(passed) passed, \(failed) failed ===\n", stderr)
     return failed == 0 ? 0 : 1
+}
+
+func runShellPipe(_ command: String) -> String {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/bash")
+    task.arguments = ["-c", command]
+    let outPipe = Pipe()
+    task.standardOutput = outPipe
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return ""
+    }
+    return String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+}
+
+func parseDDSpeed(_ output: String) -> Double {
+    for line in output.split(separator: "\n") {
+        // Linux/macOS dd "copied" format: "... copied, X s, Y MB/s"
+        if line.contains("bytes") && (line.contains("MB/s") || line.contains("GB/s") || line.contains("kB/s")) {
+            let parts = line.split(separator: ",")
+            if let last = parts.last {
+                let s = last.trimmingCharacters(in: .whitespaces)
+                if s.contains("GB/s") { return (Double(s.replacing(" GB/s", with: "")) ?? 0) * 1000 }
+                if s.contains("MB/s") { return Double(s.replacing(" MB/s", with: "")) ?? 0 }
+                if s.contains("kB/s") { return (Double(s.replacing(" kB/s", with: "")) ?? 0) / 1000 }
+            }
+        }
+        // macOS dd "transferred" format: "... bytes transferred in X secs (N bytes/sec)"
+        if line.contains("bytes") && line.contains("bytes/sec") {
+            if let parenStart = line.range(of: "("), let parenEnd = line.range(of: ")", range: parenStart.upperBound..<line.endIndex) {
+                let inside = line[parenStart.upperBound..<parenEnd.lowerBound].trimmingCharacters(in: .whitespaces)
+                let numStr = inside.replacing(" bytes/sec", with: "").trimmingCharacters(in: .whitespaces)
+                if let bytesPerSec = Double(numStr) {
+                    return bytesPerSec / 1_000_000 // bytes/sec → MB/s
+                }
+            }
+        }
+    }
+    return 0
+}
+
+func benchTCPThroughput(sshPort: UInt16, sshKey: String) -> (uploadMbps: Double, downloadMbps: Double)? {
+    let sshBase = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i \(sshKey) -p \(sshPort) root@127.0.0.1"
+
+    // Host→VM upload: local dd stats → file, data only through pipe
+    let uploadCmd = "dd if=/dev/zero bs=1m count=50 2>/tmp/_e2e_up.txt | \(sshBase) \"dd of=/dev/null 2>/dev/null\"; cat /tmp/_e2e_up.txt; rm -f /tmp/_e2e_up.txt"
+    let uploadOutput = runShellPipe(uploadCmd)
+    let uploadSpeed = parseDDSpeed(uploadOutput)
+
+    // VM→Host download: remote dd sends data, local dd stats → file
+    let downloadCmd = "\(sshBase) \"dd if=/dev/zero bs=1M count=50 2>/dev/null\" | dd of=/dev/null 2>/tmp/_e2e_down.txt; cat /tmp/_e2e_down.txt; rm -f /tmp/_e2e_down.txt"
+    let dlOutput = runShellPipe(downloadCmd)
+    let dlSpeed = parseDDSpeed(dlOutput)
+
+    if uploadSpeed > 0 && dlSpeed > 0 {
+        return (uploadSpeed * 8, dlSpeed * 8)
+    }
+    return nil
 }
 
 // MARK: - Entry point

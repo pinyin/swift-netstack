@@ -50,6 +50,37 @@ func buildDatagram(srcPort: UInt16, dstPort: UInt16, payload: [UInt8]) -> [UInt8
     return buf
 }
 
+// MARK: - UDP Checksum
+
+/// Compute UDP checksum over the pseudo-header + UDP datagram.
+/// Returns 0 if the checksum is correct.
+func udpChecksum(srcIP: UInt32, dstIP: UInt32, udpData: [UInt8]) -> UInt16 {
+    var sum: UInt32 = 0
+
+    // Pseudo-header
+    sum += UInt32(srcIP >> 16)
+    sum += UInt32(srcIP & 0xFFFF)
+    sum += UInt32(dstIP >> 16)
+    sum += UInt32(dstIP & 0xFFFF)
+    sum += UInt32(protocolUDP)
+    sum += UInt32(udpData.count)
+
+    // UDP datagram
+    var i = 0
+    while i < udpData.count - 1 {
+        sum += UInt32(UInt16(udpData[i]) << 8 | UInt16(udpData[i + 1]))
+        i += 2
+    }
+    if i < udpData.count {
+        sum += UInt32(udpData[i]) << 8
+    }
+
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    return ~UInt16(sum & 0xFFFF)
+}
+
 // MARK: - UDP Handler
 
 typealias UDPHandler = (UDPDatagram) -> [UDPDatagram]

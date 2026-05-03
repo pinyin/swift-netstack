@@ -289,9 +289,9 @@ func makeConfig(listenPort: UInt16 = 8080, gatewayIP: UInt32 = 0) -> TCPConfig {
     #expect(ts.connectionCount() == 0, "expected 0 connections after idle timeout, got \(ts.connectionCount())")
 }
 
-// MARK: - TestPreProcessACKsDoesNotCorruptSendBuf
+// MARK: - Test ACK processing in state machine (preProcessACKs removed)
 
-@Test func testPreProcessACKsDoesNotCorruptSendBuf() {
+@Test func testACKProcessingInStateMachine() {
     let gwIP = ipToUInt32("192.168.65.1")
     let vmIP = ipToUInt32("192.168.65.2")
 
@@ -313,23 +313,19 @@ func makeConfig(listenPort: UInt16 = 8080, gatewayIP: UInt32 = 0) -> TCPConfig {
     #expect(conn.sendAvail == 22, "SendAvail = \(conn.sendAvail), expected 22")
     let sendHeadBefore = conn.sendHead
 
-    // Inject SYN-ACK from VM
+    // Inject SYN-ACK from VM — ACK processing now happens in advanceSynSent
     let synAckSeg = fakeSegment(srcIP: vmIP, dstIP: gwIP, srcPort: 22, dstPort: 32769,
                                 seq: 5000, ack: conn.iss + 1, flags: TCPFlag.syn | TCPFlag.ack)
     ts.injectSegment(synAckSeg)
 
-    // PreProcessACKs should NOT touch SynSent connections
-    ts.preProcessACKs()
-
-    #expect(conn.sendHead == sendHeadBefore,
-            "PreProcessACKs moved sendHead from \(sendHeadBefore) to \(conn.sendHead)")
-    #expect(conn.sendAvail == 22,
-            "PreProcessACKs corrupted SendBuf: SendAvail = \(conn.sendAvail), expected 22")
-
-    // Deliberate → Established, then send data
+    // Deliberate: advanceSynSent processes the ACK of SYN → moves to Established
     ts.deliberate(now: Date())
 
     #expect(ts.established[tuple] != nil, "expected connection in Established")
+
+    // Verify SendBuf was NOT corrupted by ACK processing
+    #expect(conn.sendAvail == 22,
+            "ACK processing corrupted SendBuf: SendAvail = \(conn.sendAvail), expected 22")
 
     // Verify 22-byte data was sent
     let outputs = ts.consumeOutputs()
@@ -958,4 +954,112 @@ func makeConfig(listenPort: UInt16 = 8080, gatewayIP: UInt32 = 0) -> TCPConfig {
     #expect(parsed.ackNum == h.ackNum)
     #expect(parsed.flags == h.flags)
     #expect(parsed.windowSize == h.windowSize)
+}
+
+// MARK: - Regression: findConn excludes TimeWait
+
+@Test func testFindConnExcludesTimeWait() {
+    let gwIP = ipToUInt32("192.168.65.1")
+    let vmIP = ipToUInt32("192.168.65.2")
+
+    let cfg = makeConfig(gatewayIP: gwIP)
+    let ts = TCPState(cfg: cfg)
+
+    let tuple = Tuple(srcIP: gwIP, dstIP: vmIP, srcPort: 32770, dstPort: 22)
+    let conn = ts.activeOpen(tuple: tuple, vmWindow: 65535)
+
+    // Move connection directly into TimeWait (bypassing normal lifecycle)
+    ts.synSent[tuple] = nil
+    ts.timeWait[tuple] = conn
+
+    // findConn should NOT find the connection in TimeWait
+    #expect(ts.findConn(tuple) == nil, "findConn should exclude TimeWait connections")
+
+    // hasConn should also return false for TimeWait
+    #expect(!ts.hasConn(tuple), "hasConn should return false for TimeWait connections")
+}
+
+// MARK: - Regression: established→CloseWait preserves out-of-order segments
+
+@Test func testEstablishedToCloseWaitPreservesOutOfOrderSegments() {
+    let gwIP = ipToUInt32("192.168.65.1")
+    let vmIP = ipToUInt32("192.168.65.2")
+
+    let cfg = makeConfig(listenPort: 8080, gatewayIP: gwIP)
+    let ts = TCPState(cfg: cfg)
+    ts.listen { _ in }
+
+    // Manually create connection in Established to avoid handshake uncertainty
+    let tuple = Tuple(srcIP: gwIP, dstIP: vmIP, srcPort: 8080, dstPort: 22345)
+    let iss: UInt32 = 50000
+    let irs: UInt32 = 1000
+    let conn = TCPConn(tuple: tuple, irs: irs, iss: iss, window: 65535, bufSize: 65536)
+    conn.rcvNxt = irs + 1  // 1001
+    conn.sndUna = iss + 1
+    conn.sndNxt = iss + 1
+    conn.lastActivityTick = ts.tick
+    ts.established[tuple] = conn
+
+    let rcvNxtBefore = conn.rcvNxt  // 1001
+
+    // Inject out-of-order data segment (seq > rcvNxt, gap of 100 bytes)
+    let oooPayload = Array("out-of-order-data".utf8)
+    let oooSeg = fakeSegment(srcIP: vmIP, dstIP: gwIP, srcPort: 22345, dstPort: 8080,
+                              seq: rcvNxtBefore + 100, ack: iss + 1,
+                              flags: TCPFlag.ack, payload: oooPayload)
+    ts.injectSegment(oooSeg)
+
+    // Inject in-order FIN (seq == rcvNxt, triggers transition to CloseWait)
+    let finSeg = fakeSegment(srcIP: vmIP, dstIP: gwIP, srcPort: 22345, dstPort: 8080,
+                              seq: rcvNxtBefore, ack: iss + 1,
+                              flags: TCPFlag.ack | TCPFlag.fin)
+    ts.injectSegment(finSeg)
+
+    ts.deliberate(now: Date())
+
+    // Should be in CloseWait
+    #expect(ts.closeWait[conn.tuple] != nil,
+            "expected conn in CloseWait. Established=\(ts.established.count) CloseWait=\(ts.closeWait.count)")
+
+    // Out-of-order segment should be preserved in pendingSegs
+    #expect(!conn.pendingSegs.isEmpty,
+            "out-of-order segments should be preserved in pendingSegs, but it's empty")
+
+    let hasOOO = conn.pendingSegs.contains { seg in
+        !seg.payload.isEmpty && seg.header.seqNum == rcvNxtBefore + 100
+    }
+    #expect(hasOOO, "out-of-order segment was lost during Established→CloseWait transition")
+}
+
+// MARK: - Regression: appClose is idempotent (duplicate appClose regression)
+
+@Test func testAppCloseIdempotent() {
+    let gwIP = ipToUInt32("192.168.65.1")
+    let vmIP = ipToUInt32("192.168.65.2")
+
+    let cfg = makeConfig(listenPort: 8080, gatewayIP: gwIP)
+    let ts = TCPState(cfg: cfg)
+    ts.listen { _ in }
+
+    doHandshake(ts, vmIP: vmIP, gwIP: gwIP, srcPort: 32345, dstPort: 8080)
+    guard let conn = firstConn(in: ts.established) else {
+        fatalError("no connection in Established")
+    }
+
+    // appCloses is a Set, so duplicate appClose should be idempotent
+    ts.appClose(tuple: conn.tuple)
+    #expect(ts.appCloses.count == 1, "expected 1 entry in appCloses")
+
+    // Second call should not change count
+    ts.appClose(tuple: conn.tuple)
+    #expect(ts.appCloses.count == 1, "duplicate appClose should be idempotent (Set semantics)")
+
+    // Process the close
+    ts.deliberate(now: Date())
+
+    // Connection should have sent FIN (moved to FinWait1)
+    let inFinWait1 = ts.finWait1[conn.tuple] != nil
+    let inCloseWait = ts.closeWait[conn.tuple] != nil
+    #expect(inFinWait1 || inCloseWait,
+            "connection should be in FinWait1 or CloseWait after appClose")
 }

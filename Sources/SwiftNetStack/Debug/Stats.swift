@@ -2,6 +2,9 @@ import Foundation
 
 // MARK: - FlowStats
 
+// All counters are accessed exclusively from the deliberation loop thread.
+// No lock is needed.
+
 final class FlowStats {
     // Stage 1: readHost (forwarder / NAT)
     var fwdReadCalls: Int64 = 0
@@ -26,13 +29,10 @@ final class FlowStats {
     var outCSError: Int64 = 0
 
     private var lastPrint: Date = Date()
-    private let lock = NSLock()
 
     nonisolated(unsafe) static let global = FlowStats()
 
     func printIfDue() {
-        lock.lock()
-        defer { lock.unlock() }
         guard Date().timeIntervalSince(lastPrint) >= 1.0 else { return }
         print()
         lastPrint = Date()

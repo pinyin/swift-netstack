@@ -36,9 +36,7 @@ public final class VZDebugConn {
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, socklen_t(MemoryLayout<Int32>.size))
 
-        // Set non-blocking
-        let flags = fcntl(fd, F_GETFL, 0)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        // Keep blocking for initial VFKT handshake (vz-debug connects after we bind)
 
         // Bind
         var addr = sockaddr_un()
@@ -105,6 +103,10 @@ public final class VZDebugConn {
             return nil
         }
 
+        // Set non-blocking now that handshake is complete
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
         let firstFrame = Frame.parse(readBuf)
         return VZDebugConn(fd: fd, firstFrame: firstFrame)
     }
@@ -152,6 +154,13 @@ public final class VZDebugConn {
         var fds: [Int32] = [0, 0]
         let result = socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
         guard result >= 0 else { return nil }
+
+        // Increase socket buffer sizes to handle batch testing without ENOBUFS
+        var bufSize: Int32 = 1_048_576  // 1 MB
+        _ = setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
 
         let flags0 = fcntl(fds[0], F_GETFL, 0)
         _ = fcntl(fds[0], F_SETFL, flags0 | O_NONBLOCK)

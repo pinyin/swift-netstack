@@ -20,7 +20,6 @@ let package = Package(
                 .product(name: "Collections", package: "swift-collections"),
             ],
             path: "Sources/SwiftNetStack",
-            exclude: ["main.swift"],
             linkerSettings: [
                 .linkedFramework("Virtualization")
             ]
@@ -48,6 +47,11 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Virtualization")
             ]
+        ),
+        .executableTarget(
+            name: "benchmark",
+            dependencies: ["SwiftNetStack"],
+            path: "Sources/benchmark"
         ),
         .testTarget(
             name: "SwiftNetStackTests",

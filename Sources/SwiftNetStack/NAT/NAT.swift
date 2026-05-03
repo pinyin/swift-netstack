@@ -13,7 +13,8 @@ final class NATEntry {
     var vmClosed: Bool = false
     var deferredClose: Bool = false
 
-    weak var vmConn: TCPConn?
+    // Strong reference: TCPConn lifetime is tied to NAT entry, not just TCPState dictionaries.
+    var vmConn: TCPConn?
 
     init(key: Tuple, extIP: UInt32, extPort: UInt16) {
         self.key = key
@@ -24,10 +25,11 @@ final class NATEntry {
 
 // MARK: - Pending Dial
 
-final class PendingDial: @unchecked Sendable {
+final class PendingDial {
     let entry: NATEntry
     let seg: TCPSegment
     var result: (fd: Int32, error: Error?)?
+    var connectFD: Int32 = -1
 
     init(entry: NATEntry, seg: TCPSegment) {
         self.entry = entry
@@ -68,14 +70,34 @@ final class NATTable {
         return false
     }
 
-    // MARK: - Poll Dials
+    // MARK: - Poll Dials (non-blocking connect)
 
     func pollDials() {
         var remaining: [PendingDial] = []
+
         for pd in pendingDials {
-            if pd.result == nil {
+            // Start dial if not yet initiated
+            if pd.connectFD < 0 && pd.result == nil {
                 startDial(pd)
             }
+
+            // Check non-blocking connect status
+            if pd.connectFD >= 0 && pd.result == nil {
+                var err: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                let ret = getsockopt(pd.connectFD, SOL_SOCKET, SO_ERROR, &err, &len)
+                if ret == 0 && err == 0 {
+                    // Connect succeeded
+                    pd.result = (fd: pd.connectFD, error: nil)
+                } else if ret < 0 || (err != 0 && err != EINPROGRESS) {
+                    // Connect failed
+                    close(pd.connectFD)
+                    let code = err != 0 ? err : Int32(ret)
+                    pd.result = (fd: -1, error: NSError(domain: NSPOSIXErrorDomain, code: Int(code)))
+                }
+                // else: still EINPROGRESS, keep polling
+            }
+
             if let result = pd.result {
                 if let error = result.error {
                     NSLog("NAT: dial %@:%d failed: %@",
@@ -88,66 +110,41 @@ final class NATTable {
                 remaining.append(pd)
             }
         }
+
         pendingDials = remaining
     }
 
     private func startDial(_ pd: PendingDial) {
-        let addr = "\(ipString(pd.entry.extIP)):\(pd.entry.extPort)"
-        let capturePD = pd
-        Task { @Sendable in
-            let result = await NATTable.doDial(addr: addr)
-            capturePD.result = result
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_addr.s_addr = pd.entry.extIP.bigEndian
+        addr.sin_port = pd.entry.extPort.bigEndian
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            pd.result = (fd: -1, error: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
+            return
         }
-    }
 
-    private static func doDial(addr: String) async -> (fd: Int32, error: Error?)? {
-        let parts = addr.split(separator: ":")
-        guard parts.count == 2, let port = UInt16(parts[1]) else { return nil }
-        let host = String(parts[0])
+        // Set non-blocking for EINPROGRESS connect
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                var hints = addrinfo()
-                hints.ai_family = AF_INET
-                hints.ai_socktype = SOCK_STREAM
-
-                var result: UnsafeMutablePointer<addrinfo>?
-                let err = getaddrinfo(host, String(port), &hints, &result)
-                guard err == 0, let info = result else {
-                    continuation.resume(returning: (fd: -1, error: nil))
-                    return
-                }
-                defer { freeaddrinfo(result) }
-
-                let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
-                guard fd >= 0 else {
-                    continuation.resume(returning: (fd: -1, error: nil))
-                    return
-                }
-
-                // Set send timeout for blocking connect
-                var tv = timeval(tv_sec: 30, tv_usec: 0)
-                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-                let connectResult = connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen)
-                if connectResult < 0 {
-                    let savedErrno = errno
-                    close(fd)
-                    continuation.resume(returning: (fd: -1, error: NSError(domain: NSPOSIXErrorDomain, code: Int(savedErrno))))
-                    return
-                }
-
-                // Set non-blocking after connect
-                let flags = fcntl(fd, F_GETFL, 0)
-                _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-
-                // Reset socket timeout to 0 (no timeout)
-                var noTimeout = timeval(tv_sec: 0, tv_usec: 0)
-                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
-
-                continuation.resume(returning: (fd: fd, error: nil))
+        let ret = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
+
+        if ret < 0 && errno != EINPROGRESS {
+            let savedErrno = errno
+            close(fd)
+            pd.result = (fd: -1, error: NSError(domain: NSPOSIXErrorDomain, code: Int(savedErrno)))
+            return
+        }
+
+        pd.connectFD = fd
     }
 
     // MARK: - Poll Reads
@@ -174,7 +171,7 @@ final class NATTable {
 
     func proxyVMToHost() {
         for (_, entry) in entries {
-            guard entry.hostFD >= 0, !entry.hostClosed, let conn = entry.vmConn else { continue }
+            guard entry.hostFD >= 0, !entry.hostClosed, entry.vmConn != nil else { continue }
             writeHost(entry)
         }
     }
@@ -248,6 +245,7 @@ final class NATTable {
             conn.consumeRecvData(n)
         }
         if n < 0 {
+            if errno == EAGAIN || errno == EWOULDBLOCK { return }
             entry.hostClosed = true
             return
         }
@@ -258,7 +256,10 @@ final class NATTable {
                     Darwin.write(entry.hostFD, ptr.baseAddress!, more.count)
                 }
                 if n2 > 0 { conn.consumeRecvData(n2) }
-                if n2 < 0 { entry.hostClosed = true }
+                if n2 < 0 {
+                    if errno == EAGAIN || errno == EWOULDBLOCK { return }
+                    entry.hostClosed = true
+                }
             }
         }
     }

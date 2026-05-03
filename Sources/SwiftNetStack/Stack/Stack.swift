@@ -33,6 +33,10 @@ public final class Stack {
     var icmpFwd: ICMPForwarder?
     let udpNAT: UDPNATTable
 
+    // Monotonic IP ID counter (replaces Date-based ID to avoid collisions)
+    private var nextIPID: UInt16 = 0
+
+    // Single-threaded: accessed only from the deliberation loop
     public var bytesIn: UInt64 = 0
     public var bytesOut: UInt64 = 0
 
@@ -128,9 +132,6 @@ public final class Stack {
             }
         }
 
-        // Phase 1.5: Pre-process ACKs
-        tcpState.preProcessACKs()
-
         // Phase 2: Forwarder accept + poll
         if let fwd = fwd {
             fwd.pollAccept(tcpState: tcpState)
@@ -204,6 +205,12 @@ public final class Stack {
 
         // Phase 18: UDP NAT cleanup
         udpNAT.cleanup(now: now)
+
+        // Phase 19: DHCP lease expiration
+        dhcpSrv.expireLeases(now: now)
+
+        // Phase 20: ARP cache cleanup
+        arp.cleanup(now: now)
 
         FlowStats.global.printIfDue()
     }
@@ -318,12 +325,21 @@ public final class Stack {
     }
 
     func processTCP(_ frame: Frame, _ pkt: IPv4Packet) {
+        // Verify TCP checksum on ingress
+        let cs = tcpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, tcpData: pkt.payload)
+        guard cs == 0 else { return }
+
         guard let seg = TCPSegment.parse(pkt.payload, srcIP: pkt.srcIP, dstIP: pkt.dstIP) else { return }
         tcpState.injectSegment(seg)
     }
 
     func processUDP(_ frame: Frame, _ pkt: IPv4Packet) {
         guard let (hdr, payload) = parseUDP(pkt.payload) else { return }
+        // Verify UDP checksum if present (non-zero)
+        if hdr.checksum != 0 {
+            let cs = udpChecksum(srcIP: pkt.srcIP, dstIP: pkt.dstIP, udpData: pkt.payload)
+            guard cs == 0 else { return }
+        }
         let dg = UDPDatagram(srcIP: pkt.srcIP, dstIP: pkt.dstIP,
                              srcPort: hdr.srcPort, dstPort: hdr.dstPort,
                              payload: payload)
@@ -361,11 +377,12 @@ public final class Stack {
 
         let ipPkt = IPv4Packet(
             version: 4, ihl: 20, tos: 0, totalLen: 0,
-            id: UInt16(UInt64(Date().timeIntervalSince1970 * 1e9) & 0xFFFF),
+            id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolTCP,
             checksum: 0, srcIP: seg.tuple.srcIP, dstIP: seg.tuple.dstIP,
             payload: tcpBytes
         )
+        nextIPID = nextIPID &+ 1
 
         FlowStats.global.outSegs += 1
         FlowStats.global.outBytes += Int64(seg.payload.count)
@@ -384,11 +401,13 @@ public final class Stack {
 
         let ipPkt = IPv4Packet(
             version: 4, ihl: 20, tos: 0, totalLen: 0,
-            id: UInt16(UInt64(Date().timeIntervalSince1970 * 1e9) & 0xFFFF),
+            id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
             checksum: 0, srcIP: dg.srcIP, dstIP: dg.dstIP,
             payload: udpBytes
         )
+        nextIPID = nextIPID &+ 1
+
         _ = writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
     }
 
@@ -401,11 +420,13 @@ public final class Stack {
         let icmpData = buildICMPReplyData(id: reply.id, seq: reply.seq, payload: reply.payload)
 
         let ipPkt = IPv4Packet(
-            version: 4, ihl: 20, tos: 0, totalLen: 0, id: 0,
+            version: 4, ihl: 20, tos: 0, totalLen: 0, id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolICMP,
             checksum: 0, srcIP: reply.srcIP, dstIP: reply.dstIP,
             payload: icmpData
         )
+        nextIPID = nextIPID &+ 1
+
         _ = writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
     }
 

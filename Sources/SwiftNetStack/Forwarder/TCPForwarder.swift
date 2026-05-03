@@ -71,7 +71,7 @@ final class Forwarder {
         var on: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
 
-        var flags = fcntl(fd, F_GETFL, 0)
+        let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
         guard bind(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) >= 0 else {
@@ -102,7 +102,7 @@ final class Forwarder {
 
                 guard clientFD >= 0 else { break }
 
-                var flags = fcntl(clientFD, F_GETFL, 0)
+                let flags = fcntl(clientFD, F_GETFL, 0)
                 _ = fcntl(clientFD, F_SETFL, flags | O_NONBLOCK)
 
                 guard let (vmTuple, vmAddr) = createVMTuple(hostPort: hostPort) else {
@@ -123,12 +123,13 @@ final class Forwarder {
         for (_, entry) in entries {
             guard entry.hostFD >= 0 else { continue }
             if entry.hostClosed {
-                if entry.deferredClose, let conn = entry.vmConn, conn.sendAvail == 0 {
-                    entry.deferredClose = false
-                    tcpState?.appClose(tuple: conn.tuple)
-                }
-                if !entry.deferredClose, !entry.vmClosed, let conn = entry.vmConn {
-                    tcpState?.appClose(tuple: conn.tuple)
+                if let conn = entry.vmConn, !entry.vmClosed {
+                    if entry.deferredClose && conn.sendAvail == 0 {
+                        entry.deferredClose = false
+                    }
+                    if !entry.deferredClose {
+                        tcpState?.appClose(tuple: conn.tuple)
+                    }
                 }
                 continue
             }
@@ -138,7 +139,7 @@ final class Forwarder {
 
     func proxyVMToHost() {
         for (_, entry) in entries {
-            guard !entry.hostClosed, let conn = entry.vmConn else { continue }
+            guard !entry.hostClosed, entry.vmConn != nil else { continue }
             writeHost(entry)
         }
     }
@@ -221,7 +222,10 @@ final class Forwarder {
         }
 
         if n > 0 { conn.consumeRecvData(n) }
-        if n < 0 { entry.hostClosed = true; return }
+        if n < 0 {
+            if errno == EAGAIN || errno == EWOULDBLOCK { return }
+            entry.hostClosed = true; return
+        }
 
         if n == data.count && conn.recvAvail > 0 {
             let more = conn.peekRecvData()
@@ -230,7 +234,10 @@ final class Forwarder {
                     Darwin.write(entry.hostFD, ptr.baseAddress!, more.count)
                 }
                 if n2 > 0 { conn.consumeRecvData(n2) }
-                if n2 < 0 { entry.hostClosed = true }
+                if n2 < 0 {
+                    if errno == EAGAIN || errno == EWOULDBLOCK { return }
+                    entry.hostClosed = true
+                }
             }
         }
     }

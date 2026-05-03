@@ -46,6 +46,7 @@ struct DHCPServerConfig {
     var domainName: String = "bdp.local"
     var poolStart: UInt32 = ipToUInt32("192.168.65.2")
     var poolSize: Int = 50
+    var leaseTime: TimeInterval = 3600
 
     static func defaultConfig() -> DHCPServerConfig { DHCPServerConfig() }
 }
@@ -55,6 +56,7 @@ struct DHCPServerConfig {
 struct Lease {
     let clientMAC: MACAddr
     let ip: UInt32
+    let expiresAt: Date
 }
 
 // MARK: - DHCP Server
@@ -106,6 +108,17 @@ final class DHCPServer {
         }
     }
 
+    // MARK: - Lease Expiration
+
+    func expireLeases(now: Date) {
+        for (mac, lease) in leases {
+            if now >= lease.expiresAt {
+                allocated.remove(lease.ip)
+                leases[mac] = nil
+            }
+        }
+    }
+
     // MARK: - Build Responses
 
     func buildOffer(_ dg: UDPDatagram, clientMAC: MACAddr) -> UDPDatagram? {
@@ -149,64 +162,83 @@ final class DHCPServer {
                            payload: responsePayload)
     }
 
-    // MARK: - buildResponse
+    // MARK: - buildResponse (append-based, no fixed buffer)
 
     func buildResponse(_ msgType: UInt8, txID: [UInt8], clientMAC: MACAddr, assignedIP: UInt32) -> [UInt8] {
-        var buf = [UInt8](repeating: 0, count: 300)
+        var buf: [UInt8] = []
 
-        buf[0] = opReply
-        buf[1] = 1 // htype
-        buf[2] = 6 // hlen
-        buf[3] = 0 // hops
-        buf[4] = txID[0]; buf[5] = txID[1]; buf[6] = txID[2]; buf[7] = txID[3]
-        buf[10] = 0x80 // flags: broadcast
-
-        // yiaddr
-        buf[16] = UInt8(assignedIP >> 24); buf[17] = UInt8(assignedIP >> 16 & 0xFF)
-        buf[18] = UInt8(assignedIP >> 8 & 0xFF); buf[19] = UInt8(assignedIP & 0xFF)
-
-        // chaddr
-        buf[28] = clientMAC.b0; buf[29] = clientMAC.b1; buf[30] = clientMAC.b2
-        buf[31] = clientMAC.b3; buf[32] = clientMAC.b4; buf[33] = clientMAC.b5
+        // Fixed BOOTP header (236 bytes before options)
+        buf.append(opReply)        // 0: op
+        buf.append(1)              // 1: htype
+        buf.append(6)              // 2: hlen
+        buf.append(0)              // 3: hops
+        buf.append(txID[0])        // 4-7: xid
+        buf.append(txID[1])
+        buf.append(txID[2])
+        buf.append(txID[3])
+        // 8-9: secs
+        buf.append(0); buf.append(0)
+        // 10-11: flags (broadcast)
+        buf.append(0x80); buf.append(0x00)
+        // 12-15: ciaddr (0)
+        buf.append(contentsOf: [0, 0, 0, 0])
+        // 16-19: yiaddr
+        buf.append(UInt8(assignedIP >> 24))
+        buf.append(UInt8(assignedIP >> 16 & 0xFF))
+        buf.append(UInt8(assignedIP >> 8 & 0xFF))
+        buf.append(UInt8(assignedIP & 0xFF))
+        // 20-23: siaddr (0)
+        buf.append(contentsOf: [0, 0, 0, 0])
+        // 24-27: giaddr (0)
+        buf.append(contentsOf: [0, 0, 0, 0])
+        // 28-43: chaddr (16 bytes)
+        buf.append(clientMAC.b0); buf.append(clientMAC.b1); buf.append(clientMAC.b2)
+        buf.append(clientMAC.b3); buf.append(clientMAC.b4); buf.append(clientMAC.b5)
+        buf.append(contentsOf: [UInt8](repeating: 0, count: 10))
+        // 44-235: sname + file + padding (192 bytes)
+        buf.append(contentsOf: [UInt8](repeating: 0, count: 192))
 
         // Magic cookie
-        buf[236] = UInt8(magicCookie >> 24); buf[237] = UInt8(magicCookie >> 16 & 0xFF)
-        buf[238] = UInt8(magicCookie >> 8 & 0xFF); buf[239] = UInt8(magicCookie & 0xFF)
+        buf.append(UInt8(magicCookie >> 24))
+        buf.append(UInt8(magicCookie >> 16 & 0xFF))
+        buf.append(UInt8(magicCookie >> 8 & 0xFF))
+        buf.append(UInt8(magicCookie & 0xFF))
 
-        var offset = 240
+        // Options
+        buf = writeOptionAppend(&buf, optType: optMessageType, val: [msgType])
+        buf = writeOptionAppend(&buf, optType: optServerIdentifier,
+                                 val: [UInt8(cfg.gatewayIP >> 24), UInt8(cfg.gatewayIP >> 16 & 0xFF),
+                                       UInt8(cfg.gatewayIP >> 8 & 0xFF), UInt8(cfg.gatewayIP & 0xFF)])
+        buf = writeOptionAppend(&buf, optType: optSubnetMask,
+                                 val: [UInt8(cfg.subnetMask >> 24), UInt8(cfg.subnetMask >> 16 & 0xFF),
+                                       UInt8(cfg.subnetMask >> 8 & 0xFF), UInt8(cfg.subnetMask & 0xFF)])
+        buf = writeOptionAppend(&buf, optType: optRouter,
+                                 val: [UInt8(cfg.gatewayIP >> 24), UInt8(cfg.gatewayIP >> 16 & 0xFF),
+                                       UInt8(cfg.gatewayIP >> 8 & 0xFF), UInt8(cfg.gatewayIP & 0xFF)])
+        buf = writeOptionAppend(&buf, optType: optDNSServer,
+                                 val: [UInt8(cfg.dnsIP >> 24), UInt8(cfg.dnsIP >> 16 & 0xFF),
+                                       UInt8(cfg.dnsIP >> 8 & 0xFF), UInt8(cfg.dnsIP & 0xFF)])
 
-        offset = writeOption(&buf, offset: offset, optType: optMessageType, val: [msgType])
-        offset = writeOption(&buf, offset: offset, optType: optServerIdentifier,
-                             val: [UInt8(cfg.gatewayIP >> 24), UInt8(cfg.gatewayIP >> 16 & 0xFF),
-                                   UInt8(cfg.gatewayIP >> 8 & 0xFF), UInt8(cfg.gatewayIP & 0xFF)])
-        offset = writeOption(&buf, offset: offset, optType: optSubnetMask,
-                             val: [UInt8(cfg.subnetMask >> 24), UInt8(cfg.subnetMask >> 16 & 0xFF),
-                                   UInt8(cfg.subnetMask >> 8 & 0xFF), UInt8(cfg.subnetMask & 0xFF)])
-        offset = writeOption(&buf, offset: offset, optType: optRouter,
-                             val: [UInt8(cfg.gatewayIP >> 24), UInt8(cfg.gatewayIP >> 16 & 0xFF),
-                                   UInt8(cfg.gatewayIP >> 8 & 0xFF), UInt8(cfg.gatewayIP & 0xFF)])
-        offset = writeOption(&buf, offset: offset, optType: optDNSServer,
-                             val: [UInt8(cfg.dnsIP >> 24), UInt8(cfg.dnsIP >> 16 & 0xFF),
-                                   UInt8(cfg.dnsIP >> 8 & 0xFF), UInt8(cfg.dnsIP & 0xFF)])
-
-        // Lease time: 3600 seconds
-        let lt: [UInt8] = [0, 0, 0x0E, 0x10]
-        offset = writeOption(&buf, offset: offset, optType: optLeaseTime, val: lt)
+        // Lease time (network byte order)
+        let leaseSecs = UInt32(cfg.leaseTime)
+        buf = writeOptionAppend(&buf, optType: optLeaseTime,
+                                 val: [UInt8(leaseSecs >> 24), UInt8(leaseSecs >> 16 & 0xFF),
+                                       UInt8(leaseSecs >> 8 & 0xFF), UInt8(leaseSecs & 0xFF)])
 
         if !cfg.domainName.isEmpty {
-            offset = writeOption(&buf, offset: offset, optType: optDomainName,
-                                 val: [UInt8](cfg.domainName.utf8))
+            buf = writeOptionAppend(&buf, optType: optDomainName,
+                                     val: [UInt8](cfg.domainName.utf8))
         }
 
-        buf[offset] = optEnd
-        offset += 1
+        buf.append(optEnd)
 
-        return Array(buf[..<offset])
+        return buf
     }
 
     // MARK: - IP Allocation
 
     func allocateIP(_ clientMAC: MACAddr) -> UInt32? {
+        // Renew existing lease if still valid
         if let lease = leases[clientMAC] {
             return lease.ip
         }
@@ -215,7 +247,11 @@ final class DHCPServer {
             let ip = cfg.poolStart + UInt32(i)
             if !allocated.contains(ip) {
                 allocated.insert(ip)
-                leases[clientMAC] = Lease(clientMAC: clientMAC, ip: ip)
+                let lease = Lease(
+                    clientMAC: clientMAC, ip: ip,
+                    expiresAt: Date().addingTimeInterval(cfg.leaseTime)
+                )
+                leases[clientMAC] = lease
                 return ip
             }
         }
@@ -252,6 +288,14 @@ final class DHCPServer {
     }
 }
 
+func writeOptionAppend(_ buf: inout [UInt8], optType: UInt8, val: [UInt8]) -> [UInt8] {
+    buf.append(optType)
+    buf.append(UInt8(val.count))
+    buf.append(contentsOf: val)
+    return buf
+}
+
+// Legacy in-place writer kept for binary compatibility with test code
 func writeOption(_ buf: inout [UInt8], offset: Int, optType: UInt8, val: [UInt8]) -> Int {
     buf[offset] = optType
     buf[offset + 1] = UInt8(val.count)

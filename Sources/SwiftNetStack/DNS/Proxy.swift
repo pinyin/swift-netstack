@@ -5,13 +5,14 @@ let dnsPort: UInt16 = 53
 
 // MARK: - Pending DNS Query
 
-private final class PendingDNSQuery: @unchecked Sendable {
+private final class PendingDNSQuery {
     let srcIP: UInt32
     let dstIP: UInt32
     let srcPort: UInt16
     let dstPort: UInt16
     let query: [UInt8]
-    var result: UDPDatagram??
+    var fd: Int32 = -1
+    var sentAt: Date = Date()
 
     init(srcIP: UInt32, dstIP: UInt32, srcPort: UInt16, dstPort: UInt16, query: [UInt8]) {
         self.srcIP = srcIP
@@ -19,7 +20,6 @@ private final class PendingDNSQuery: @unchecked Sendable {
         self.srcPort = srcPort
         self.dstPort = dstPort
         self.query = query
-        self.result = .none
     }
 }
 
@@ -32,6 +32,10 @@ final class DNSProxy {
     private var nextID: UInt64 = 0
     private var pendingQueries: [UInt64: PendingDNSQuery] = [:]
     private var ready: [UDPDatagram] = []
+    private var inFlightIDs: Set<UInt64> = []
+
+    // Pre-resolved upstream sockaddr for non-blocking sendto
+    private var upstreamAddr: sockaddr_in?
 
     init(listenIP: UInt32, upstreamAddr: String) {
         self.listenIP = listenIP
@@ -40,6 +44,7 @@ final class DNSProxy {
         } else {
             self.upstream = DNSProxy.readSystemDNS()
         }
+        resolveUpstreamAddr()
     }
 
     func handler() -> UDPHandler {
@@ -49,114 +54,137 @@ final class DNSProxy {
         }
     }
 
-    func set(upstream addr: String) { upstream = addr }
+    func set(upstream addr: String) {
+        upstream = addr
+        resolveUpstreamAddr()
+    }
 
-    // MARK: - Enqueue
+    // MARK: - Upstream Address Resolution
+
+    private func resolveUpstreamAddr() {
+        guard !upstream.isEmpty else {
+            upstreamAddr = nil
+            return
+        }
+        let parts = upstream.split(separator: ":")
+        guard parts.count == 2, let port = UInt16(parts[1]) else {
+            upstreamAddr = nil
+            return
+        }
+        let host = String(parts[0])
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_port = port.bigEndian
+
+        let ret = host.withCString { cstr in
+            inet_pton(AF_INET, cstr, &addr.sin_addr)
+        }
+        guard ret == 1 else {
+            upstreamAddr = nil
+            return
+        }
+        upstreamAddr = addr
+    }
+
+    // MARK: - Enqueue (non-blocking)
 
     private func enqueue(_ dg: UDPDatagram) {
-        guard !upstream.isEmpty else {
+        guard let upstreamAddr = self.upstreamAddr else {
             if let resp = servfail(dg) { ready.append(resp) }
             return
         }
 
-        let id = nextID
-        nextID += 1
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            if let resp = servfail(dg) { ready.append(resp) }
+            return
+        }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        // Allocate an ID, skipping in-flight IDs on wrap
+        var id = nextID
+        while inFlightIDs.contains(id) {
+            id = id &+ 1
+        }
+        nextID = id &+ 1
+        inFlightIDs.insert(id)
 
         let pq = PendingDNSQuery(
             srcIP: dg.srcIP, dstIP: dg.dstIP,
             srcPort: dg.srcPort, dstPort: dg.dstPort,
             query: dg.payload
         )
+        pq.fd = fd
+        pq.sentAt = Date()
         pendingQueries[id] = pq
 
-        let upstreamAddr = self.upstream
-        let queryData = dg.payload
-
-        let capturePQ = pq
-        Task { @Sendable in
-            let result = await DNSProxy.resolveUpstream(
-                upstream: upstreamAddr, query: queryData,
-                dstIP: capturePQ.dstIP, srcIP: capturePQ.srcIP, srcPort: capturePQ.srcPort
-            )
-            capturePQ.result = .some(result)
-        }
-    }
-
-    // MARK: - Async Resolution
-
-    private static func resolveUpstream(
-        upstream: String, query: [UInt8],
-        dstIP: UInt32, srcIP: UInt32, srcPort: UInt16
-    ) async -> UDPDatagram? {
-        let parts = upstream.split(separator: ":")
-        guard parts.count == 2, let port = UInt16(parts[1]) else { return nil }
-        let host = String(parts[0])
-
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                var hints = addrinfo()
-                hints.ai_family = AF_INET
-                hints.ai_socktype = SOCK_DGRAM
-
-                var result: UnsafeMutablePointer<addrinfo>?
-                let err = getaddrinfo(host, String(port), &hints, &result)
-                guard err == 0, let info = result else {
-                    continuation.resume(returning: nil)
-                    return
+        // Non-blocking send on UDP socket
+        var addr = upstreamAddr
+        dg.payload.withUnsafeBytes { buf in
+            withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    _ = sendto(fd, buf.baseAddress!, dg.payload.count, 0,
+                              sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
-                defer { freeaddrinfo(result) }
-
-                let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
-                guard fd >= 0 else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                defer { close(fd) }
-
-                var tv = timeval(tv_sec: 2, tv_usec: 0)
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-                query.withUnsafeBytes { buf in
-                    _ = sendto(fd, buf.baseAddress!, query.count, 0,
-                               info.pointee.ai_addr, info.pointee.ai_addrlen)
-                }
-
-                var recvBuf = [UInt8](repeating: 0, count: 1500)
-                let n = recvBuf.withUnsafeMutableBytes { buf in
-                    recvfrom(fd, buf.baseAddress!, 1500, 0, nil, nil)
-                }
-
-                guard n > 0 else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let resp = UDPDatagram(
-                    srcIP: dstIP, dstIP: srcIP,
-                    srcPort: dnsPort, dstPort: srcPort,
-                    payload: Array(recvBuf[0..<n])
-                )
-                continuation.resume(returning: resp)
             }
         }
     }
 
-    // MARK: - Poll
+    // MARK: - Poll (non-blocking)
 
     func poll() {
+        var completed: [UInt64] = []
+
         for (id, pq) in pendingQueries {
-            guard let result = pq.result else { continue }
-            pendingQueries[id] = nil
-            if let resp = result {
+            guard pq.fd >= 0 else {
+                completed.append(id)
+                continue
+            }
+
+            var recvBuf = [UInt8](repeating: 0, count: 1500)
+            let n = recvBuf.withUnsafeMutableBytes { buf in
+                recvfrom(pq.fd, buf.baseAddress!, 1500, 0, nil, nil)
+            }
+
+            if n > 0 {
+                let resp = UDPDatagram(
+                    srcIP: pq.dstIP, dstIP: pq.srcIP,
+                    srcPort: dnsPort, dstPort: pq.srcPort,
+                    payload: Array(recvBuf[0..<n])
+                )
                 ready.append(resp)
-            } else {
+                completed.append(id)
+                close(pq.fd)
+            } else if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK {
+                // Socket error
                 let sfDg = UDPDatagram(
                     srcIP: pq.dstIP, dstIP: pq.srcIP,
                     srcPort: dnsPort, dstPort: pq.srcPort,
                     payload: pq.query
                 )
                 if let sf = servfail(sfDg) { ready.append(sf) }
+                completed.append(id)
+                close(pq.fd)
+            } else if Date().timeIntervalSince(pq.sentAt) > 5.0 {
+                // Timeout after 5 seconds
+                let sfDg = UDPDatagram(
+                    srcIP: pq.dstIP, dstIP: pq.srcIP,
+                    srcPort: dnsPort, dstPort: pq.srcPort,
+                    payload: pq.query
+                )
+                if let sf = servfail(sfDg) { ready.append(sf) }
+                completed.append(id)
+                close(pq.fd)
             }
+        }
+
+        for id in completed {
+            pendingQueries[id] = nil
+            inFlightIDs.remove(id)
         }
     }
 

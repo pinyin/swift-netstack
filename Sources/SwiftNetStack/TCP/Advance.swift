@@ -483,7 +483,6 @@ extension TCPState {
             if nb.length == 0 { break }
 
             let payloadLen = nb.length
-            let payloadData = nb.toArray()
             let flags = TCPFlag.ack | TCPFlag.psh
             let win = conn.scaledWindow(syn: false)
 
@@ -495,19 +494,14 @@ extension TCPState {
             )
             tcpHdr.marshal(into: nb)
 
-            var seg = TCPSegment(
-                header: tcpHdr,
-                payload: Data(payloadData),
-                tuple: conn.tuple,
-                raw: []
-            )
-            seg.netBuf = nb
-
             if let wf = writeFunc {
-                if wf(seg) != nil {
-                    break
-                }
+                var seg = TCPSegment(header: tcpHdr, payload: Data(), tuple: conn.tuple, raw: [])
+                seg.netBuf = nb
+                if wf(seg) != nil { break }
             } else {
+                let raw = nb.toArray()
+                let payloadData = raw.count > 20 ? Data(raw[20...]) : Data()
+                let seg = TCPSegment(header: tcpHdr, payload: payloadData, tuple: conn.tuple, raw: raw)
                 outputs.append(seg)
             }
 
@@ -531,53 +525,49 @@ extension TCPState {
 
     func sendACK(_ conn: TCPConn) {
         let win = conn.scaledWindow(syn: false)
-        let rawSeg = buildSegment(tuple: conn.tuple, seq: conn.sndNxt, ack: conn.rcvNxt,
-                                   flags: TCPFlag.ack, window: win, wscale: 0, payload: [])
 
         conn.lastAckSent = conn.rcvNxt
         conn.lastAckTime = tick
         conn.lastAckWin = conn.scaledWindow(syn: false)
 
-        let seg = TCPSegment(
-            header: TCPHeader(
-                srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
-                seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
-                dataOffset: 20, flags: TCPFlag.ack,
-                windowSize: win, checksum: 0, urgentPtr: 0
-            ),
-            payload: Data(),
-            tuple: conn.tuple,
-            raw: rawSeg
+        let hdr = TCPHeader(
+            srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
+            seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
+            dataOffset: 20, flags: TCPFlag.ack,
+            windowSize: win, checksum: 0, urgentPtr: 0
         )
+        let nb = buildSegmentNetBuf(tuple: conn.tuple, seq: conn.sndNxt, ack: conn.rcvNxt,
+                                     flags: TCPFlag.ack, window: win, wscale: 0,
+                                     payload: NetBuf.empty)
 
         if let wf = writeFunc {
+            var seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: [])
+            seg.netBuf = nb
             _ = wf(seg)
         } else {
+            let seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: nb.toArray())
             outputs.append(seg)
         }
     }
 
     func sendSYN(_ conn: TCPConn) {
         let win = conn.scaledWindow(syn: true)
-        let rawSeg = buildSegmentWithWScale(tuple: conn.tuple, seq: conn.iss, ack: 0,
-                                              flags: TCPFlag.syn, window: win,
-                                              wscale: conn.rcvShift, payload: [])
-
-        let seg = TCPSegment(
-            header: TCPHeader(
-                srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
-                seqNum: conn.iss, ackNum: 0,
-                dataOffset: conn.rcvShift > 0 ? 24 : 20, flags: TCPFlag.syn,
-                windowSize: win, checksum: 0, urgentPtr: 0
-            ),
-            payload: Data(),
-            tuple: conn.tuple,
-            raw: rawSeg
+        let hdr = TCPHeader(
+            srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
+            seqNum: conn.iss, ackNum: 0,
+            dataOffset: conn.rcvShift > 0 ? 24 : 20, flags: TCPFlag.syn,
+            windowSize: win, checksum: 0, urgentPtr: 0
         )
+        let nb = buildSegmentNetBuf(tuple: conn.tuple, seq: conn.iss, ack: 0,
+                                     flags: TCPFlag.syn, window: win,
+                                     wscale: conn.rcvShift, payload: NetBuf.empty)
 
         if let wf = writeFunc {
+            var seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: [])
+            seg.netBuf = nb
             if wf(seg) != nil { return }
         } else {
+            let seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: nb.toArray())
             outputs.append(seg)
         }
 
@@ -588,26 +578,23 @@ extension TCPState {
 
     func sendSYNACK(_ conn: TCPConn) {
         let win = conn.scaledWindow(syn: true)
-        let rawSeg = buildSegmentWithWScale(tuple: conn.tuple, seq: conn.iss, ack: conn.rcvNxt,
-                                              flags: TCPFlag.syn | TCPFlag.ack, window: win,
-                                              wscale: conn.rcvShift, payload: [])
-
-        let seg = TCPSegment(
-            header: TCPHeader(
-                srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
-                seqNum: conn.iss, ackNum: conn.rcvNxt,
-                dataOffset: conn.rcvShift > 0 ? 24 : 20,
-                flags: TCPFlag.syn | TCPFlag.ack,
-                windowSize: win, checksum: 0, urgentPtr: 0
-            ),
-            payload: Data(),
-            tuple: conn.tuple,
-            raw: rawSeg
+        let hdr = TCPHeader(
+            srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
+            seqNum: conn.iss, ackNum: conn.rcvNxt,
+            dataOffset: conn.rcvShift > 0 ? 24 : 20,
+            flags: TCPFlag.syn | TCPFlag.ack,
+            windowSize: win, checksum: 0, urgentPtr: 0
         )
+        let nb = buildSegmentNetBuf(tuple: conn.tuple, seq: conn.iss, ack: conn.rcvNxt,
+                                     flags: TCPFlag.syn | TCPFlag.ack, window: win,
+                                     wscale: conn.rcvShift, payload: NetBuf.empty)
 
         if let wf = writeFunc {
+            var seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: [])
+            seg.netBuf = nb
             if wf(seg) != nil { return }
         } else {
+            let seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: nb.toArray())
             outputs.append(seg)
         }
 
@@ -618,24 +605,22 @@ extension TCPState {
 
     func sendFIN(_ conn: TCPConn) {
         let win = conn.scaledWindow(syn: false)
-        let rawSeg = buildSegment(tuple: conn.tuple, seq: conn.sndNxt, ack: conn.rcvNxt,
-                                   flags: TCPFlag.fin | TCPFlag.ack, window: win, wscale: 0, payload: [])
-
-        let seg = TCPSegment(
-            header: TCPHeader(
-                srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
-                seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
-                dataOffset: 20, flags: TCPFlag.fin | TCPFlag.ack,
-                windowSize: win, checksum: 0, urgentPtr: 0
-            ),
-            payload: Data(),
-            tuple: conn.tuple,
-            raw: rawSeg
+        let hdr = TCPHeader(
+            srcPort: conn.tuple.srcPort, dstPort: conn.tuple.dstPort,
+            seqNum: conn.sndNxt, ackNum: conn.rcvNxt,
+            dataOffset: 20, flags: TCPFlag.fin | TCPFlag.ack,
+            windowSize: win, checksum: 0, urgentPtr: 0
         )
+        let nb = buildSegmentNetBuf(tuple: conn.tuple, seq: conn.sndNxt, ack: conn.rcvNxt,
+                                     flags: TCPFlag.fin | TCPFlag.ack, window: win,
+                                     wscale: 0, payload: NetBuf.empty)
 
         if let wf = writeFunc {
+            var seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: [])
+            seg.netBuf = nb
             if wf(seg) != nil { return }
         } else {
+            let seg = TCPSegment(header: hdr, payload: Data(), tuple: conn.tuple, raw: nb.toArray())
             outputs.append(seg)
         }
 

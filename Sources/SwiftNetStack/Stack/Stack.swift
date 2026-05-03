@@ -470,18 +470,29 @@ public final class Stack {
             dstMAC = broadcastMAC
         }
 
-        let udpBytes = buildDatagram(srcPort: dg.srcPort, dstPort: dg.dstPort, payload: dg.payload)
+        // NetBuf zero-copy: build complete frame [Eth | IP | UDP | payload] in one buffer
+        let payloadBuf = dg.payload.withUnsafeBytes { ptr in
+            NetBuf(copying: ptr.baseAddress!, count: dg.payload.count, headroom: 0)
+        }
+        let nb = buildDatagramNetBuf(srcPort: dg.srcPort, dstPort: dg.dstPort, payload: payloadBuf)
 
+        // Prepend IP header
         let ipPkt = IPv4Packet(
             version: 4, ihl: 20, tos: 0, totalLen: 0,
             id: nextIPID,
             flags: 0, fragOffset: 0, ttl: 64, protocol: protocolUDP,
             checksum: 0, srcIP: dg.srcIP, dstIP: dg.dstIP,
-            payload: Data(udpBytes)
+            payload: Data()
         )
         nextIPID = nextIPID &+ 1
+        _ = ipPkt.serialize(into: nb)
 
-        _ = writeIPv4Packet(dstMAC: dstMAC, pkt: ipPkt)
+        // Prepend Ethernet header
+        _ = prependEthernetHeader(into: nb, dstMAC: dstMAC, srcMAC: cfg.gatewayMAC, etherType: etherTypeIPv4)
+
+        FlowStats.global.outSegs += 1
+        FlowStats.global.outBytes += Int64(dg.payload.count)
+        _ = writeNetBuf(nb)
     }
 
     func sendICMPReply(_ reply: ICMPReply) {

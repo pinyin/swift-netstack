@@ -33,9 +33,11 @@ public struct ARPFrame {
     /// Parse an ARP frame from a PacketBuffer (Ethernet payload).
     /// Returns nil if the buffer is too short or fields don't match Ethernet/IPv4 ARP.
     public static func parse(from pkt: PacketBuffer) -> ARPFrame? {
+        var pkt = pkt
         // ARP packet: 2(hw) + 2(proto) + 1(hwSize) + 1(protoSize) + 2(op)
         // + hwSize + protoSize + hwSize + protoSize = 8 + 2*(6+4) = 28 bytes
         guard pkt.totalLength >= 28 else { return nil }
+        guard pkt.pullUp(28) else { return nil }
 
         return pkt.withUnsafeReadableBytes { buf -> ARPFrame? in
             let hwType   = (UInt16(buf[0]) << 8) | UInt16(buf[1])

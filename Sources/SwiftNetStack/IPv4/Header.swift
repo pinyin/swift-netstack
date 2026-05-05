@@ -29,7 +29,13 @@ public struct IPv4Header {
 
     /// Parse an IPv4 header from a PacketBuffer. Returns nil on validation failure.
     public static func parse(from pkt: PacketBuffer) -> IPv4Header? {
+        var pkt = pkt
         guard pkt.totalLength >= 20 else { return nil }
+        // Pull up the maximum header size (60 bytes) to ensure single-view access
+        // regardless of IHL value. The common case (IHL=5, 20 bytes) is a fast-path
+        // no-op when the first view already covers it.
+        let maxHeaderLen = Swift.min(60, pkt.totalLength)
+        guard pkt.pullUp(maxHeaderLen) else { return nil }
 
         return pkt.withUnsafeReadableBytes { buf -> IPv4Header? in
             let versionIHL = buf[0]

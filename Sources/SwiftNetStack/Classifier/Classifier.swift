@@ -19,6 +19,12 @@ public struct ClassifiedFrames {
 
 /// BDP phase-separated frame classification.
 ///
+/// Stateless utility: takes raw PacketBuffers, returns parsed+classified frames.
+/// Unlike `bdpRound`, this function does NOT track endpoint IDs — it is suitable
+/// for off-path analysis, testing, and contexts where endpoint routing isn't
+/// needed. The production data path uses `bdpRound` directly so it can tag each
+/// frame with its source endpoint for reply routing.
+///
 /// Instead of per-packet parse→classify→dispatch (which interleaves Ethernet,
 /// IPv4, and ARP code within the same loop body), this splits processing into
 /// four distinct phases. Each phase keeps a single code path in L1 cache:
@@ -61,9 +67,9 @@ public func classifyFrames(
         }
     }
 
-    // Phase 3: Parse all IPv4 headers + protocol dispatch
+    // Phase 3: Parse all IPv4 headers + checksum verification + protocol dispatch
     for (pkt, eth) in ipv4Input {
-        guard let ip = IPv4Header.parse(from: eth.payload) else {
+        guard let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() else {
             result.unknown.append(pkt)
             continue
         }

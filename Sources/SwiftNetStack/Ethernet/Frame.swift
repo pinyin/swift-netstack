@@ -15,7 +15,9 @@ public struct EthernetFrame {
     /// Parse an Ethernet frame from a PacketBuffer. Returns nil if the buffer is too short
     /// or the EtherType is unrecognized.
     public static func parse(from pkt: PacketBuffer) -> EthernetFrame? {
+        var pkt = pkt
         guard pkt.totalLength >= 14 else { return nil }
+        guard pkt.pullUp(14) else { return nil }
 
         return pkt.withUnsafeReadableBytes { buf -> EthernetFrame? in
             let dstMAC = MACAddress(buf)

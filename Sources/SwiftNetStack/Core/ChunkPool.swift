@@ -19,13 +19,11 @@ public final class ChunkPool {
     }
 
     public func release(_ s: Storage) {
-        s.resetRefCount()
         freeList.append(s)
     }
 
     /// Amortized O(1): appends N chunks in a single array operation.
     public func batchRelease(_ chunks: [Storage]) {
-        for s in chunks { s.resetRefCount() }
         freeList.append(contentsOf: chunks)
     }
 
@@ -83,10 +81,14 @@ public enum ChunkPools {
     public static func select(minCapacity: Int) -> ChunkPool {
         guard minCapacity > 64 else { return pool64B }
         let shifted = minCapacity >> 6  // baseChunkSizeLog2 = 6
-        // 1-indexed MSB position (0 for shifted==0, handled by guard above)
         let msbOneIndexed = 64 - shifted.leadingZeroBitCount
-        let poolIndex = Swift.min(msbOneIndexed, 10)
-        return all[poolIndex]
+        var poolIndex = msbOneIndexed
+        // When minCapacity is an exact power of two (and > 64),
+        // the pool at index-1 has chunkSize == minCapacity.
+        if minCapacity.nonzeroBitCount == 1 {
+            poolIndex -= 1
+        }
+        return all[Swift.min(poolIndex, 10)]
     }
 
     /// Reverse lookup: given a chunk's actual capacity, return the exact pool it came from.

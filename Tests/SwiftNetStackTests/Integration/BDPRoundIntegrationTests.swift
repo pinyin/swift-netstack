@@ -1,0 +1,357 @@
+import Testing
+import Darwin
+@testable import SwiftNetStack
+
+@Suite(.serialized)
+struct BDPRoundIntegrationTests {
+
+    let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+    let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
+    let gateway = IPv4Address(100, 64, 1, 1)
+
+    func makeEndpoint(id: Int = 1) -> VMEndpoint {
+        VMEndpoint(id: id, fd: Int32(id + 100), subnet: subnet, gateway: gateway, mtu: 1500)
+    }
+
+    // MARK: - ARP proxy reply
+
+    @Test func arpRequestForGatewayGeneratesProxyReply() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        // Build an ARP request asking for the gateway IP
+        let arpFrame = makeEthernetFrame(
+            dst: .broadcast,
+            src: clientMAC,
+            type: .arp,
+            payload: makeARPPayload(op: .request, senderMAC: clientMAC, senderIP: clientIP, targetMAC: .zero, targetIP: gateway)
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let routingTable = RoutingTable()
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: routingTable, round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+        #expect((transport as! InMemoryTransport).outputs[0].endpointID == 1)
+
+        // Verify the reply is a valid ARP reply
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let eth = EthernetFrame.parse(from: reply) else {
+            Issue.record("reply is not valid Ethernet")
+            return
+        }
+        #expect(eth.dstMAC == clientMAC)
+        #expect(eth.srcMAC == ourMAC)
+        #expect(eth.etherType == .arp)
+
+        guard let arp = ARPFrame.parse(from: eth.payload) else {
+            Issue.record("reply does not contain valid ARP")
+            return
+        }
+        #expect(arp.operation == .reply)
+        #expect(arp.senderMAC == ourMAC)
+        #expect(arp.senderIP == gateway)
+        #expect(arp.targetMAC == clientMAC)
+        #expect(arp.targetIP == clientIP)
+    }
+
+    @Test func arpRequestForUnknownIPDoesNotGenerateReply() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+
+        let arpFrame = makeEthernetFrame(
+            dst: .broadcast,
+            src: clientMAC,
+            type: .arp,
+            payload: makeARPPayload(op: .request, senderMAC: clientMAC, senderIP: IPv4Address(100, 64, 1, 50), targetMAC: .zero, targetIP: IPv4Address(100, 64, 1, 99))
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    // MARK: - DHCP DISCOVER → OFFER
+
+    @Test func dhcpDiscoverGeneratesOffer() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+
+        // Build Ethernet/IPv4/UDP/DHCPDISCOVER
+        let dhcpDiscover = makeDHCPPacketBytes(op: 1, xid: 42, chaddr: clientMAC, msgType: .discover)
+        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpDiscover)
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let dhcp = DHCPPacket.parse(from: reply) else {
+            Issue.record("failed to parse DHCP reply")
+            return
+        }
+        #expect(dhcp.messageType == .offer)
+        #expect(dhcp.xid == 42)
+    }
+
+    // MARK: - DHCP REQUEST → ACK
+
+    @Test func dhcpRequestGeneratesAck() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let requestedIP = IPv4Address(100, 64, 1, 50)
+
+        let dhcpRequest = makeDHCPPacketBytes(op: 1, xid: 99, chaddr: clientMAC, msgType: .request, extraOptions: [
+            (50, ipBytes(requestedIP)),
+            (54, ipBytes(gateway)),
+        ])
+        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let dhcp = DHCPPacket.parse(from: reply) else {
+            Issue.record("failed to parse DHCP ACK")
+            return
+        }
+        #expect(dhcp.messageType == .ack)
+        #expect(dhcp.xid == 99)
+    }
+
+    // MARK: - DHCP updates ARPMapping
+
+    @Test func dhcpRequestUpdatesARPMapping() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let requestedIP = IPv4Address(100, 64, 1, 50)
+
+        let dhcpRequest = makeDHCPPacketBytes(op: 1, xid: 1, chaddr: clientMAC, msgType: .request, extraOptions: [
+            (50, ipBytes(requestedIP)),
+            (54, ipBytes(gateway)),
+        ])
+        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        #expect(!arpMapping.isKnown(requestedIP))
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect(arpMapping.isKnown(requestedIP))
+        #expect(arpMapping.lookup(ip: requestedIP) == clientMAC)
+    }
+
+    // MARK: - Cross-round state
+
+    @Test func crossRoundStateLeasePersists() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let requestedIP = IPv4Address(100, 64, 1, 50)
+
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+
+        // Round 1: REQUEST (allocate lease)
+        let requestFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 1, chaddr: clientMAC, msgType: .request, extraOptions: [
+            (50, ipBytes(requestedIP)),
+            (54, ipBytes(gateway)),
+        ]))
+        var transport1: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: requestFrame)])
+        let round1 = RoundContext()
+        bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round1)
+
+        #expect(arpMapping.isKnown(requestedIP))
+
+        // Round 2: RELEASE
+        let releaseFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: clientMAC, msgType: .release))
+        var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: releaseFrame)])
+        let round2 = RoundContext()
+        bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round2)
+
+        #expect(!arpMapping.isKnown(requestedIP))
+
+        // Round 3: DISCOVER should succeed (IP was reclaimed)
+        let discoverFrame = makeDHCPFrame(clientMAC: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
+        var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discoverFrame)])
+        let round3 = RoundContext()
+        bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round3)
+
+        #expect(!(transport3 as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    // MARK: - Mixed traffic
+
+    @Test func mixedARPAndDHCPTraffic() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        // Frame 1: ARP request for gateway
+        let arpFrame = makeEthernetFrame(
+            dst: .broadcast,
+            src: clientMAC,
+            type: .arp,
+            payload: makeARPPayload(op: .request, senderMAC: clientMAC, senderIP: clientIP, targetMAC: .zero, targetIP: gateway)
+        )
+
+        // Frame 2: DHCP DISCOVER
+        let dhcpFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 77, chaddr: clientMAC, msgType: .discover))
+
+        var transport: any Transport = InMemoryTransport(inputs: [
+            (endpointID: 1, packet: arpFrame),
+            (endpointID: 1, packet: dhcpFrame),
+        ])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        // Should get 2 replies: ARP reply + DHCP OFFER
+        #expect((transport as! InMemoryTransport).outputs.count == 2)
+    }
+
+    // MARK: - Empty input
+
+    @Test func emptyInputRoundReturnsFast() {
+        var transport: any Transport = InMemoryTransport()
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint()])
+        var dhcpServer = DHCPServer(endpoints: [makeEndpoint()])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    // MARK: - Helpers
+
+    private func makeEthernetFrame(dst: MACAddress, src: MACAddress, type: EtherType, payload: [UInt8]) -> PacketBuffer {
+        var bytes: [UInt8] = []
+        var buf6 = [UInt8](repeating: 0, count: 6)
+        dst.write(to: &buf6); bytes.append(contentsOf: buf6)
+        src.write(to: &buf6); bytes.append(contentsOf: buf6)
+        let etRaw = type.rawValue
+        bytes.append(UInt8(etRaw >> 8))
+        bytes.append(UInt8(etRaw & 0xFF))
+        bytes.append(contentsOf: payload)
+        let s = Storage.allocate(capacity: bytes.count)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+        return PacketBuffer(storage: s, offset: 0, length: bytes.count)
+    }
+
+    private func makeARPPayload(op: ARPOperation, senderMAC: MACAddress, senderIP: IPv4Address, targetMAC: MACAddress, targetIP: IPv4Address) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: 28)
+        bytes[0] = 0x00; bytes[1] = 0x01
+        bytes[2] = 0x08; bytes[3] = 0x00
+        bytes[4] = 6; bytes[5] = 4
+        bytes[6] = UInt8(op.rawValue >> 8)
+        bytes[7] = UInt8(op.rawValue & 0xFF)
+        var buf6 = [UInt8](repeating: 0, count: 6)
+        var buf4 = [UInt8](repeating: 0, count: 4)
+        senderMAC.write(to: &buf6); bytes.replaceSubrange(8..<14, with: buf6)
+        senderIP.write(to: &buf4); bytes.replaceSubrange(14..<18, with: buf4)
+        targetMAC.write(to: &buf6); bytes.replaceSubrange(18..<24, with: buf6)
+        targetIP.write(to: &buf4); bytes.replaceSubrange(24..<28, with: buf4)
+        return bytes
+    }
+
+    private func ipBytes(_ ip: IPv4Address) -> [UInt8] {
+        var buf = [UInt8](repeating: 0, count: 4)
+        ip.write(to: &buf)
+        return buf
+    }
+
+    /// Build a full Ethernet/IPv4/UDP/DHCP frame.
+    private func makeDHCPFrame(clientMAC: MACAddress, dhcpPayload: [UInt8]) -> PacketBuffer {
+        let udpLen = 8 + dhcpPayload.count
+        let ipTotalLen = 20 + udpLen
+
+        // IPv4 header
+        var ipBytes = [UInt8](repeating: 0, count: 20)
+        ipBytes[0] = 0x45
+        ipBytes[2] = UInt8(ipTotalLen >> 8)
+        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
+        ipBytes[8] = 64
+        ipBytes[9] = IPProtocol.udp.rawValue
+        IPv4Address(10, 0, 0, 50).write(to: &ipBytes[12])   // src
+        IPv4Address(100, 64, 1, 1).write(to: &ipBytes[16])   // dst = gateway
+        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
+        ipBytes[10] = UInt8(ipCksum >> 8)
+        ipBytes[11] = UInt8(ipCksum & 0xFF)
+
+        // UDP header: srcPort=68 (client), dstPort=67 (server)
+        var udpBytes = [UInt8](repeating: 0, count: 8)
+        udpBytes[0] = 0x00; udpBytes[1] = 68   // src port 68
+        udpBytes[2] = 0x00; udpBytes[3] = 67   // dst port 67
+        udpBytes[4] = UInt8(udpLen >> 8)
+        udpBytes[5] = UInt8(udpLen & 0xFF)
+        // checksum = 0 (UDP checksum is optional for IPv4)
+
+        return makeEthernetFrame(
+            dst: ourMAC,
+            src: clientMAC,
+            type: .ipv4,
+            payload: ipBytes + udpBytes + dhcpPayload
+        )
+    }
+
+    /// Build a raw DHCP packet (240-byte header + magic + options), suitable for DHCPPacket.parse.
+    private func makeDHCPPacketBytes(op: UInt8, xid: UInt32, chaddr: MACAddress,
+                                      msgType: DHCPMessageType,
+                                      extraOptions: [(UInt8, [UInt8])] = []) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: 247)
+        bytes[0] = op
+        bytes[4] = UInt8((xid >> 24) & 0xFF)
+        bytes[5] = UInt8((xid >> 16) & 0xFF)
+        bytes[6] = UInt8((xid >> 8) & 0xFF)
+        bytes[7] = UInt8(xid & 0xFF)
+        var buf6 = [UInt8](repeating: 0, count: 6)
+        chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
+        // Magic cookie
+        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+        // Option 53
+        bytes[244] = 53; bytes[245] = 1; bytes[246] = msgType.rawValue
+
+        var optIdx = 247
+        for (code, value) in extraOptions {
+            if optIdx + 2 + value.count > bytes.count {
+                bytes.append(contentsOf: [UInt8](repeating: 0, count: optIdx + 2 + value.count - bytes.count))
+            }
+            bytes[optIdx] = code
+            bytes[optIdx + 1] = UInt8(value.count)
+            bytes.replaceSubrange((optIdx + 2)..<(optIdx + 2 + value.count), with: value)
+            optIdx += 2 + value.count
+        }
+        if optIdx >= bytes.count { bytes.append(0) }
+        bytes[optIdx] = 255
+        return bytes
+    }
+}

@@ -76,16 +76,6 @@ public struct PacketBuffer {
 
     // MARK: - Zero-copy read operations
 
-    /// Create a shared reference to the same data (zero-copy).
-    /// All underlying Storage refCounts are incremented.
-    public func clone() -> PacketBuffer {
-        let copy = self
-        for i in copy._views.indices {
-            copy._views[i].storage.retain()
-        }
-        return copy
-    }
-
     /// Create a new view into a subrange (zero-copy, shares Storage).
     /// - Precondition: `from + length` ≤ totalLength
     public func slice(from start: Int, length: Int) -> PacketBuffer {
@@ -102,7 +92,6 @@ public struct PacketBuffer {
             let viewStart = view.offset + remaining
             let avail = view.length - remaining
             let take = Swift.min(avail, need)
-            view.storage.retain()
             newViews.append(View(storage: view.storage, offset: viewStart, length: take))
             need -= take
             remaining = 0
@@ -155,7 +144,6 @@ public struct PacketBuffer {
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
-        v.storage.release()
         _views[0] = View(storage: newStorage, offset: v.offset, length: v.length)
     }
 
@@ -170,7 +158,6 @@ public struct PacketBuffer {
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
-        v.storage.release()
         _views[idx] = View(storage: newStorage, offset: v.offset, length: v.length)
     }
 
@@ -203,7 +190,6 @@ public struct PacketBuffer {
         while remaining > 0, !_views.isEmpty {
             if remaining >= _views[0].length {
                 remaining -= _views[0].length
-                _views[0].storage.release()
                 _views.removeFirst()
             } else {
                 _views[0].offset += remaining
@@ -218,16 +204,10 @@ public struct PacketBuffer {
     /// Used for TCP segment reassembly and other multi-view construction.
     public mutating func appendView(_ other: PacketBuffer) {
         if totalLength == 0 {
-            // Replace empty buffer: release our stale views, adopt other's
-            for v in _views { v.storage.release() }
-            _views = other._views.map { v in
-                v.storage.retain()
-                return v
-            }
+            _views = other._views
             return
         }
         for view in other._views where view.length > 0 {
-            view.storage.retain()
             _views.append(view)
         }
     }
@@ -273,8 +253,6 @@ public struct PacketBuffer {
                     storage: _views[i].storage,
                     offset: _views[i].offset + take,
                     length: _views[i].length - take))
-            } else {
-                _views[i].storage.release()
             }
             viewIndex = i + 1
         }
@@ -299,7 +277,6 @@ public struct PacketBuffer {
             let lastIdx = _views.count - 1
             if remaining >= _views[lastIdx].length {
                 remaining -= _views[lastIdx].length
-                _views[lastIdx].storage.release()
                 _views.removeLast()
             } else {
                 _views[lastIdx].length -= remaining

@@ -43,75 +43,70 @@ public final class RoundContext {
         pendingReleases.append(chunk)
     }
 
-    /// Defer release of all chunks referenced by a PacketBuffer.
-    public func deferRelease(_ pkt: consuming PacketBuffer) {
-        // PacketBuffer is consumed; its views' storages will be released
-        // when the struct is destroyed. But we want them batch-released.
-        // Since PacketBuffer is a struct with COW, we can't easily extract
-        // the views. Callers should use deferRelease(Storage) for now.
-        //
-        // In practice, deferRelease is for chunks that were explicitly
-        // acquired via acquireStorage() and then wrapped.
-        _ = pkt
-    }
-
     // MARK: - Round lifecycle
 
     /// End the round: batch-release all round-scoped chunks back to their pools.
     ///
     /// Two categories:
     /// 1. **Deferred releases** (`pendingReleases`): explicitly marked chunks → return to pool.
-    /// 2. **Untracked single-ref chunks**: acquired via `acquireStorage()` but never
-    ///    deferRelease'd and never cloned (refCount==1) → round-scoped, return to pool.
-    /// 3. **Cloned chunks** (refCount > 1): held by persistent state (sendBuf/recvBuf)
-    ///    → survive the round naturally.
+    /// 2. **Round-scoped chunks**: acquired via `acquireStorage()` and no longer referenced
+    ///    outside this RoundContext → return to pool. Detected via `isKnownUniquelyReferenced`
+    ///    (Swift ARC), which correctly tracks all strong references including those held by
+    ///    PacketBuffer.View structs.
     ///
     /// After this call, all round-scoped Storage is back in the pools.
-    /// Persistent chunks remain alive via their clone's ARC reference.
+    /// Persistent chunks (held by transport outputs, sendBuf/recvBuf) survive
+    /// because their Swift ARC references prevent recycling.
     public func endRound() {
-        // Track which chunks were returned to pools to avoid double-release
-        var returnedToPool = Set<ObjectIdentifier>()
+        // Group chunks by capacity (maps 1:1 to pool) for batch release
+        var byCapacity: [Int: [Storage]] = [:]
 
-        // Phase 1: deferred releases explicitly go back to pools
+        // Phase 1: deferred releases
         for chunk in pendingReleases {
-            let pool = ChunkPools.poolFor(chunkCapacity: chunk.capacity)
-            pool.release(chunk)  // reset refCount to 1, append to freeList
-            returnedToPool.insert(ObjectIdentifier(chunk))
+            byCapacity[chunk.capacity, default: []].append(chunk)
         }
         pendingReleases.removeAll(keepingCapacity: true)
 
-        // Phase 2: round-scoped chunks (refCount==1, not already pooled)
-        for chunk in allocatedChunks {
-            let id = ObjectIdentifier(chunk)
-            if returnedToPool.contains(id) { continue }
-            if chunk.refCount == 1 {
-                // Only RoundContext holds this — return to pool
-                let pool = ChunkPools.poolFor(chunkCapacity: chunk.capacity)
-                pool.release(chunk)
-            }
-            // refCount > 1: someone else (sendBuf/recvBuf) cloned it — survives
-        }
+        // Phase 2: round-scoped chunks — use Swift ARC to detect whether
+        // chunks are still referenced outside this RoundContext.
+        // Move chunks out of allocatedChunks first to drop one reference.
+        var candidates = allocatedChunks
         allocatedChunks.removeAll(keepingCapacity: true)
+
+        // Pop one at a time. After removal from candidates, the chunk is
+        // held only by the local variable. isKnownUniquelyReferenced
+        // returns true iff no other Swift ARC references exist.
+        while !candidates.isEmpty {
+            var chunk = candidates.removeLast()
+            if isKnownUniquelyReferenced(&chunk) {
+                byCapacity[chunk.capacity, default: []].append(chunk)
+            }
+        }
+
+        // Batch release: single append(contentsOf:) per pool
+        for (capacity, chunks) in byCapacity {
+            ChunkPools.poolFor(chunkCapacity: capacity).batchRelease(chunks)
+        }
     }
 
     // MARK: - Stats & Debug
 
-    public var stats: (allocated: Int, released: Int, retained: Int) {
-        let retained = allocatedChunks.filter { $0.refCount > 1 }.count
-        return (allocatedChunks.count, pendingReleases.count, retained)
+    public var stats: (allocated: Int, released: Int) {
+        return (allocatedChunks.count, pendingReleases.count)
     }
 
     #if DEBUG
     /// Verify no unexpected chunk leaks at round end.
-    /// A chunk whose refCount == 0 after release means it was allocated
-    /// but neither explicitly transferred to persistent state nor released.
+    /// Returns chunks still in allocatedChunks that are held only by
+    /// this RoundContext — these were allocated but never transferred
+    /// to persistent state or outputs.
     public func verifyNoLeaks() -> [Storage] {
+        // Pop one at a time from a copy to check uniqueness
+        var remaining = allocatedChunks
         var leaks: [Storage] = []
-        for chunk in allocatedChunks {
-            // refCount == 1 means only RoundContext holds a reference —
-            // nobody else picked it up (no clone into sendBuf/recvBuf).
-            // refCount > 1 means it was transferred to persistent state.
-            if chunk.refCount == 1 && !pendingReleases.contains(where: { $0 === chunk }) {
+        while !remaining.isEmpty {
+            var chunk = remaining.removeLast()
+            if isKnownUniquelyReferenced(&chunk) {
                 leaks.append(chunk)
             }
         }
@@ -119,3 +114,4 @@ public final class RoundContext {
     }
     #endif
 }
+

@@ -5,26 +5,27 @@
 /// comes from is unknown until poll returns, so blocking is the correct
 /// deliberation posture.
 ///
-/// This function duplicates the parsing phases from `classifyFrames` because
-/// it needs to track endpointID alongside each frame to route replies back
-/// to the correct VM endpoint. `classifyFrames` is a stateless utility for
-/// contexts where endpoint tracking isn't needed.
-///
 /// ## Phase separation
 ///
 /// Each phase keeps a single code path in L1 cache. Parse phases never
 /// interleave with business-logic phases — intermediate arrays carry results
 /// between phases so I-cache stays hot within each phase.
 ///
-///   Phase 1: Poll + batch read          (syscall)
-///   Phase 2: Parse ALL Ethernet headers (EthernetFrame.parse, ~15 insns)
-///   Phase 3: MAC filter + EtherType     (branch logic only)
-///   Phase 4: Parse ALL IPv4 headers     (IPv4Header.parse, ~25 insns)
-///   Phase 5: Parse ALL ARP frames       (ARPFrame.parse, ~20 insns)
-///   Phase 6: Process ALL ICMP           (ICMPHeader.parse + buildICMPEchoReply)
-///   Phase 7: Process ALL DHCP           (DHCPServer.process)
-///   Phase 8: Process ALL ARP            (processARPRequest)
-///   Phase 9: Batch write + endRound     (syscall + reclaim)
+///   Phase 1:  Poll + batch read              (syscall)
+///   Phase 2:  Parse ALL Ethernet headers     (EthernetFrame.parse, ~15 insns)
+///   Phase 3:  MAC filter + EtherType dispatch (branch logic only)
+///   Phase 4:  Parse ALL IPv4 headers         (IPv4Header.parse, ~25 insns)
+///   Phase 5:  Parse ALL ARP frames           (ARPFrame.parse, ~20 insns)
+///   Phase 6:  Parse ALL ICMP headers         (ICMPHeader.parse, ~10 insns)
+///   Phase 7:  Parse ALL DHCP packets         (UDP port check + DHCPPacket.parse)
+///   Phase 8:  Process ALL ICMP               (buildICMPEchoReply)
+///   Phase 9:  Process ALL DHCP               (DHCPServer.process + buildDHCPFrame)
+///   Phase 10: Process ALL ARP                (processARPRequest)
+///   Phase 11: Batch write + endRound         (syscall + reclaim)
+///
+/// Zero-copy throughout: every .parse returns a view (slice) over the original
+/// PacketBuffer. Intermediate arrays hold small value types (MAC, IP, headers)
+/// plus a PacketBuffer reference — no byte copies of frame data.
 ///
 /// Forwarding (NAT, L3 routing between VMs) is deferred to a later phase.
 @discardableResult
@@ -84,15 +85,30 @@ public func bdpRound(
         }
     }
 
-    var replies: [(endpointID: Int, packet: PacketBuffer)] = []
-
-    // ── Phase 6: Process ALL ICMP ──
-    // I-cache: ICMPHeader.parse + buildICMPEchoReply
+    // ── Phase 6: Parse ALL ICMP headers ──
+    // I-cache: ICMPHeader.parse only — no reply construction
+    var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
     for (ep, eth, ip) in ipv4Parsed {
         guard ip.protocol == .icmp else { continue }
         guard let icmp = ICMPHeader.parse(from: ip.payload) else { continue }
-        guard icmp.type == 8, icmp.code == 0 else { continue }  // echo request only
+        icmpParsed.append((ep, eth, ip, icmp))
+    }
 
+    // ── Phase 7: Parse ALL DHCP packets ──
+    // I-cache: extractDHCP only — no lease logic
+    var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
+    for (ep, eth, ip) in ipv4Parsed {
+        guard ip.protocol == .udp else { continue }
+        guard let dhcp = extractDHCP(from: ip.payload) else { continue }
+        dhcpParsed.append((ep, eth, ip, dhcp))
+    }
+
+    var replies: [(endpointID: Int, packet: PacketBuffer)] = []
+
+    // ── Phase 8: Process ALL ICMP ──
+    // I-cache: buildICMPEchoReply — no parsing
+    for (ep, eth, ip, icmp) in icmpParsed {
+        guard icmp.type == 8, icmp.code == 0 else { continue }  // echo request only
         if let reply = buildICMPEchoReply(
             hostMAC: arpMapping.hostMAC, eth: eth, ip: ip, icmp: icmp, round: round
         ) {
@@ -100,14 +116,11 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 7: Process ALL DHCP ──
-    // I-cache: extractDHCP + DHCPServer.process + buildDHCPFrame
-    for (ep, eth, ip) in ipv4Parsed {
-        guard ip.protocol == .udp else { continue }
-        guard let dhcpPkt = extractDHCP(from: ip.payload) else { continue }
-
+    // ── Phase 9: Process ALL DHCP ──
+    // I-cache: DHCPServer.process + buildDHCPFrame — no parsing
+    for (ep, eth, ip, dhcp) in dhcpParsed {
         if let (rawReply, targetEp) = dhcpServer.process(
-            packet: dhcpPkt, srcMAC: eth.srcMAC,
+            packet: dhcp, srcMAC: eth.srcMAC,
             endpointID: ep, arpMapping: &arpMapping, round: round
         ) {
             // Extract yiaddr from raw DHCP reply (offset 16, 4 bytes)
@@ -129,7 +142,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 8: Process ALL ARP ──
+    // ── Phase 10: Process ALL ARP ──
     // I-cache: ARPMapping.processARPRequest + ARP reply frame construction
     for (ep, _, arp) in arpParsed {
         if let reply = arpMapping.processARPRequest(arp, round: round) {
@@ -137,7 +150,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 9: Batch write + endRound ──
+    // ── Phase 11: Batch write + endRound ──
     let replyCount = replies.count
     if !replies.isEmpty {
         transport.writePackets(replies)
@@ -151,6 +164,8 @@ public func bdpRound(
     ipv4Pkts.removeAll()
     ipv4Parsed.removeAll()
     arpParsed.removeAll()
+    icmpParsed.removeAll()
+    dhcpParsed.removeAll()
     replies.removeAll()
 
     round.endRound()

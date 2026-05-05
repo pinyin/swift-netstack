@@ -56,7 +56,7 @@ public func bdpRound(
     var arpPkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
     var ipv4Pkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
     for (ep, pkt, eth) in ethParsed {
-        guard eth.dstMAC == arpMapping.ourMAC || eth.dstMAC == .broadcast else {
+        guard eth.dstMAC == arpMapping.hostMAC || eth.dstMAC == .broadcast else {
             continue
         }
         switch eth.etherType {
@@ -94,23 +94,38 @@ public func bdpRound(
         guard icmp.type == 8, icmp.code == 0 else { continue }  // echo request only
 
         if let reply = buildICMPEchoReply(
-            ourMAC: arpMapping.ourMAC, eth: eth, ip: ip, icmp: icmp, round: round
+            hostMAC: arpMapping.hostMAC, eth: eth, ip: ip, icmp: icmp, round: round
         ) {
             replies.append((ep, reply))
         }
     }
 
     // ── Phase 7: Process ALL DHCP ──
-    // I-cache: extractDHCP + DHCPServer.process + buildDHCPReply
+    // I-cache: extractDHCP + DHCPServer.process + buildDHCPFrame
     for (ep, eth, ip) in ipv4Parsed {
         guard ip.protocol == .udp else { continue }
         guard let dhcpPkt = extractDHCP(from: ip.payload) else { continue }
 
-        if let (reply, targetEp) = dhcpServer.process(
+        if let (rawReply, targetEp) = dhcpServer.process(
             packet: dhcpPkt, srcMAC: eth.srcMAC,
             endpointID: ep, arpMapping: &arpMapping, round: round
         ) {
-            replies.append((targetEp, reply))
+            // Extract yiaddr from raw DHCP reply (offset 16, 4 bytes)
+            guard rawReply.totalLength >= 20 else { continue }
+            let yiaddr = rawReply.withUnsafeReadableBytes { buf in
+                IPv4Address(buf[16], buf[17], buf[18], buf[19])
+            }
+
+            if let frame = buildDHCPFrame(
+                hostMAC: arpMapping.hostMAC,
+                clientMAC: eth.srcMAC,
+                gatewayIP: ip.dstAddr,
+                yiaddr: yiaddr,
+                dhcpPayload: rawReply,
+                round: round
+            ) {
+                replies.append((targetEp, frame))
+            }
         }
     }
 
@@ -158,4 +173,59 @@ private func extractDHCP(from udpPayload: PacketBuffer) -> DHCPPacket? {
         let dhcpPayload = pkt.slice(from: 8, length: pkt.totalLength - 8)
         return DHCPPacket.parse(from: dhcpPayload)
     }
+}
+
+/// Wrap a raw DHCP payload in Ethernet/IPv4/UDP headers.
+private func buildDHCPFrame(
+    hostMAC: MACAddress,
+    clientMAC: MACAddress,
+    gatewayIP: IPv4Address,
+    yiaddr: IPv4Address,
+    dhcpPayload: PacketBuffer,
+    round: RoundContext
+) -> PacketBuffer? {
+    let dhcpLen = dhcpPayload.totalLength
+    let udpLen = 8 + dhcpLen
+    let ipTotalLen = 20 + udpLen
+    let frameLen = 14 + ipTotalLen
+
+    var pkt = round.allocate(capacity: frameLen, headroom: 0)
+    guard let ptr = pkt.appendPointer(count: frameLen) else { return nil }
+    ptr.initializeMemory(as: UInt8.self, repeating: 0, count: frameLen)
+
+    // ── Ethernet header ──
+    clientMAC.write(to: ptr)                                   // dst = client
+    hostMAC.write(to: ptr.advanced(by: 6))                     // src = host
+    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+    // ── IPv4 header (offset 14) ──
+    let ipOff = 14
+    ptr.advanced(by: ipOff).storeBytes(of: UInt8(0x45), as: UInt8.self)
+    ptr.advanced(by: ipOff + 2).storeBytes(of: UInt8(ipTotalLen >> 8), as: UInt8.self)
+    ptr.advanced(by: ipOff + 3).storeBytes(of: UInt8(ipTotalLen & 0xFF), as: UInt8.self)
+    ptr.advanced(by: ipOff + 8).storeBytes(of: UInt8(64), as: UInt8.self)  // TTL
+    ptr.advanced(by: ipOff + 9).storeBytes(of: IPProtocol.udp.rawValue, as: UInt8.self)
+    gatewayIP.write(to: ptr.advanced(by: ipOff + 12))          // src IP
+    yiaddr.write(to: ptr.advanced(by: ipOff + 16))             // dst IP
+    let ipCksum = UnsafeRawBufferPointer(start: ptr.advanced(by: ipOff), count: 20)
+        .withUnsafeBytes { internetChecksum($0) }
+    ptr.advanced(by: ipOff + 10).storeBytes(of: UInt8(ipCksum >> 8), as: UInt8.self)
+    ptr.advanced(by: ipOff + 11).storeBytes(of: UInt8(ipCksum & 0xFF), as: UInt8.self)
+
+    // ── UDP header (offset 34) ──
+    let udpOff = 34
+    ptr.advanced(by: udpOff).storeBytes(of: UInt8(0x00), as: UInt8.self)
+    ptr.advanced(by: udpOff + 1).storeBytes(of: UInt8(67), as: UInt8.self)  // src port = 67
+    ptr.advanced(by: udpOff + 2).storeBytes(of: UInt8(0x00), as: UInt8.self)
+    ptr.advanced(by: udpOff + 3).storeBytes(of: UInt8(68), as: UInt8.self)  // dst port = 68
+    ptr.advanced(by: udpOff + 4).storeBytes(of: UInt8(udpLen >> 8), as: UInt8.self)
+    ptr.advanced(by: udpOff + 5).storeBytes(of: UInt8(udpLen & 0xFF), as: UInt8.self)
+
+    // ── DHCP payload (offset 42) ──
+    let dhcpOff = 42
+    dhcpPayload.withUnsafeReadableBytes { buf in
+        ptr.advanced(by: dhcpOff).copyMemory(from: buf.baseAddress!, byteCount: dhcpLen)
+    }
+
+    return pkt
 }

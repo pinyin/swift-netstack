@@ -5,7 +5,7 @@ import Darwin
 @Suite(.serialized)
 struct BDPRoundIntegrationTests {
 
-    let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+    let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
     let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
     let gateway = IPv4Address(100, 64, 1, 1)
 
@@ -29,7 +29,7 @@ struct BDPRoundIntegrationTests {
         )
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let routingTable = RoutingTable()
         let round = RoundContext()
@@ -47,7 +47,7 @@ struct BDPRoundIntegrationTests {
             return
         }
         #expect(eth.dstMAC == clientMAC)
-        #expect(eth.srcMAC == ourMAC)
+        #expect(eth.srcMAC == hostMAC)
         #expect(eth.etherType == .arp)
 
         guard let arp = ARPFrame.parse(from: eth.payload) else {
@@ -55,7 +55,7 @@ struct BDPRoundIntegrationTests {
             return
         }
         #expect(arp.operation == .reply)
-        #expect(arp.senderMAC == ourMAC)
+        #expect(arp.senderMAC == hostMAC)
         #expect(arp.senderIP == gateway)
         #expect(arp.targetMAC == clientMAC)
         #expect(arp.targetIP == clientIP)
@@ -73,7 +73,7 @@ struct BDPRoundIntegrationTests {
         )
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -93,7 +93,7 @@ struct BDPRoundIntegrationTests {
         let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpDiscover)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -103,8 +103,8 @@ struct BDPRoundIntegrationTests {
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
 
         let reply = (transport as! InMemoryTransport).outputs[0].packet
-        guard let dhcp = DHCPPacket.parse(from: reply) else {
-            Issue.record("failed to parse DHCP reply")
+        guard let dhcp = extractDHCPFromReply(reply) else {
+            Issue.record("failed to parse DHCP OFFER from wrapped reply")
             return
         }
         #expect(dhcp.messageType == .offer)
@@ -125,7 +125,7 @@ struct BDPRoundIntegrationTests {
         let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -135,8 +135,8 @@ struct BDPRoundIntegrationTests {
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
 
         let reply = (transport as! InMemoryTransport).outputs[0].packet
-        guard let dhcp = DHCPPacket.parse(from: reply) else {
-            Issue.record("failed to parse DHCP ACK")
+        guard let dhcp = extractDHCPFromReply(reply) else {
+            Issue.record("failed to parse DHCP ACK from wrapped reply")
             return
         }
         #expect(dhcp.messageType == .ack)
@@ -157,7 +157,7 @@ struct BDPRoundIntegrationTests {
         let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -175,7 +175,7 @@ struct BDPRoundIntegrationTests {
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         let requestedIP = IPv4Address(100, 64, 1, 50)
 
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
 
         // Round 1: REQUEST (allocate lease)
@@ -228,7 +228,7 @@ struct BDPRoundIntegrationTests {
             (endpointID: 1, packet: arpFrame),
             (endpointID: 1, packet: dhcpFrame),
         ])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -248,7 +248,7 @@ struct BDPRoundIntegrationTests {
         let frame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x1234, seq: 0x0001)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext()
 
@@ -264,7 +264,7 @@ struct BDPRoundIntegrationTests {
             return
         }
         #expect(eth.dstMAC == clientMAC)
-        #expect(eth.srcMAC == ourMAC)
+        #expect(eth.srcMAC == hostMAC)
         #expect(eth.etherType == .ipv4)
 
         guard let ip = IPv4Header.parse(from: eth.payload) else {
@@ -290,7 +290,7 @@ struct BDPRoundIntegrationTests {
 
     @Test func emptyInputRoundReturnsFast() {
         var transport: any Transport = InMemoryTransport()
-        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint()])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint()])
         var dhcpServer = DHCPServer(endpoints: [makeEndpoint()])
         let round = RoundContext()
 
@@ -300,6 +300,19 @@ struct BDPRoundIntegrationTests {
     }
 
     // MARK: - Helpers
+
+    /// Unwrap Ethernet → IPv4 → UDP → DHCP and parse the inner DHCP packet.
+    private func extractDHCPFromReply(_ pkt: PacketBuffer) -> DHCPPacket? {
+        guard let eth = EthernetFrame.parse(from: pkt),
+              eth.etherType == .ipv4,
+              let ip = IPv4Header.parse(from: eth.payload),
+              ip.protocol == .udp else { return nil }
+        // Skip UDP header (8 bytes)
+        let udpPayload = ip.payload
+        guard udpPayload.totalLength >= 8 else { return nil }
+        let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8)
+        return DHCPPacket.parse(from: dhcpPayload)
+    }
 
     private func makeEthernetFrame(dst: MACAddress, src: MACAddress, type: EtherType, payload: [UInt8]) -> PacketBuffer {
         var bytes: [UInt8] = []
@@ -367,7 +380,7 @@ struct BDPRoundIntegrationTests {
         ipBytes[11] = UInt8(ipCksum & 0xFF)
 
         return makeEthernetFrame(
-            dst: ourMAC,
+            dst: hostMAC,
             src: clientMAC,
             type: .ipv4,
             payload: ipBytes + icmpBytes
@@ -401,7 +414,7 @@ struct BDPRoundIntegrationTests {
         // checksum = 0 (UDP checksum is optional for IPv4)
 
         return makeEthernetFrame(
-            dst: ourMAC,
+            dst: hostMAC,
             src: clientMAC,
             type: .ipv4,
             payload: ipBytes + udpBytes + dhcpPayload

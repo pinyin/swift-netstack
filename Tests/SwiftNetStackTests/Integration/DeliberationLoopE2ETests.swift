@@ -5,7 +5,7 @@ import Darwin
 @Suite(.serialized)
 struct DeliberationLoopE2ETests {
 
-    let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+    let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
     let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
     let gateway = IPv4Address(100, 64, 1, 1)
 
@@ -43,7 +43,7 @@ struct DeliberationLoopE2ETests {
         defer { close(hostFD); close(guestFD) }
 
         let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
-        var loop = DeliberationLoop(endpoints: [ep], ourMAC: ourMAC)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
         var transport: any Transport = PollingTransport(endpoints: [ep])
 
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
@@ -68,7 +68,7 @@ struct DeliberationLoopE2ETests {
             return
         }
         #expect(eth.dstMAC == clientMAC)
-        #expect(eth.srcMAC == ourMAC)
+        #expect(eth.srcMAC == hostMAC)
         #expect(eth.etherType == .ipv4)
 
         guard let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() else {
@@ -98,7 +98,7 @@ struct DeliberationLoopE2ETests {
         defer { close(hostFD); close(guestFD) }
 
         let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
-        var loop = DeliberationLoop(endpoints: [ep], ourMAC: ourMAC)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
         var transport: any Transport = PollingTransport(endpoints: [ep])
 
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
@@ -114,15 +114,15 @@ struct DeliberationLoopE2ETests {
         let offer = readFromFD(guestFD)
         #expect(!offer.isEmpty)
         guard !offer.isEmpty else { return }
-        guard let offerDHCP = DHCPPacket.parse(from: packetFrom(offer)) else {
+        guard let offerDHCP = parseDHCPFromBytes(offer) else {
             Issue.record("OFFER is not valid DHCP")
             return
         }
         #expect(offerDHCP.messageType == .offer)
         #expect(offerDHCP.xid == 0xABCD)
 
-        // Extract offered IP from the raw packet (yiaddr at offset 16)
-        let offeredIP = IPv4Address(offer[16], offer[17], offer[18], offer[19])
+        // Extract offered IP from DHCP payload (yiaddr at offset 16 in DHCP, which starts at byte 42)
+        let offeredIP = IPv4Address(offer[58], offer[59], offer[60], offer[61])
 
         // Round 2: REQUEST → ACK
         let requestFrame = makeDHCPFrame(clientMAC: clientMAC,
@@ -138,7 +138,7 @@ struct DeliberationLoopE2ETests {
         let ack = readFromFD(guestFD)
         #expect(!ack.isEmpty)
         guard !ack.isEmpty else { return }
-        guard let ackDHCP = DHCPPacket.parse(from: packetFrom(ack)) else {
+        guard let ackDHCP = parseDHCPFromBytes(ack) else {
             Issue.record("ACK is not valid DHCP")
             return
         }
@@ -159,7 +159,7 @@ struct DeliberationLoopE2ETests {
         defer { close(hostFD); close(guestFD) }
 
         let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
-        var loop = DeliberationLoop(endpoints: [ep], ourMAC: ourMAC)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
         var transport: any Transport = PollingTransport(endpoints: [ep])
 
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
@@ -212,7 +212,7 @@ struct DeliberationLoopE2ETests {
         let ep1 = VMEndpoint(id: 1, fd: hostFD1, subnet: subnet1, gateway: gw1)
         let ep2 = VMEndpoint(id: 2, fd: hostFD2, subnet: subnet2, gateway: gw2)
 
-        var loop = DeliberationLoop(endpoints: [ep1, ep2], ourMAC: ourMAC)
+        var loop = DeliberationLoop(endpoints: [ep1, ep2], hostMAC: hostMAC)
         var transport: any Transport = PollingTransport(endpoints: [ep1, ep2])
 
         let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
@@ -257,7 +257,7 @@ struct DeliberationLoopE2ETests {
         defer { close(hostFD); close(guestFD) }
 
         let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
-        var loop = DeliberationLoop(endpoints: [ep], ourMAC: ourMAC)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
         var transport: any Transport = PollingTransport(endpoints: [ep])
 
         let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
@@ -294,7 +294,129 @@ struct DeliberationLoopE2ETests {
         #expect(seenMAC2)
     }
 
+    // MARK: - Batch stress (verifies BDP phase batching)
+
+    @Test func batchStress100MixedFramesE2E() {
+        guard let (hostFD, guestFD) = makeSocketPair() else {
+            Issue.record("socketpair failed: \(errno)")
+            return
+        }
+        defer { close(hostFD); close(guestFD) }
+
+        let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
+        var transport: any Transport = PollingTransport(endpoints: [ep])
+
+        let totalARP = 30
+        let totalICMP = 30
+        let totalDHCP = 40
+        let totalFrames = totalARP + totalICMP + totalDHCP
+        let batchSize = 10
+
+        var arpReplies = 0, icmpReplies = 0, dhcpOffers = 0
+        var totalReplies = 0
+
+        /// Process one batch: write frames, one round drains all, then collect replies.
+        func runBatch(frameCount: Int, buildFrame: (Int) -> [UInt8]) {
+            // Write frames
+            for i in 0..<frameCount {
+                writeToFD(guestFD, buildFrame(i))
+            }
+            // One round drains all pending datagrams from hostFD (readPackets has drain loop)
+            totalReplies += loop.runOneRound(transport: &transport)
+            // Collect replies from guestFD to prevent buffer overflow
+            for _ in 0..<frameCount {
+                let reply = readFromFD(guestFD)
+                guard !reply.isEmpty else { continue }
+                guard let eth = EthernetFrame.parse(from: packetFrom(reply)) else { continue }
+                switch eth.etherType {
+                case .arp: arpReplies += 1
+                case .ipv4:
+                    guard let ip = IPv4Header.parse(from: eth.payload) else { continue }
+                    switch ip.protocol {
+                    case .icmp: icmpReplies += 1
+                    case .udp:  dhcpOffers += 1
+                    case .tcp: break
+                    }
+                @unknown default: break
+                }
+            }
+        }
+
+        // ARP batch
+        for batchStart in stride(from: 0, to: totalARP, by: batchSize) {
+            let end = min(batchStart + batchSize, totalARP)
+            runBatch(frameCount: end - batchStart) { i in
+                let idx = batchStart + i
+                let mac = MACAddress(0xA1, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
+                let ip = IPv4Address(100, 64, 1, UInt8(10 + idx))
+                return makeEthernetFrameBytes(
+                    dst: .broadcast, src: mac, type: .arp,
+                    payload: makeARPPayload(op: .request, senderMAC: mac, senderIP: ip, targetMAC: .zero, targetIP: gateway)
+                )
+            }
+        }
+
+        // ICMP batch
+        for batchStart in stride(from: 0, to: totalICMP, by: batchSize) {
+            let end = min(batchStart + batchSize, totalICMP)
+            runBatch(frameCount: end - batchStart) { i in
+                let idx = totalARP + batchStart + i
+                let mac = MACAddress(0xA2, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
+                let ip = IPv4Address(100, 64, 1, UInt8(50 + batchStart + i))
+                return makeICMPEchoFrame(clientMAC: mac, clientIP: ip, dstIP: gateway, id: UInt16(idx + 1), seq: 1)
+            }
+        }
+
+        // DHCP batch
+        for batchStart in stride(from: 0, to: totalDHCP, by: batchSize) {
+            let end = min(batchStart + batchSize, totalDHCP)
+            runBatch(frameCount: end - batchStart) { i in
+                let idx = totalARP + totalICMP + batchStart + i
+                let mac = MACAddress(0xA3, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
+                return makeDHCPFrame(clientMAC: mac,
+                    dhcpPayload: makeDHCPPacketBytes(op: 1, xid: UInt32(1000 + batchStart + i), chaddr: mac, msgType: .discover))
+            }
+        }
+
+        // Drain any remaining replies from guestFD (non-blocking poll, may timeout)
+        for _ in 0..<totalFrames {
+            let reply = readFromFD(guestFD)
+            guard !reply.isEmpty else { continue }
+            guard let eth = EthernetFrame.parse(from: packetFrom(reply)) else { continue }
+            switch eth.etherType {
+            case .arp: arpReplies += 1
+            case .ipv4:
+                guard let ip = IPv4Header.parse(from: eth.payload) else { continue }
+                switch ip.protocol {
+                case .icmp: icmpReplies += 1
+                case .udp:  dhcpOffers += 1
+                case .tcp: break
+                }
+            @unknown default: break
+            }
+        }
+
+        #expect(totalReplies == totalFrames)
+        #expect(arpReplies == totalARP)
+        #expect(icmpReplies == totalICMP)
+        #expect(dhcpOffers == totalDHCP)
+    }
+
     // MARK: - Helpers
+
+    /// Parse DHCP packet from raw bytes, unwrapping Ethernet → IPv4 → UDP.
+    private func parseDHCPFromBytes(_ bytes: [UInt8]) -> DHCPPacket? {
+        let pkt = packetFrom(bytes)
+        guard let eth = EthernetFrame.parse(from: pkt),
+              eth.etherType == .ipv4,
+              let ip = IPv4Header.parse(from: eth.payload),
+              ip.protocol == .udp else { return nil }
+        let udpPayload = ip.payload
+        guard udpPayload.totalLength >= 8 else { return nil }
+        let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8)
+        return DHCPPacket.parse(from: dhcpPayload)
+    }
 
     private func packetFrom(_ bytes: [UInt8]) -> PacketBuffer {
         let s = Storage.allocate(capacity: bytes.count)
@@ -359,7 +481,7 @@ struct DeliberationLoopE2ETests {
         udpBytes[5] = UInt8(udpLen & 0xFF)
 
         return makeEthernetFrameBytes(
-            dst: ourMAC, src: clientMAC, type: .ipv4,
+            dst: hostMAC, src: clientMAC, type: .ipv4,
             payload: ipBytes + udpBytes + dhcpPayload
         )
     }
@@ -420,7 +542,7 @@ struct DeliberationLoopE2ETests {
         ipBytesArr[11] = UInt8(ipCksum & 0xFF)
 
         return makeEthernetFrameBytes(
-            dst: ourMAC, src: clientMAC, type: .ipv4,
+            dst: hostMAC, src: clientMAC, type: .ipv4,
             payload: ipBytesArr + icmpBytes
         )
     }

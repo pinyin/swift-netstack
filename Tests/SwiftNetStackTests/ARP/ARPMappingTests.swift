@@ -9,18 +9,18 @@ struct ARPMappingTests {
     @Test func initPrepopulatesGatewayEntries() {
         let ep1 = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24), gateway: IPv4Address(100, 64, 1, 1))
         let ep2 = VMEndpoint(id: 2, fd: 11, subnet: IPv4Subnet(network: IPv4Address(100, 64, 2, 0), prefixLength: 24), gateway: IPv4Address(100, 64, 2, 1))
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
-        let mapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep1, ep2])
+        let mapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1, ep2])
 
         #expect(mapping.isKnown(IPv4Address(100, 64, 1, 1)))
         #expect(mapping.isKnown(IPv4Address(100, 64, 2, 1)))
-        #expect(mapping.lookup(ip: IPv4Address(100, 64, 1, 1)) == ourMAC)
-        #expect(mapping.lookup(ip: IPv4Address(100, 64, 2, 1)) == ourMAC)
+        #expect(mapping.lookup(ip: IPv4Address(100, 64, 1, 1)) == hostMAC)
+        #expect(mapping.lookup(ip: IPv4Address(100, 64, 2, 1)) == hostMAC)
     }
 
     @Test func initEmptyEndpointsProducesEmptyMapping() {
-        let mapping = ARPMapping(ourMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpoints: [])
+        let mapping = ARPMapping(hostMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpoints: [])
         #expect(!mapping.isKnown(IPv4Address(10, 0, 0, 1)))
     }
 
@@ -28,14 +28,14 @@ struct ARPMappingTests {
 
     @Test func lookupReturnsNilForUnknown() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        let mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        let mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         #expect(mapping.lookup(ip: IPv4Address(192, 168, 1, 100)) == nil)
     }
 
     @Test func lookupReturnsMACForKnown() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        var mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let ip = IPv4Address(10, 0, 0, 50)
         let mac = MACAddress(0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01)
@@ -48,14 +48,14 @@ struct ARPMappingTests {
 
     @Test func isKnownTrueForGateway() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        let mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        let mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         #expect(mapping.isKnown(IPv4Address(10, 0, 0, 1)))
     }
 
     @Test func isKnownFalseForUnknown() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        let mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        let mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         #expect(!mapping.isKnown(IPv4Address(10, 0, 0, 99)))
     }
@@ -64,7 +64,7 @@ struct ARPMappingTests {
 
     @Test func addInsertsNewEntry() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        var mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let ip = IPv4Address(10, 0, 0, 100)
         let mac = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
@@ -76,7 +76,7 @@ struct ARPMappingTests {
 
     @Test func addUpdatesExistingEntry() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        var mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let ip = IPv4Address(10, 0, 0, 1)  // the gateway
         let oldMAC = mapping.lookup(ip: ip)
@@ -92,7 +92,7 @@ struct ARPMappingTests {
 
     @Test func removeDeletesEntry() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        var mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let ip = IPv4Address(10, 0, 0, 50)
         mapping.add(ip: ip, mac: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66), endpointID: 1)
@@ -104,7 +104,7 @@ struct ARPMappingTests {
 
     @Test func removeUnknownIsNoop() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        var mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let countBefore = mapping.lookup(ip: IPv4Address(10, 0, 0, 1)) != nil
         mapping.remove(ip: IPv4Address(192, 168, 1, 1))
@@ -116,7 +116,7 @@ struct ARPMappingTests {
 
     @Test func processARPRequestReturnsNilForUnknownTarget() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        let mapping = ARPMapping(ourMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
+        let mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
         let round = RoundContext()
 
         // Build an ARP request for an unknown IP
@@ -134,8 +134,8 @@ struct ARPMappingTests {
 
     @Test func processARPRequestGeneratesReplyForKnownTarget() {
         let ep = VMEndpoint(id: 1, fd: 10, subnet: IPv4Subnet(network: IPv4Address(10, 0, 0, 0), prefixLength: 24), gateway: IPv4Address(10, 0, 0, 1))
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
-        let mapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let mapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         let round = RoundContext()
 
         let smac = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
@@ -160,7 +160,7 @@ struct ARPMappingTests {
             return
         }
         #expect(replyEth.dstMAC == smac)       // reply to requester
-        #expect(replyEth.srcMAC == ourMAC)      // from us
+        #expect(replyEth.srcMAC == hostMAC)      // from us
         #expect(replyEth.etherType == .arp)
 
         guard let replyARP = ARPFrame.parse(from: replyEth.payload) else {
@@ -168,7 +168,7 @@ struct ARPMappingTests {
             return
         }
         #expect(replyARP.operation == .reply)
-        #expect(replyARP.senderMAC == ourMAC)
+        #expect(replyARP.senderMAC == hostMAC)
         #expect(replyARP.senderIP == tip)       // we claim to be the target
         #expect(replyARP.targetMAC == smac)
         #expect(replyARP.targetIP == sip)

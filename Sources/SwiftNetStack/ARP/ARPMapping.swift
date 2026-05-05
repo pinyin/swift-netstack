@@ -19,17 +19,17 @@ public struct ARPEntry {
 /// the constant factor is small, and SIMD vectorization (UInt32 .== target
 /// across 16 entries at a time) can be applied later without API changes.
 ///
-/// Proxy ARP: all intra-subnet ARP requests receive a reply with ourMAC,
+/// Proxy ARP: all intra-subnet ARP requests receive a reply with hostMAC,
 /// forcing L2 traffic through the gateway.
 public struct ARPMapping {
-    public let ourMAC: MACAddress
+    public let hostMAC: MACAddress
     private var entries: [ARPEntry] = []
 
-    /// Build from VMEndpoint list. Gateway IPs are registered with ourMAC.
-    public init(ourMAC: MACAddress, endpoints: [VMEndpoint]) {
-        self.ourMAC = ourMAC
+    /// Build from VMEndpoint list. Gateway IPs are registered with hostMAC.
+    public init(hostMAC: MACAddress, endpoints: [VMEndpoint]) {
+        self.hostMAC = hostMAC
         for ep in endpoints {
-            entries.append(ARPEntry(ip: ep.gateway, mac: ourMAC, endpointID: ep.id))
+            entries.append(ARPEntry(ip: ep.gateway, mac: hostMAC, endpointID: ep.id))
         }
     }
 
@@ -71,7 +71,7 @@ public struct ARPMapping {
     // MARK: - Proxy ARP
 
     /// Process an incoming ARP request.
-    /// - targetIP known → generate a proxy ARP reply (Ethernet + ARP frame) with ourMAC
+    /// - targetIP known → generate a proxy ARP reply (Ethernet + ARP frame) with hostMAC
     /// - targetIP unknown → return nil (silently ignore)
     public func processARPRequest(
         _ arp: ARPFrame, round: RoundContext
@@ -83,7 +83,7 @@ public struct ARPMapping {
 
         // Ethernet header (14 bytes)
         arp.senderMAC.write(to: ptr)                             // dst = sender
-        ourMAC.write(to: ptr.advanced(by: 6))                    // src = us
+        hostMAC.write(to: ptr.advanced(by: 6))                    // src = us
         writeUInt16BE(0x0806, to: ptr.advanced(by: 12))         // EtherType = ARP
 
         // ARP body (28 bytes)
@@ -93,7 +93,7 @@ public struct ARPMapping {
         arpPtr.advanced(by: 4).storeBytes(of: UInt8(6), as: UInt8.self)  // hlen = 6
         arpPtr.advanced(by: 5).storeBytes(of: UInt8(4), as: UInt8.self)  // plen = 4
         writeUInt16BE(ARPOperation.reply.rawValue, to: arpPtr.advanced(by: 6))  // operation
-        ourMAC.write(to: arpPtr.advanced(by: 8))                  // sender MAC = us
+        hostMAC.write(to: arpPtr.advanced(by: 8))                  // sender MAC = us
         arp.targetIP.write(to: arpPtr.advanced(by: 14))            // sender IP = target
         arp.senderMAC.write(to: arpPtr.advanced(by: 18))           // target MAC = requester
         arp.senderIP.write(to: arpPtr.advanced(by: 24))            // target IP = requester

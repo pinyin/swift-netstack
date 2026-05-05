@@ -120,6 +120,8 @@ public struct DHCPServer {
 
     // MARK: - Packet construction
 
+    /// Build raw DHCP payload (BOOTREPLY + magic cookie + options) only.
+    /// Caller is responsible for wrapping in Ethernet/IPv4/UDP headers.
     private func buildDHCPReply(
         messageType: DHCPMessageType,
         xid: UInt32,
@@ -128,14 +130,13 @@ public struct DHCPServer {
         pool: DHCPPool,
         round: RoundContext
     ) -> PacketBuffer? {
-        let totalLen = 240 + 4 + 34  // header + magic + options
-        var pkt = round.allocate(capacity: totalLen, headroom: 0)
-        guard let ptr = pkt.appendPointer(count: totalLen) else { return nil }
+        let dhcpLen = 240 + 4 + 34  // header + magic + options
 
-        // Zero out the buffer
-        ptr.initializeMemory(as: UInt8.self, repeating: 0, count: totalLen)
+        var pkt = round.allocate(capacity: dhcpLen, headroom: 0)
+        guard let ptr = pkt.appendPointer(count: dhcpLen) else { return nil }
+        ptr.initializeMemory(as: UInt8.self, repeating: 0, count: dhcpLen)
 
-        // Fixed header
+        // DHCP header
         ptr.storeBytes(of: UInt8(2), as: UInt8.self)                     // op = BOOTREPLY
         ptr.advanced(by: 1).storeBytes(of: UInt8(1), as: UInt8.self)   // htype = Ethernet
         ptr.advanced(by: 2).storeBytes(of: UInt8(6), as: UInt8.self)   // hlen
@@ -152,18 +153,11 @@ public struct DHCPServer {
 
         // Options
         var optOff = 244
-
-        // Option 53: DHCP Message Type
         writeOption(53, value: [messageType.rawValue], ptr: ptr, offset: &optOff)
-        // Option 1: Subnet Mask
         writeOption(1, value: subnetMaskBytes(pool.subnet.mask), ptr: ptr, offset: &optOff)
-        // Option 3: Router
         writeOption(3, value: pool.gateway, ptr: ptr, offset: &optOff)
-        // Option 6: DNS Server (use gateway as DNS proxy for now)
         writeOption(6, value: pool.gateway, ptr: ptr, offset: &optOff)
-        // Option 51: Lease Time
         writeOption(51, value: pool.leaseTime, ptr: ptr, offset: &optOff)
-        // Option 54: Server Identifier
         writeOption(54, value: pool.gateway, ptr: ptr, offset: &optOff)
         // Option 255: End
         ptr.advanced(by: optOff).storeBytes(of: UInt8(255), as: UInt8.self)

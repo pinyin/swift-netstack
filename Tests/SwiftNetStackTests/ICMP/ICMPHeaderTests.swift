@@ -4,7 +4,7 @@ import Testing
 @Suite(.serialized)
 struct ICMPHeaderTests {
 
-    let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+    let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
     let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
     let srcIP = IPv4Address(10, 0, 0, 1)
     let dstIP = IPv4Address(10, 0, 0, 2)
@@ -75,7 +75,7 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest()
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         #expect(reply != nil)
         guard let reply else { return }
 
@@ -101,7 +101,7 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest(id: 0xABCD, seq: 0x0042)
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply),
               let replyIP = IPv4Header.parse(from: replyEth.payload),
@@ -116,7 +116,7 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest(payload: payload)
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply),
               let replyIP = IPv4Header.parse(from: replyEth.payload),
@@ -132,19 +132,19 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest()
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply) else { return }
 
         #expect(replyEth.dstMAC == clientMAC)
-        #expect(replyEth.srcMAC == ourMAC)
+        #expect(replyEth.srcMAC == hostMAC)
     }
 
     @Test func buildEchoReplySwapsIPAddresses() {
         let (eth, ip, icmp) = makeEchoRequest()
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply),
               let replyIP = IPv4Header.parse(from: replyEth.payload) else { return }
@@ -157,7 +157,7 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest(payload: [1, 2, 3, 4, 5])
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply),
               let replyIP = IPv4Header.parse(from: replyEth.payload),
@@ -181,7 +181,7 @@ struct ICMPHeaderTests {
         let (eth, ip, icmp) = makeEchoRequest()
         let round = RoundContext()
 
-        let reply = buildICMPEchoReply(ourMAC: ourMAC, eth: eth, ip: ip, icmp: icmp, round: round)
+        let reply = buildICMPEchoReply(hostMAC: hostMAC, eth: eth, ip: ip, icmp: icmp, round: round)
         guard let reply else { return }
         guard let replyEth = EthernetFrame.parse(from: reply),
               let replyIP = IPv4Header.parse(from: replyEth.payload) else { return }
@@ -243,10 +243,10 @@ struct ICMPHeaderTests {
         let ipTotalLen = 20 + icmpBytes.count
         let ipBytes = makeIPv4Bytes(totalLength: ipTotalLen)
 
-        // Ethernet frame: dst=ourMAC, src=clientMAC, type=IPv4
+        // Ethernet frame: dst=hostMAC, src=clientMAC, type=IPv4
         var ethBytes: [UInt8] = []
         var macBuf = [UInt8](repeating: 0, count: 6)
-        ourMAC.write(to: &macBuf); ethBytes.append(contentsOf: macBuf)
+        hostMAC.write(to: &macBuf); ethBytes.append(contentsOf: macBuf)
         clientMAC.write(to: &macBuf); ethBytes.append(contentsOf: macBuf)
         ethBytes.append(0x08); ethBytes.append(0x00)  // EtherType IPv4
         ethBytes.append(contentsOf: ipBytes)

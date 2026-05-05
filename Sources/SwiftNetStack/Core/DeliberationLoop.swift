@@ -7,20 +7,20 @@
 /// touches TUN devices, and runs entirely within sandbox constraints.
 ///
 /// Usage:
-///   var loop = DeliberationLoop(endpoints: [vm1, vm2], ourMAC: myMAC)
+///   var loop = DeliberationLoop(endpoints: [vm1, vm2], hostMAC: myMAC)
 ///   var transport = PollingTransport(endpoints: [vm1, vm2])
 ///   while running {
 ///       loop.runOneRound(transport: &transport)
 ///   }
 public struct DeliberationLoop {
-    public let ourMAC: MACAddress
+    public let hostMAC: MACAddress
     public var arpMapping: ARPMapping
     public var dhcpServer: DHCPServer
     public let routingTable: RoutingTable
 
-    public init(endpoints: [VMEndpoint], ourMAC: MACAddress) {
-        self.ourMAC = ourMAC
-        self.arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: endpoints)
+    public init(endpoints: [VMEndpoint], hostMAC: MACAddress) {
+        self.hostMAC = hostMAC
+        self.arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: endpoints)
         self.dhcpServer = DHCPServer(endpoints: endpoints)
         self.routingTable = RoutingTable()
     }

@@ -51,7 +51,7 @@ public struct ICMPHeader {
 ///
 /// Returns nil if allocation fails.
 public func buildICMPEchoReply(
-    ourMAC: MACAddress,
+    hostMAC: MACAddress,
     eth: EthernetFrame,
     ip: IPv4Header,
     icmp: ICMPHeader,
@@ -67,7 +67,7 @@ public func buildICMPEchoReply(
 
     // Ethernet header (14 bytes)
     eth.srcMAC.write(to: ptr)                                 // dst = original sender
-    ourMAC.write(to: ptr.advanced(by: 6))                     // src = us
+    hostMAC.write(to: ptr.advanced(by: 6))                     // src = us
     writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
 
     // IPv4 header (20 bytes)

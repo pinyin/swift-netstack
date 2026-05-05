@@ -15,10 +15,10 @@ struct DHCPServerTests {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         let discover = DHCPPacket(op: 1, xid: 42, chaddr: clientMAC, messageType: .discover, requestedIP: nil, serverIdentifier: nil)
@@ -43,10 +43,10 @@ struct DHCPServerTests {
         // Use /30 subnet: network .0, gateway .1, broadcast .3 → only .2 available
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 30)
         let gateway = IPv4Address(100, 64, 1, 1)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         // First DISCOVER consumes the only available IP
@@ -65,10 +65,10 @@ struct DHCPServerTests {
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         let requestedIP = IPv4Address(100, 64, 1, 50)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         let request = DHCPPacket(op: 1, xid: 99, chaddr: clientMAC, messageType: .request,
@@ -93,10 +93,10 @@ struct DHCPServerTests {
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         let requestedIP = IPv4Address(100, 64, 1, 50)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         #expect(!arp.isKnown(requestedIP))
@@ -113,11 +113,11 @@ struct DHCPServerTests {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
         let wrongServer = IPv4Address(192, 168, 1, 1)  // not in subnet → not ours
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
@@ -130,10 +130,10 @@ struct DHCPServerTests {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
@@ -148,10 +148,10 @@ struct DHCPServerTests {
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         let requestedIP = IPv4Address(100, 64, 1, 2)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         // First, get a lease via REQUEST
@@ -179,10 +179,10 @@ struct DHCPServerTests {
     @Test func unknownEndpointIDReturnsNil() {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         let discover = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
@@ -192,10 +192,10 @@ struct DHCPServerTests {
     @Test func unknownMessageTypeReturnsNil() {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         // DECLINE has no handler
@@ -209,10 +209,10 @@ struct DHCPServerTests {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
         let gateway = IPv4Address(100, 64, 1, 1)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-        let ourMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
 
         var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
-        var arp = ARPMapping(ourMAC: ourMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
         let round = RoundContext()
 
         // Step 1: DISCOVER

@@ -38,7 +38,7 @@ public struct ClassifiedFrames {
 /// separation prevents I-cache thrashing that a single-pass loop would cause.
 public func classifyFrames(
     _ frames: [PacketBuffer],
-    ourMAC: MACAddress
+    hostMAC: MACAddress
 ) -> ClassifiedFrames {
     var result = ClassifiedFrames()
 
@@ -56,7 +56,7 @@ public func classifyFrames(
     var arpInput: [(pkt: PacketBuffer, eth: EthernetFrame)] = []
     var ipv4Input: [(pkt: PacketBuffer, eth: EthernetFrame)] = []
     for (pkt, eth) in ethParsed {
-        guard eth.dstMAC == ourMAC || eth.dstMAC == .broadcast else {
+        guard eth.dstMAC == hostMAC || eth.dstMAC == .broadcast else {
             result.unknown.append(pkt)
             continue
         }

@@ -16,12 +16,11 @@
 ///   Phase 3:  MAC filter + EtherType dispatch (branch logic only)
 ///   Phase 4:  Parse ALL IPv4 headers         (IPv4Header.parse, ~25 insns)
 ///   Phase 5:  Parse ALL ARP frames           (ARPFrame.parse, ~20 insns)
-///   Phase 6:  Parse ALL ICMP headers         (ICMPHeader.parse, ~10 insns)
-///   Phase 7:  Parse ALL DHCP packets         (UDP port check + DHCPPacket.parse)
-///   Phase 8:  Process ALL ICMP               (buildICMPEchoReply)
-///   Phase 9:  Process ALL DHCP               (DHCPServer.process + buildDHCPFrame)
-///   Phase 10: Process ALL ARP                (processARPRequest)
-///   Phase 11: Batch write + endRound         (syscall + reclaim)
+///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + extractDHCP)
+///   Phase 7:  Process ALL ICMP               (buildICMPEchoReply)
+///   Phase 8:  Process ALL DHCP               (DHCPServer.process + buildDHCPFrame)
+///   Phase 9:  Process ALL ARP                (processARPRequest)
+///   Phase 10: Batch write + endRound         (syscall + reclaim)
 ///
 /// Zero-copy throughout: every .parse returns a view (slice) over the original
 /// PacketBuffer. Intermediate arrays hold small value types (MAC, IP, headers)
@@ -85,27 +84,28 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 6: Parse ALL ICMP headers ──
-    // I-cache: ICMPHeader.parse only — no reply construction
+    // ── Phase 6: Parse ALL transport headers ──
+    // I-cache: ICMPHeader.parse + extractDHCP — no reply construction
     var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
-    for (ep, eth, ip) in ipv4Parsed {
-        guard ip.protocol == .icmp else { continue }
-        guard let icmp = ICMPHeader.parse(from: ip.payload) else { continue }
-        icmpParsed.append((ep, eth, ip, icmp))
-    }
-
-    // ── Phase 7: Parse ALL DHCP packets ──
-    // I-cache: extractDHCP only — no lease logic
     var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
     for (ep, eth, ip) in ipv4Parsed {
-        guard ip.protocol == .udp else { continue }
-        guard let dhcp = extractDHCP(from: ip.payload) else { continue }
-        dhcpParsed.append((ep, eth, ip, dhcp))
+        switch ip.protocol {
+        case .icmp:
+            if let icmp = ICMPHeader.parse(from: ip.payload) {
+                icmpParsed.append((ep, eth, ip, icmp))
+            }
+        case .udp:
+            if let dhcp = extractDHCP(from: ip.payload) {
+                dhcpParsed.append((ep, eth, ip, dhcp))
+            }
+        default:
+            break
+        }
     }
 
     var replies: [(endpointID: Int, packet: PacketBuffer)] = []
 
-    // ── Phase 8: Process ALL ICMP ──
+    // ── Phase 7: Process ALL ICMP ──
     // I-cache: buildICMPEchoReply — no parsing
     for (ep, eth, ip, icmp) in icmpParsed {
         guard icmp.type == 8, icmp.code == 0 else { continue }  // echo request only
@@ -116,7 +116,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 9: Process ALL DHCP ──
+    // ── Phase 8: Process ALL DHCP ──
     // I-cache: DHCPServer.process + buildDHCPFrame — no parsing
     for (ep, eth, ip, dhcp) in dhcpParsed {
         if let (rawReply, targetEp) = dhcpServer.process(
@@ -142,7 +142,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 10: Process ALL ARP ──
+    // ── Phase 9: Process ALL ARP ──
     // I-cache: ARPMapping.processARPRequest + ARP reply frame construction
     for (ep, _, arp) in arpParsed {
         if let reply = arpMapping.processARPRequest(arp, round: round) {
@@ -150,7 +150,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 11: Batch write + endRound ──
+    // ── Phase 10: Batch write + endRound ──
     let replyCount = replies.count
     if !replies.isEmpty {
         transport.writePackets(replies)

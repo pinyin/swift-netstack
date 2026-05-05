@@ -37,25 +37,25 @@ private func configureNetworkFD(_ fd: Int32) {
 
 /// Production transport using poll() + read() + sendmsg().
 ///
-/// Southbound: VZ VZFileHandleNetworkDeviceAttachment fds (AF_UNIX SOCK_DGRAM).
-/// Each fd delivers raw Ethernet frames as individual datagrams — one
-/// `read()` = one frame. Fds are configured O_NONBLOCK so the drain loop
-/// can batch-read all pending datagrams per poll() wakeup.
+/// Southbound only: VM endpoint fds from VZFileHandleNetworkDeviceAttachment
+/// (AF_UNIX SOCK_DGRAM). Each fd delivers raw Ethernet frames as individual
+/// datagrams — one `read()` = one frame. Fds are configured O_NONBLOCK so
+/// the drain loop can batch-read all pending datagrams per poll() wakeup.
 ///
-/// Northbound: TUN fd (deferred — simple NAT, same as gvproxy).
+/// No TUN fd — this library runs within sandbox constraints. Northbound
+/// routing (NAT) will use a userspace UDP socket, deferred to a later phase.
 ///
-/// Read phase: poll() blocks on all fds → read ready fds until EAGAIN →
+/// Read phase: poll() blocks on all VM fds → read ready fds until EAGAIN →
 /// collect frames tagged with endpointID.
 ///
 /// Write phase: group by endpointID → sendmsg(MSG_DONTWAIT) per datagram.
 /// EAGAIN → internal pending queue, retried on next poll writability.
 public struct PollingTransport: Transport {
     private var endpointsByFD: [Int32: VMEndpoint]
-    private let tunFD: Int32
     private var mtuByFD: [Int32: Int]
     private var pendingWrites: [(endpointID: Int, packet: PacketBuffer)] = []
 
-    public init(endpoints: [VMEndpoint], tunFD: Int32) {
+    public init(endpoints: [VMEndpoint]) {
         var byFD: [Int32: VMEndpoint] = [:]
         var mtu: [Int32: Int] = [:]
         for ep in endpoints {
@@ -63,10 +63,8 @@ public struct PollingTransport: Transport {
             mtu[ep.fd] = ep.mtu
             configureNetworkFD(ep.fd)
         }
-        configureNetworkFD(tunFD)
         self.endpointsByFD = byFD
         self.mtuByFD = mtu
-        self.tunFD = tunFD
     }
 
     // MARK: - Read
@@ -85,9 +83,6 @@ public struct PollingTransport: Transport {
             pollfds.append(pollfd(fd: fd, events: events, revents: 0))
         }
 
-        fds.append(tunFD)
-        pollfds.append(pollfd(fd: tunFD, events: Int16(POLLIN), revents: 0))
-
         // ── Block until data or pending write becomes ready ──
         let rc = Darwin.poll(&pollfds, UInt32(pollfds.count), -1)
         guard rc > 0 else { return [] }
@@ -97,10 +92,8 @@ public struct PollingTransport: Transport {
             let badMask = Int16(POLLNVAL | POLLERR | POLLHUP)
             guard pfd.revents & badMask != 0 else { continue }
             let fd = fds[i]
-            if fd != tunFD {
-                endpointsByFD.removeValue(forKey: fd)
-                mtuByFD.removeValue(forKey: fd)
-            }
+            endpointsByFD.removeValue(forKey: fd)
+            mtuByFD.removeValue(forKey: fd)
         }
 
         // ── Retry pending writes on writable fds ──
@@ -112,24 +105,15 @@ public struct PollingTransport: Transport {
 
         for (i, pfd) in pollfds.enumerated() where pfd.revents & Int16(POLLIN) != 0 {
             let fd = fds[i]
-            let epID: Int
-            let mtu: Int
-            if fd == tunFD {
-                epID = northboundEndpointID
-                mtu = 1500
-            } else {
-                guard let ep = endpointsByFD[fd] else { continue }
-                epID = ep.id
-                mtu = ep.mtu
-            }
+            guard let ep = endpointsByFD[fd] else { continue }
 
             while frames.count < kMaxPacketsPerRead {
-                var pkt = round.allocate(capacity: mtu, headroom: 0)
-                guard let ptr = pkt.appendPointer(count: mtu) else { break }
-                let n = Darwin.read(fd, ptr, mtu)
+                var pkt = round.allocate(capacity: ep.mtu, headroom: 0)
+                guard let ptr = pkt.appendPointer(count: ep.mtu) else { break }
+                let n = Darwin.read(fd, ptr, ep.mtu)
                 if n <= 0 { break }
-                if n < mtu { pkt.trimBack(mtu - n) }
-                frames.append((epID, pkt))
+                if n < ep.mtu { pkt.trimBack(ep.mtu - n) }
+                frames.append((ep.id, pkt))
             }
         }
 
@@ -139,31 +123,17 @@ public struct PollingTransport: Transport {
     // MARK: - Write
 
     public mutating func writePackets(_ packets: [(endpointID: Int, packet: PacketBuffer)]) {
-        // Group by endpointID for fd lookup
-        var byEndpoint: [Int: [PacketBuffer]] = [:]
         for (epID, pkt) in packets {
-            byEndpoint[epID, default: []].append(pkt)
-        }
-
-        for (epID, pkts) in byEndpoint {
-            let fd: Int32
-            if epID == northboundEndpointID {
-                fd = tunFD
-            } else {
-                guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
-                    continue
-                }
-                fd = entry.key
+            guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
+                continue
             }
+            let fd = entry.key
 
-            for pkt in pkts {
-                let written = pkt.sendmsg(to: fd, flags: Int32(MSG_DONTWAIT))
-                if written < 0, errno == EAGAIN {
-                    pendingWrites.append((epID, pkt))
-                    // Drop oldest if over budget
-                    if pendingWrites.count > kMaxPendingWrites {
-                        pendingWrites.removeFirst(pendingWrites.count - kMaxPendingWrites)
-                    }
+            let written = pkt.sendmsg(to: fd, flags: Int32(MSG_DONTWAIT))
+            if written < 0, errno == EAGAIN {
+                pendingWrites.append((epID, pkt))
+                if pendingWrites.count > kMaxPendingWrites {
+                    pendingWrites.removeFirst(pendingWrites.count - kMaxPendingWrites)
                 }
             }
         }
@@ -174,12 +144,6 @@ public struct PollingTransport: Transport {
     private mutating func retryPendingWrites(pollfds: [pollfd], fds: [Int32]) {
         guard !pendingWrites.isEmpty else { return }
 
-        var fdToEpID: [Int32: Int] = [:]
-        for (fd, ep) in endpointsByFD {
-            fdToEpID[fd] = ep.id
-        }
-        fdToEpID[tunFD] = northboundEndpointID
-
         var writableFDs = Set<Int32>()
         for (i, pfd) in pollfds.enumerated() where pfd.revents & Int16(POLLOUT) != 0 {
             writableFDs.insert(fds[i])
@@ -187,16 +151,10 @@ public struct PollingTransport: Transport {
 
         var remaining: [(endpointID: Int, packet: PacketBuffer)] = []
         for (epID, pkt) in pendingWrites {
-            let fd: Int32
-            if epID == northboundEndpointID {
-                fd = tunFD
-            } else {
-                guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
-                    continue
-                }
-                fd = entry.key
+            guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
+                continue
             }
-
+            let fd = entry.key
             guard writableFDs.contains(fd) else {
                 remaining.append((epID, pkt))
                 continue

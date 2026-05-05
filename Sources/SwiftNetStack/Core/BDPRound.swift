@@ -21,23 +21,25 @@
 ///   Phase 3: MAC filter + EtherType     (branch logic only)
 ///   Phase 4: Parse ALL IPv4 headers     (IPv4Header.parse, ~25 insns)
 ///   Phase 5: Parse ALL ARP frames       (ARPFrame.parse, ~20 insns)
-///   Phase 6: Process ALL DHCP           (DHCPServer.process)
-///   Phase 7: Process ALL ARP            (processARPRequest)
-///   Phase 8: Batch write + endRound     (syscall + reclaim)
+///   Phase 6: Process ALL ICMP           (ICMPHeader.parse + buildICMPEchoReply)
+///   Phase 7: Process ALL DHCP           (DHCPServer.process)
+///   Phase 8: Process ALL ARP            (processARPRequest)
+///   Phase 9: Batch write + endRound     (syscall + reclaim)
 ///
 /// Forwarding (NAT, L3 routing between VMs) is deferred to a later phase.
+@discardableResult
 public func bdpRound(
     transport: inout Transport,
     arpMapping: inout ARPMapping,
     dhcpServer: inout DHCPServer,
     routingTable: RoutingTable,
     round: RoundContext
-) {
+) -> Int {
     // ── Phase 1: Poll + batch read ──
     var taggedFrames = transport.readPackets(round: round)
     if taggedFrames.isEmpty {
         round.endRound()
-        return
+        return 0
     }
 
     // ── Phase 2: Parse ALL Ethernet headers ──
@@ -84,7 +86,21 @@ public func bdpRound(
 
     var replies: [(endpointID: Int, packet: PacketBuffer)] = []
 
-    // ── Phase 6: Process ALL DHCP ──
+    // ── Phase 6: Process ALL ICMP ──
+    // I-cache: ICMPHeader.parse + buildICMPEchoReply
+    for (ep, eth, ip) in ipv4Parsed {
+        guard ip.protocol == .icmp else { continue }
+        guard let icmp = ICMPHeader.parse(from: ip.payload) else { continue }
+        guard icmp.type == 8, icmp.code == 0 else { continue }  // echo request only
+
+        if let reply = buildICMPEchoReply(
+            ourMAC: arpMapping.ourMAC, eth: eth, ip: ip, icmp: icmp, round: round
+        ) {
+            replies.append((ep, reply))
+        }
+    }
+
+    // ── Phase 7: Process ALL DHCP ──
     // I-cache: extractDHCP + DHCPServer.process + buildDHCPReply
     for (ep, eth, ip) in ipv4Parsed {
         guard ip.protocol == .udp else { continue }
@@ -98,7 +114,7 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 7: Process ALL ARP ──
+    // ── Phase 8: Process ALL ARP ──
     // I-cache: ARPMapping.processARPRequest + ARP reply frame construction
     for (ep, _, arp) in arpParsed {
         if let reply = arpMapping.processARPRequest(arp, round: round) {
@@ -106,7 +122,8 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 8: Batch write + endRound ──
+    // ── Phase 9: Batch write + endRound ──
+    let replyCount = replies.count
     if !replies.isEmpty {
         transport.writePackets(replies)
     }
@@ -122,6 +139,7 @@ public func bdpRound(
     replies.removeAll()
 
     round.endRound()
+    return replyCount
 }
 
 /// Extract a DHCP packet from a UDP datagram payload.

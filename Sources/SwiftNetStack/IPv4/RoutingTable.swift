@@ -1,7 +1,7 @@
 /// Result of a routing table lookup.
 public enum RouteResult: Equatable {
     case direct(Int)     // Directly attached → VM endpoint ID
-    case `default`       // NAT outbound via TUN
+    case `default`       // NAT outbound (userspace, deferred)
 }
 
 /// Longest-prefix-match routing table.

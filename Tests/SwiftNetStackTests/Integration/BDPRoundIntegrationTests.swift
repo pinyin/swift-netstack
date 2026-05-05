@@ -238,6 +238,54 @@ struct BDPRoundIntegrationTests {
         #expect((transport as! InMemoryTransport).outputs.count == 2)
     }
 
+    // MARK: - ICMP Echo Reply
+
+    @Test func icmpEchoRequestGeneratesReply() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        let frame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x1234, seq: 0x0001)
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(ourMAC: ourMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+        #expect((transport as! InMemoryTransport).outputs[0].endpointID == 1)
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let eth = EthernetFrame.parse(from: reply) else {
+            Issue.record("reply is not valid Ethernet")
+            return
+        }
+        #expect(eth.dstMAC == clientMAC)
+        #expect(eth.srcMAC == ourMAC)
+        #expect(eth.etherType == .ipv4)
+
+        guard let ip = IPv4Header.parse(from: eth.payload) else {
+            Issue.record("reply does not contain valid IPv4")
+            return
+        }
+        #expect(ip.srcAddr == gateway)
+        #expect(ip.dstAddr == clientIP)
+        #expect(ip.protocol == .icmp)
+        #expect(ip.verifyChecksum())
+
+        guard let icmp = ICMPHeader.parse(from: ip.payload) else {
+            Issue.record("reply does not contain valid ICMP")
+            return
+        }
+        #expect(icmp.type == 0)
+        #expect(icmp.code == 0)
+        #expect(icmp.identifier == 0x1234)
+        #expect(icmp.sequenceNumber == 0x0001)
+    }
+
     // MARK: - Empty input
 
     @Test func emptyInputRoundReturnsFast() {
@@ -287,6 +335,43 @@ struct BDPRoundIntegrationTests {
         var buf = [UInt8](repeating: 0, count: 4)
         ip.write(to: &buf)
         return buf
+    }
+
+    /// Build a full Ethernet/IPv4/ICMP Echo Request frame.
+    private func makeICMPEchoFrame(clientMAC: MACAddress, clientIP: IPv4Address, dstIP: IPv4Address, id: UInt16, seq: UInt16, payload: [UInt8] = [0x70, 0x69, 0x6E, 0x67]) -> PacketBuffer {
+        let icmpLen = 8 + payload.count
+        let ipTotalLen = 20 + icmpLen
+
+        // ICMP header + payload
+        var icmpBytes: [UInt8] = []
+        icmpBytes.append(8); icmpBytes.append(0)  // type=8 (echo request), code=0
+        icmpBytes.append(0); icmpBytes.append(0)  // checksum placeholder
+        icmpBytes.append(UInt8(id >> 8)); icmpBytes.append(UInt8(id & 0xFF))
+        icmpBytes.append(UInt8(seq >> 8)); icmpBytes.append(UInt8(seq & 0xFF))
+        icmpBytes.append(contentsOf: payload)
+        let icmpCksum = icmpBytes.withUnsafeBytes { internetChecksum($0) }
+        icmpBytes[2] = UInt8(icmpCksum >> 8)
+        icmpBytes[3] = UInt8(icmpCksum & 0xFF)
+
+        // IPv4 header
+        var ipBytes = [UInt8](repeating: 0, count: 20)
+        ipBytes[0] = 0x45
+        ipBytes[2] = UInt8(ipTotalLen >> 8)
+        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
+        ipBytes[8] = 64
+        ipBytes[9] = IPProtocol.icmp.rawValue
+        clientIP.write(to: &ipBytes[12])
+        dstIP.write(to: &ipBytes[16])
+        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
+        ipBytes[10] = UInt8(ipCksum >> 8)
+        ipBytes[11] = UInt8(ipCksum & 0xFF)
+
+        return makeEthernetFrame(
+            dst: ourMAC,
+            src: clientMAC,
+            type: .ipv4,
+            payload: ipBytes + icmpBytes
+        )
     }
 
     /// Build a full Ethernet/IPv4/UDP/DHCP frame.

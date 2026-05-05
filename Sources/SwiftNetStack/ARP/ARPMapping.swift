@@ -102,7 +102,3 @@ public struct ARPMapping {
     }
 }
 
-@inline(__always)
-private func writeUInt16BE(_ value: UInt16, to ptr: UnsafeMutableRawPointer) {
-    ptr.storeBytes(of: value.bigEndian, as: UInt16.self)
-}

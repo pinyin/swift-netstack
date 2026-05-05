@@ -260,7 +260,3 @@ private struct DHCPPool {
 
 // MARK: - Helpers
 
-@inline(__always)
-private func writeUInt32BE(_ value: UInt32, to ptr: UnsafeMutableRawPointer) {
-    ptr.storeBytes(of: value.bigEndian, as: UInt32.self)
-}

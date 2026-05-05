@@ -51,18 +51,19 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 3: MAC filter + EtherType dispatch ──
-    // I-cache: integer comparison + switch
+    // ── Phase 3: MAC filter + EtherType dispatch + L2 forward ──
     var arpPkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
     var ipv4Pkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
+    var forwardPkts: [(endpointID: Int, packet: PacketBuffer)] = []
     for (ep, pkt, eth) in ethParsed {
-        guard eth.dstMAC == arpMapping.hostMAC || eth.dstMAC == .broadcast else {
-            continue
-        }
-        switch eth.etherType {
-        case .arp:  arpPkts.append((ep, pkt, eth))
-        case .ipv4: ipv4Pkts.append((ep, pkt, eth))
-        @unknown default: break
+        if eth.dstMAC == arpMapping.hostMAC || eth.dstMAC == .broadcast {
+            switch eth.etherType {
+            case .arp:  arpPkts.append((ep, pkt, eth))
+            case .ipv4: ipv4Pkts.append((ep, pkt, eth))
+            @unknown default: break
+            }
+        } else if let dstEp = arpMapping.lookupEndpoint(mac: eth.dstMAC), dstEp != ep {
+            forwardPkts.append((dstEp, pkt))
         }
     }
 
@@ -151,7 +152,11 @@ public func bdpRound(
     }
 
     // ── Phase 10: Batch write + endRound ──
+    let forwardCount = forwardPkts.count
     let replyCount = replies.count
+    if !forwardPkts.isEmpty {
+        transport.writePackets(forwardPkts)
+    }
     if !replies.isEmpty {
         transport.writePackets(replies)
     }
@@ -166,10 +171,11 @@ public func bdpRound(
     arpParsed.removeAll()
     icmpParsed.removeAll()
     dhcpParsed.removeAll()
+    forwardPkts.removeAll()
     replies.removeAll()
 
     round.endRound()
-    return replyCount
+    return forwardCount + replyCount
 }
 
 /// Extract a DHCP packet from a UDP datagram payload.

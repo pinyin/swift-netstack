@@ -286,6 +286,150 @@ struct BDPRoundIntegrationTests {
         #expect(icmp.sequenceNumber == 0x0001)
     }
 
+    // MARK: - L2 forwarding
+
+    @Test func unicastToKnownVMIsForwarded() {
+        let ep1 = VMEndpoint(id: 1, fd: 101, subnet: subnet, gateway: gateway)
+        let ep2 = VMEndpoint(id: 2, fd: 102, subnet: subnet, gateway: gateway)
+        let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
+        let mac2 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x02)
+        let ip1 = IPv4Address(100, 64, 1, 50)
+        let ip2 = IPv4Address(100, 64, 1, 51)
+
+        // Pre-populate ARP mapping: VM B's IP→MAC on endpoint 2
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1, ep2])
+        arpMapping.add(ip: ip2, mac: mac2, endpointID: 2)
+
+        // VM A sends ICMP echo to VM B's MAC (not hostMAC)
+        let frame = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: ip2, id: 1, seq: 1)
+        let l2Frame = makeEthernetFrame(
+            dst: mac2, src: mac1, type: .ipv4,
+            payload: extractEtherPayload(frame)
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: l2Frame)])
+        var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        let outputs = (transport as! InMemoryTransport).outputs
+        #expect(outputs.count == 1)
+        guard outputs.count == 1 else { return }
+        #expect(outputs[0].endpointID == 2, "frame should be forwarded to VM B's endpoint")
+
+        // The forwarded frame should be the original frame unchanged
+        guard let eth = EthernetFrame.parse(from: outputs[0].packet) else {
+            Issue.record("forwarded frame is not valid Ethernet")
+            return
+        }
+        #expect(eth.dstMAC == mac2)
+        #expect(eth.srcMAC == mac1)
+    }
+
+    @Test func unicastToUnknownMACIsDropped() {
+        let ep1 = makeEndpoint(id: 1)
+        let unknownMAC = MACAddress(0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00)
+        let clientMAC = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        let frame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 1, seq: 1)
+        let l2Frame = makeEthernetFrame(
+            dst: unknownMAC, src: clientMAC, type: .ipv4,
+            payload: extractEtherPayload(frame)
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: l2Frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1])
+        var dhcpServer = DHCPServer(endpoints: [ep1])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    @Test func arpForPeerVMGeneratesProxyReply() {
+        let ep1 = VMEndpoint(id: 1, fd: 101, subnet: subnet, gateway: gateway)
+        let ep2 = VMEndpoint(id: 2, fd: 102, subnet: subnet, gateway: gateway)
+        let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
+        let mac2 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x02)
+        let ip2 = IPv4Address(100, 64, 1, 51)
+
+        // Pre-populate: VM B's MAC is known
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1, ep2])
+        arpMapping.add(ip: ip2, mac: mac2, endpointID: 2)
+
+        // VM A ARPs for VM B's IP
+        let arpFrame = makeEthernetFrame(
+            dst: .broadcast, src: mac1, type: .arp,
+            payload: makeARPPayload(op: .request, senderMAC: mac1, senderIP: IPv4Address(100, 64, 1, 50), targetMAC: .zero, targetIP: ip2)
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
+        var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let eth = EthernetFrame.parse(from: reply),
+              let arp = ARPFrame.parse(from: eth.payload) else {
+            Issue.record("reply is not valid ARP")
+            return
+        }
+        #expect(arp.operation == .reply)
+        #expect(arp.senderMAC == hostMAC)
+        #expect(arp.senderIP == ip2)
+        #expect(arp.targetMAC == mac1)
+    }
+
+    @Test func mixedForwardAndLocalTraffic() {
+        let ep1 = VMEndpoint(id: 1, fd: 101, subnet: subnet, gateway: gateway)
+        let ep2 = VMEndpoint(id: 2, fd: 102, subnet: subnet, gateway: gateway)
+        let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
+        let mac2 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x02)
+        let ip1 = IPv4Address(100, 64, 1, 50)
+        let ip2 = IPv4Address(100, 64, 1, 51)
+
+        // Pre-populate ARP: VM B known
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1, ep2])
+        arpMapping.add(ip: ip2, mac: mac2, endpointID: 2)
+
+        // Frame 1: VM A → hostMAC (ICMP echo, local processing)
+        let localFrame = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: gateway, id: 1, seq: 1)
+
+        // Frame 2: VM A → VM B MAC (forwarded)
+        let forwardContent = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: ip2, id: 2, seq: 1)
+        let forwardFrame = makeEthernetFrame(
+            dst: mac2, src: mac1, type: .ipv4,
+            payload: extractEtherPayload(forwardContent)
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [
+            (endpointID: 1, packet: localFrame),
+            (endpointID: 1, packet: forwardFrame),
+        ])
+        var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
+        let round = RoundContext()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+
+        let outputs = (transport as! InMemoryTransport).outputs
+        #expect(outputs.count == 2)
+
+        var forwardedCount = 0, localCount = 0
+        for out in outputs {
+            if out.endpointID == 2 { forwardedCount += 1 }
+            if out.endpointID == 1 { localCount += 1 }
+        }
+        #expect(forwardedCount == 1, "one frame should be forwarded to ep2")
+        #expect(localCount == 1, "one frame should generate local reply on ep1")
+    }
+
     // MARK: - Empty input
 
     @Test func emptyInputRoundReturnsFast() {
@@ -326,6 +470,13 @@ struct BDPRoundIntegrationTests {
         let s = Storage.allocate(capacity: bytes.count)
         bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
         return PacketBuffer(storage: s, offset: 0, length: bytes.count)
+    }
+
+    /// Extract the payload after the 14-byte Ethernet header as raw bytes.
+    private func extractEtherPayload(_ pkt: PacketBuffer) -> [UInt8] {
+        guard pkt.totalLength > 14 else { return [] }
+        let payload = pkt.slice(from: 14, length: pkt.totalLength - 14)
+        return payload.withUnsafeReadableBytes { Array($0) }
     }
 
     private func makeARPPayload(op: ARPOperation, senderMAC: MACAddress, senderIP: IPv4Address, targetMAC: MACAddress, targetIP: IPv4Address) -> [UInt8] {

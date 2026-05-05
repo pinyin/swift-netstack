@@ -44,6 +44,14 @@ public struct ARPMapping {
         return nil
     }
 
+    /// Look up the endpoint ID for a MAC address. Returns nil if unknown.
+    public func lookupEndpoint(mac: MACAddress) -> Int? {
+        for entry in entries where entry.mac == mac {
+            return entry.endpointID
+        }
+        return nil
+    }
+
     /// Whether this IP is known (gateway or DHCP-leased container).
     public func isKnown(_ ip: IPv4Address) -> Bool {
         lookup(ip: ip) != nil

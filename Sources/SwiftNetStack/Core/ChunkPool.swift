@@ -19,11 +19,22 @@ public final class ChunkPool {
     }
 
     public func release(_ s: Storage) {
+        #if DEBUG
+        // Fill with sentinel to expose stale-data bugs (e.g. checksum over
+        // uninitialized fields). Any consumer that forgets to overwrite a
+        // field will see 0xCC instead of accidentally-correct zeroes.
+        s.data.initializeMemory(as: UInt8.self, repeating: 0xCC, count: s.capacity)
+        #endif
         freeList.append(s)
     }
 
     /// Amortized O(1): appends N chunks in a single array operation.
     public func batchRelease(_ chunks: [Storage]) {
+        #if DEBUG
+        for s in chunks {
+            s.data.initializeMemory(as: UInt8.self, repeating: 0xCC, count: s.capacity)
+        }
+        #endif
         freeList.append(contentsOf: chunks)
     }
 

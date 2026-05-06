@@ -85,7 +85,15 @@ public struct DHCPServer {
         }
 
         // If serverIdentifier is set and not ours, this REQUEST is not for us
-        if let sid = packet.serverIdentifier, !pool.subnet.contains(sid) {
+        if let sid = packet.serverIdentifier, sid != pool.gateway {
+            return nil
+        }
+
+        // Validate requested IP belongs to this pool's subnet
+        guard pool.subnet.contains(requestedIP) else { return nil }
+
+        // Reject if requested IP is already leased to a different MAC
+        if let existingMAC = pool.macForIP(requestedIP), existingMAC != srcMAC {
             return nil
         }
 
@@ -249,6 +257,11 @@ private struct DHCPPool {
             return IPv4Address(addr: addr)
         }
         return nil
+    }
+
+    /// Get the MAC that holds a lease for the given IP, if any.
+    func macForIP(_ ip: IPv4Address) -> MACAddress? {
+        return leases[ip.addr]
     }
 }
 

@@ -17,7 +17,7 @@ public struct IPv4Header {
         version: UInt8, ihl: UInt8, totalLength: UInt16, identification: UInt16,
         flags: UInt8, fragmentOffset: UInt16, ttl: UInt8, protocol: IPProtocol,
         checksum: UInt16, srcAddr: IPv4Address, dstAddr: IPv4Address,
-        payload: PacketBuffer
+        payload: PacketBuffer, checksumValid: Bool
     ) {
         self.version = version; self.ihl = ihl; self.totalLength = totalLength
         self.identification = identification; self.flags = flags
@@ -25,6 +25,7 @@ public struct IPv4Header {
         self.protocol = `protocol`; self.checksum = checksum
         self.srcAddr = srcAddr; self.dstAddr = dstAddr
         self.payload = payload
+        self._checksumValid = checksumValid
     }
 
     /// Parse an IPv4 header from a PacketBuffer. Returns nil on validation failure.
@@ -62,38 +63,27 @@ public struct IPv4Header {
 
             let payload = pkt.slice(from: headerLen, length: pkt.totalLength - headerLen)
 
+            // Compute checksum from raw bytes covering IHL*4 bytes (includes options)
+            let headerBuf = UnsafeRawBufferPointer(start: buf.baseAddress!, count: headerLen)
+            let checksumValid = internetChecksum(headerBuf) == 0
+
             return IPv4Header(
                 version: version, ihl: ihl, totalLength: totalLength,
                 identification: identification, flags: flags,
                 fragmentOffset: fragmentOffset, ttl: ttl, protocol: proto,
                 checksum: checksum, srcAddr: srcAddr, dstAddr: dstAddr,
-                payload: payload
+                payload: payload, checksumValid: checksumValid
             )
         }
     }
 
     /// RFC 791 internet checksum over the IP header (not payload).
     /// Returns true if the header checksum is valid.
+    /// Computed during parse from raw bytes covering IHL*4 bytes (including options).
     public func verifyChecksum() -> Bool {
-        var sum: UInt32 = 0
-
-        let verIHL = UInt16((version << 4) | ihl)
-        sum += UInt32(verIHL << 8)  // DSCP/ECN = 0 for checksum
-        sum += UInt32(totalLength)
-        sum += UInt32(identification)
-        sum += UInt32((UInt16(flags) << 13) | fragmentOffset)
-        sum += UInt32((UInt16(ttl) << 8) | UInt16(`protocol`.rawValue))
-        // checksum field is zero when computing
-        sum += UInt32(srcAddr.addr >> 16)
-        sum += UInt32(srcAddr.addr & 0xFFFF)
-        sum += UInt32(dstAddr.addr >> 16)
-        sum += UInt32(dstAddr.addr & 0xFFFF)
-
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16)
-        }
-        return UInt16(~sum & 0xFFFF) == checksum
+        return _checksumValid
     }
+    private let _checksumValid: Bool
 }
 
 // MARK: - Internet checksum utility

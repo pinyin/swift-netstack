@@ -136,29 +136,39 @@ public struct PacketBuffer {
     /// If shared, allocates a new Storage and copies the data.
     private mutating func makeFirstUnique() {
         guard !_views.isEmpty else { return }
-        var v = _views[0]
-        guard !isKnownUniquelyReferenced(&v.storage) else { return }
+        // Remove first to drop our array reference, so isKnownUniquelyReferenced
+        // checks the true external reference count rather than always seeing ≥2
+        // (the array + the local copy).
+        var v = _views.removeFirst()
+        guard !isKnownUniquelyReferenced(&v.storage) else {
+            _views.insert(v, at: 0)
+            return
+        }
         // COW: clone the first view's data
         let pool = ChunkPools.select(minCapacity: v.storage.capacity)
         let newStorage = pool.acquire()
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
-        _views[0] = View(storage: newStorage, offset: v.offset, length: v.length)
+        _views.insert(View(storage: newStorage, offset: v.offset, length: v.length), at: 0)
     }
 
     /// Ensure the last view's Storage is uniquely owned before modification.
     private mutating func makeLastUnique() {
         guard !_views.isEmpty else { return }
-        let idx = _views.count - 1
-        var v = _views[idx]
-        guard !isKnownUniquelyReferenced(&v.storage) else { return }
+        // Remove last to drop array reference before checking uniqueness.
+        var v = _views.removeLast()
+        guard !isKnownUniquelyReferenced(&v.storage) else {
+            _views.append(v)
+            return
+        }
+        // COW: clone the last view's data
         let pool = ChunkPools.select(minCapacity: v.storage.capacity)
         let newStorage = pool.acquire()
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
-        _views[idx] = View(storage: newStorage, offset: v.offset, length: v.length)
+        _views.append(View(storage: newStorage, offset: v.offset, length: v.length))
     }
 
     /// Reserve `count` bytes in headroom and return a write pointer.

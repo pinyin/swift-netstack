@@ -79,7 +79,8 @@ public func buildICMPEchoReply(
     writeUInt16BE(0x4000, to: ipPtr.advanced(by: 6))          // flags=DF, offset=0
     ipPtr.advanced(by: 8).storeBytes(of: UInt8(64), as: UInt8.self) // TTL
     ipPtr.advanced(by: 9).storeBytes(of: IPProtocol.icmp.rawValue, as: UInt8.self)
-    // checksum at offset 10-11 — computed below after we have all fields
+    // Zero checksum field before computing — chunk may contain stale bytes
+    writeUInt16BE(0, to: ipPtr.advanced(by: 10))
     ip.dstAddr.write(to: ipPtr.advanced(by: 12))              // src = original dst
     ip.srcAddr.write(to: ipPtr.advanced(by: 16))              // dst = original src
 
@@ -91,7 +92,8 @@ public func buildICMPEchoReply(
     let icmpPtr = ipPtr.advanced(by: 20)
     icmpPtr.storeBytes(of: UInt8(0), as: UInt8.self)          // type = echo reply
     icmpPtr.advanced(by: 1).storeBytes(of: UInt8(0), as: UInt8.self) // code = 0
-    // checksum at offset 2-3 — computed below (zero for now)
+    // Zero checksum field before computing — chunk may contain stale bytes
+    writeUInt16BE(0, to: icmpPtr.advanced(by: 2))
     writeUInt16BE(icmp.identifier, to: icmpPtr.advanced(by: 4))
     writeUInt16BE(icmp.sequenceNumber, to: icmpPtr.advanced(by: 6))
 

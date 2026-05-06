@@ -84,6 +84,7 @@ public struct ARPMapping {
     public func processARPRequest(
         _ arp: ARPFrame, round: RoundContext
     ) -> PacketBuffer? {
+        guard arp.operation == .request else { return nil }
         guard isKnown(arp.targetIP) else { return nil }
 
         var reply = round.allocate(capacity: 64, headroom: 0)

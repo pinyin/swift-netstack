@@ -126,6 +126,64 @@ struct UDPSocketTests {
         }
     }
 
+    // MARK: - AUDIT #6: UDPEchoSocket does not verify dstIP
+
+    /// Verifies fix for audit finding #6: `UDPEchoSocket` now checks `dstIP`
+    /// against a configured set of local IPs. When `localIPs` is non-empty,
+    /// datagrams addressed to non-local IPs are silently dropped, preventing
+    /// UDP reflection amplification attacks.
+    @Test func echoDropsDatagramsToNonLocalIP() {
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let srcIP = IPv4Address(1, 2, 3, 4)
+        let localIP = IPv4Address(10, 0, 0, 1)
+        let dstIP = IPv4Address(8, 8, 8, 8)  // clearly not a local IP
+
+        let payload = makeRawPacket([0x70, 0x69, 0x6E, 0x67])
+        var socket = UDPEchoSocket(localIPs: [localIP])
+        var replies: [(endpointID: Int, packet: PacketBuffer)] = []
+        let round = RoundContext()
+
+        socket.handleDatagram(
+            payload: payload,
+            srcIP: srcIP, dstIP: dstIP,
+            srcPort: 1234, dstPort: 7,
+            srcMAC: clientMAC,
+            endpointID: 1,
+            hostMAC: hostMAC,
+            replies: &replies,
+            round: round
+        )
+
+        #expect(replies.isEmpty,
+            "dstIP \(dstIP) is not in localIPs — should be dropped")
+    }
+
+    /// Verifies that echo still works when dstIP matches a local IP.
+    @Test func echoRepliesWhenDstIPIsLocal() {
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let localIP = IPv4Address(100, 64, 1, 1)
+
+        let payload = makeRawPacket([0x70, 0x69, 0x6E, 0x67])
+        var socket = UDPEchoSocket(localIPs: [localIP])
+        var replies: [(endpointID: Int, packet: PacketBuffer)] = []
+        let round = RoundContext()
+
+        socket.handleDatagram(
+            payload: payload,
+            srcIP: IPv4Address(100, 64, 1, 50), dstIP: localIP,
+            srcPort: 1234, dstPort: 7,
+            srcMAC: clientMAC,
+            endpointID: 1,
+            hostMAC: hostMAC,
+            replies: &replies,
+            round: round
+        )
+
+        #expect(replies.count == 1, "dstIP matches localIP — should echo")
+    }
+
     @Test func echoEmptyPayload() {
         let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)

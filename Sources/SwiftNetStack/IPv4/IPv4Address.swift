@@ -1,5 +1,5 @@
 /// 4-octet IPv4 address backed by UInt32 in network byte order.
-public struct IPv4Address: Equatable, CustomStringConvertible {
+public struct IPv4Address: Equatable, Hashable, CustomStringConvertible {
     public var addr: UInt32  // network byte order
 
     public init(addr: UInt32) {

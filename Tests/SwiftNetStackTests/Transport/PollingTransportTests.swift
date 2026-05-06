@@ -110,6 +110,64 @@ struct PollingTransportTests {
         #expect(packets.isEmpty)
     }
 
+    // MARK: - AUDIT #3: MSG_TRUNC detection (jumbo frame truncation)
+
+    /// Verifies fix for audit finding #3: `PollingTransport.readPackets` uses
+    /// `recvmsg()` which sets `MSG_TRUNC` in `msg_flags` when a SOCK_DGRAM
+    /// datagram exceeds the receive buffer. Truncated frames are silently dropped.
+    ///
+    /// Without the fix (using `read()`), the truncated 64-byte frame would be
+    /// passed up the stack as valid, causing downstream parse failures.
+    @Test func jumboFrameTruncationDetectedAndDropped() {
+        guard let (hostFD, guestFD) = makeSocketPair() else {
+            Issue.record("socketpair failed: \(errno)")
+            return
+        }
+        defer { close(hostFD); close(guestFD) }
+
+        // MTU=64 — smaller than the datagram we'll send
+        let ep = VMEndpoint(id: 1, fd: hostFD, subnet: IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24), gateway: IPv4Address(100, 64, 1, 1), mtu: 64)
+
+        // Send a 128-byte datagram (exceeds MTU)
+        let data: [UInt8] = Array(0..<128).map { UInt8($0) }
+        data.withUnsafeBytes { _ = Darwin.write(guestFD, $0.baseAddress!, data.count) }
+
+        var transport = PollingTransport(endpoints: [ep])
+        let round = RoundContext()
+        let packets = transport.readPackets(round: round)
+
+        // Truncated frames should be dropped — not passed up the stack.
+        #expect(packets.isEmpty,
+            "AUDIT #3 FIX: jumbo frame (128 bytes, MTU=64) should be dropped, got \(packets.count) packet(s)")
+    }
+
+    /// Complement to truncation test: a datagram that fits within MTU must
+    /// still be received correctly (no false-positive truncation detection).
+    @Test func normalFrameReceivedWhenWithinMTU() {
+        guard let (hostFD, guestFD) = makeSocketPair() else {
+            Issue.record("socketpair failed: \(errno)")
+            return
+        }
+        defer { close(hostFD); close(guestFD) }
+
+        let ep = VMEndpoint(id: 1, fd: hostFD, subnet: IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24), gateway: IPv4Address(100, 64, 1, 1), mtu: 1500)
+
+        let data: [UInt8] = Array(0..<64).map { UInt8($0) }
+        data.withUnsafeBytes { _ = Darwin.write(guestFD, $0.baseAddress!, data.count) }
+
+        var transport = PollingTransport(endpoints: [ep])
+        let round = RoundContext()
+        let packets = transport.readPackets(round: round)
+
+        #expect(packets.count == 1, "64-byte frame within 1500 MTU should be received")
+        guard packets.count == 1 else { return }
+        #expect(packets[0].packet.totalLength == 64)
+
+        packets[0].packet.withUnsafeReadableBytes { buf in
+            #expect(Array(buf) == data)
+        }
+    }
+
     // MARK: - readPackets budget
 
     @Test func packetBudgetIsRespected() {

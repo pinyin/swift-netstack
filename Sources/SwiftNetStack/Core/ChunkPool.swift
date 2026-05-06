@@ -32,6 +32,8 @@ public final class ChunkPool {
     public func batchRelease(_ chunks: [Storage]) {
         #if DEBUG
         for s in chunks {
+            precondition(!freeList.contains(where: { $0 === s }),
+                "ChunkPool.batchRelease: duplicate release detected (Storage \(ObjectIdentifier(s)))")
             s.data.initializeMemory(as: UInt8.self, repeating: 0xCC, count: s.capacity)
         }
         #endif
@@ -40,6 +42,12 @@ public final class ChunkPool {
 
     /// Number of chunks currently available in the pool (for debugging/stats).
     public var available: Int { freeList.count }
+
+    /// Discard all cached chunks. Chunks already acquired by callers are unaffected.
+    /// Useful for resetting pool state between test suites.
+    public func drain() {
+        freeList.removeAll()
+    }
 }
 
 // MARK: - 11-tier pool set
@@ -104,10 +112,20 @@ public enum ChunkPools {
     }
 
     /// Reverse lookup: given a chunk's actual capacity, return the exact pool it came from.
-    /// All chunk sizes are 64 << index (powers of two), so we use trailing-zero-bit count.
+    /// All standard chunk sizes are 64 << index (powers of two), so we use trailing-zero-bit count.
+    /// For capacities < 64 (non-standard, heap-allocated), returns pool64B.
     public static func poolFor(chunkCapacity: Int) -> ChunkPool {
+        guard chunkCapacity > 64 else { return pool64B }
         let shifted = chunkCapacity >> 6
         let index = shifted.trailingZeroBitCount
         return all[Swift.min(index, 10)]
+    }
+
+    /// Discard all cached chunks across all 11 pools.
+    /// Use in test setup to isolate tests from pool state left by previous suites.
+    public static func drainAll() {
+        for pool in all {
+            pool.drain()
+        }
     }
 }

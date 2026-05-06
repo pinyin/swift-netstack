@@ -11,12 +11,14 @@ struct FragmentKey: Hashable {
 /// In-progress reassembly for one datagram.
 private struct ReassemblyBuffer {
     /// Raw bytes of the first fragment's IP header (including options).
-    /// nil when the first fragment (offset=0) has not yet arrived.
     var firstHeader: [UInt8]?
-    /// Stored fragments: (byteOffset, data).
-    var fragments: [(offset: Int, data: [UInt8])] = []
-    /// Total payload length of the reassembled datagram (data after IP header).
-    /// Set when MF=0 fragment arrives.
+    /// Fragments received before totalPayloadLength is known (MF=0).
+    var pendingFragments: [(offset: Int, data: [UInt8])] = []
+    /// Output payload buffer. Allocated when totalPayloadLength is known.
+    var payload: [UInt8]?
+    /// Bitmap tracking which payload bytes have been filled.
+    var covered: [Bool]?
+    /// Total payload length of the reassembled datagram.
     var totalPayloadLength: Int?
     /// Deadline for expiration (seconds since epoch).
     let deadline: UInt64
@@ -63,60 +65,57 @@ public struct IPFragmentReassembler {
         guard !payloadBytes.isEmpty else { return nil }
 
         // Lookup or create buffer
-        var buffer: ReassemblyBuffer
-        if let existing = buffers[key] {
-            buffer = existing
-        } else {
+        if buffers[key] == nil {
             guard buffers.count < maxConcurrentReassemblies else { return nil }
-            // Capture IP header if this is the first fragment (offset=0);
-            // otherwise fill it in when offset=0 arrives later.
             let rawHeader: [UInt8]?
             if offset == 0 {
-                rawHeader = rawIPPacket.withUnsafeReadableBytes { buf in
-                    Array(buf[0..<headerLen])
-                }
+                rawHeader = rawIPPacket.withUnsafeReadableBytes { buf in Array(buf[0..<headerLen]) }
             } else {
                 rawHeader = nil
             }
-            buffer = ReassemblyBuffer(
+            buffers[key] = ReassemblyBuffer(
                 firstHeader: rawHeader,
                 deadline: UInt64(Darwin.time(nil)) + timeoutSeconds
             )
         }
 
+        // swiftlint:disable:next force_unwrapping
+        var buffer = buffers[key]!
+
         // If offset=0 arrived for an existing buffer (out-of-order), fill in the header
         if offset == 0 && buffer.firstHeader == nil {
-            buffer.firstHeader = rawIPPacket.withUnsafeReadableBytes { buf in
-                Array(buf[0..<headerLen])
+            buffer.firstHeader = rawIPPacket.withUnsafeReadableBytes { buf in Array(buf[0..<headerLen]) }
+        }
+
+        // If MF=0, set total payload length and allocate output buffer
+        if !mf {
+            let newTotal = offset + payloadBytes.count
+            if buffer.totalPayloadLength == nil {
+                buffer.totalPayloadLength = newTotal
+                buffer.payload = [UInt8](repeating: 0, count: newTotal)
+                buffer.covered = [Bool](repeating: false, count: newTotal)
+                // Apply all previously pending fragments to the output buffer
+                for (off, data) in buffer.pendingFragments {
+                    applyFragment(data: data, offset: off, to: &buffer)
+                }
+                buffer.pendingFragments.removeAll()
             }
         }
 
-        // Store this fragment's data — skip duplicates (same offset already stored)
-        let isDuplicate = buffer.fragments.contains(where: { $0.offset == offset })
-        if !isDuplicate {
-            buffer.fragments.append((offset: offset, data: payloadBytes))
-        }
-
-        // If MF=0, compute total payload length
-        if !mf {
-            buffer.totalPayloadLength = offset + payloadBytes.count
+        // Write fragment data: into output buffer if allocated, else pending
+        if buffer.payload != nil {
+            applyFragment(data: payloadBytes, offset: offset, to: &buffer)
+        } else {
+            buffer.pendingFragments.append((offset: offset, data: payloadBytes))
         }
 
         // Check if reassembly is complete
-        guard let firstHeader = buffer.firstHeader, let totalLen = buffer.totalPayloadLength else {
+        guard let firstHeader = buffer.firstHeader,
+              let totalLen = buffer.totalPayloadLength,
+              let covered = buffer.covered,
+              let payload = buffer.payload else {
             buffers[key] = buffer
             return nil
-        }
-
-        // Build coverage bitmap
-        var covered = [Bool](repeating: false, count: totalLen)
-        for (off, data) in buffer.fragments {
-            for i in 0..<data.count {
-                let pos = off + i
-                if pos < totalLen {
-                    covered[pos] = true
-                }
-            }
         }
 
         guard covered.allSatisfy({ $0 }) else {
@@ -127,16 +126,13 @@ public struct IPFragmentReassembler {
         // Reassembly complete
         buffers.removeValue(forKey: key)
 
-        // Assemble: corrected IP header + sorted payload
+        // Assemble: corrected IP header + payload
         let newTotalLength = UInt16(headerLen + totalLen)
         var correctedHeader = firstHeader
-        // totalLength at offset 2-3
         correctedHeader[2] = UInt8(newTotalLength >> 8)
         correctedHeader[3] = UInt8(newTotalLength & 0xFF)
-        // flags+fragmentOffset at offset 6-7 → clear MF and fragmentOffset
         correctedHeader[6] = 0
         correctedHeader[7] = 0
-        // Recompute checksum
         correctedHeader[10] = 0
         correctedHeader[11] = 0
         let cksum = correctedHeader.withUnsafeBytes { internetChecksum($0) }
@@ -144,14 +140,22 @@ public struct IPFragmentReassembler {
         correctedHeader[11] = UInt8(cksum & 0xFF)
 
         var fullData = correctedHeader
-        let sorted = buffer.fragments.sorted { $0.offset < $1.offset }
-        for (_, data) in sorted {
-            fullData.append(contentsOf: data)
-        }
-
+        fullData.append(contentsOf: payload)
         let s = ChunkPools.select(minCapacity: fullData.count).acquire()
         fullData.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: fullData.count) }
         return PacketBuffer(storage: s, offset: 0, length: fullData.count)
+    }
+
+    /// Write fragment data into the output buffer, overwriting any overlapping region.
+    /// RFC 791: last-received fragment wins for overlapping bytes.
+    private func applyFragment(data: [UInt8], offset: Int, to buffer: inout ReassemblyBuffer) {
+        guard let totalLen = buffer.totalPayloadLength else { return }
+        for i in 0..<data.count {
+            let pos = offset + i
+            guard pos < totalLen else { break }
+            buffer.payload?[pos] = data[i]
+            buffer.covered?[pos] = true
+        }
     }
 
     /// Remove expired reassembly buffers.

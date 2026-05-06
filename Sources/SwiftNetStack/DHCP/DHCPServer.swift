@@ -106,6 +106,11 @@ public struct DHCPServer {
             return nil
         }
 
+        // Reject if requested IP is pending-offer to a different MAC (audit #1)
+        if let pendingMAC = pool.pendingOfferMAC(for: requestedIP), pendingMAC != srcMAC {
+            return nil
+        }
+
         // Confirm the lease
         pool.confirm(requestedIP, mac: srcMAC)
         pool.removePendingOffer(requestedIP)
@@ -128,13 +133,19 @@ public struct DHCPServer {
         endpointID: Int, pool: inout DHCPPool,
         arpMapping: inout ARPMapping
     ) {
-        // The released IP is in ciaddr for RELEASE
-        // In our simplified impl, we trust the chaddr and release its lease
-        if let ip = pool.ipForMAC(srcMAC) {
-            pool.release(ip)
-            pool.removePendingOffer(ip)
-            arpMapping.remove(ip: ip)
+        // RFC 2131: RELEASE uses ciaddr to identify the IP being released.
+        let ip: IPv4Address
+        if packet.ciaddr != .zero {
+            ip = packet.ciaddr
+        } else if let macIP = pool.ipForMAC(srcMAC) {
+            // Fallback for clients that don't set ciaddr
+            ip = macIP
+        } else {
+            return
         }
+        pool.release(ip)
+        pool.removePendingOffer(ip)
+        arpMapping.remove(ip: ip)
     }
 
     // MARK: - Packet construction
@@ -328,6 +339,14 @@ private struct DHCPPool {
     /// Get the MAC that holds a lease for the given IP, if any.
     func macForIP(_ ip: IPv4Address) -> MACAddress? {
         return leases[ip.addr]
+    }
+
+    /// Get the MAC for which the given IP has a pending (unconfirmed) offer, if any.
+    func pendingOfferMAC(for ip: IPv4Address) -> MACAddress? {
+        for offer in pendingOffers where offer.addr == ip.addr {
+            return offer.mac
+        }
+        return nil
     }
 
     // MARK: - DEBUG integrity check

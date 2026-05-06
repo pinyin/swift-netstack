@@ -2,8 +2,17 @@
 ///
 /// RFC 862 compliant — simplest valid UDP socket, useful for testing
 /// the UDP datapath end-to-end.
+///
+/// `localIPs`: set of IP addresses this host owns. When non-empty, the echo
+/// only replies to datagrams addressed to one of these IPs, preventing
+/// UDP reflection amplification attacks. When empty (test convenience),
+/// no dstIP filtering is performed.
 public struct UDPEchoSocket: UDPSocket {
-    public init() {}
+    public let localIPs: Set<IPv4Address>
+
+    public init(localIPs: Set<IPv4Address> = []) {
+        self.localIPs = localIPs
+    }
 
     public func handleDatagram(
         payload: PacketBuffer,
@@ -17,6 +26,9 @@ public struct UDPEchoSocket: UDPSocket {
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
+        // Reject datagrams not addressed to a local IP
+        if !localIPs.isEmpty && !localIPs.contains(dstIP) { return }
+
         guard let reply = buildUDPFrame(
             hostMAC: hostMAC,
             dstMAC: srcMAC,

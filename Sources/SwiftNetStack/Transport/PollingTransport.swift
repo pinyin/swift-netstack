@@ -116,8 +116,19 @@ public struct PollingTransport: Transport {
             while frames.count < kMaxPacketsPerRead {
                 var pkt = round.allocate(capacity: ep.mtu, headroom: 0)
                 guard let ptr = pkt.appendPointer(count: ep.mtu) else { break }
-                let n = Darwin.read(fd, ptr, ep.mtu)
+
+                // Use recvmsg to detect truncated datagrams (audit #3).
+                // read() silently discards data beyond buffer size for SOCK_DGRAM.
+                // MSG_TRUNC in msg_flags is set by the kernel when the datagram
+                // exceeds the buffer — no input flag needed on macOS.
+                var iov = iovec(iov_base: ptr, iov_len: ep.mtu)
+                var msg = msghdr(msg_name: nil, msg_namelen: 0, msg_iov: &iov, msg_iovlen: 1, msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                let n = Darwin.recvmsg(fd, &msg, 0)
                 if n <= 0 { break }
+                if msg.msg_flags & Int32(MSG_TRUNC) != 0 {
+                    // Datagram exceeded buffer — silently drop the truncated frame.
+                    continue
+                }
                 if n < ep.mtu { pkt.trimBack(ep.mtu - n) }
                 frames.append((ep.id, pkt))
             }

@@ -164,4 +164,28 @@ struct DHCPPacketTests {
         let pkt = PacketBuffer(storage: s, offset: 0, length: 247)
         #expect(DHCPPacket.parse(from: pkt) == nil)
     }
+
+    // MARK: - AUDIT #2: ciaddr not parsed
+
+    /// Verifies fix for audit finding #2: `DHCPPacket` now parses the `ciaddr`
+    /// field (BOOTP header offset 12-15). RFC 2131 requires RELEASE to use
+    /// ciaddr to identify the IP being released.
+    @Test func ciaddrParsedFromReleasePacket() {
+        let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let expectedCIAddr = IPv4Address(100, 64, 1, 20)
+
+        var bytes = makeDHCPBytes(op: 1, xid: 99, chaddr: chaddr, msgType: .release)
+        expectedCIAddr.write(to: &bytes[12])
+
+        let s = Storage.allocate(capacity: bytes.count)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: bytes.count)
+
+        guard let dhcp = DHCPPacket.parse(from: pkt) else {
+            Issue.record("failed to parse valid RELEASE packet")
+            return
+        }
+        #expect(dhcp.ciaddr == expectedCIAddr,
+            "ciaddr should be parsed from BOOTP header bytes 12-15")
+    }
 }

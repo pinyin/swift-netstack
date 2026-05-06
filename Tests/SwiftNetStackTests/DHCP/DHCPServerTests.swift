@@ -174,6 +174,60 @@ struct DHCPServerTests {
         #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), endpointID: 1, arpMapping: &arp, round: round) != nil)
     }
 
+    // MARK: - AUDIT #2: RELEASE uses MAC lookup instead of ciaddr
+
+    /// Reproduces audit finding #2: `handleRelease` uses `pool.ipForMAC(srcMAC)`
+    /// to find the IP to release, instead of reading `ciaddr` from the DHCP packet
+    /// (offset 12-15) as required by RFC 2131.
+    ///
+    /// When a single MAC holds multiple IPs (legal in DHCP), the wrong IP may be
+    /// released. `ipForMAC` returns the first match from the leases dictionary,
+    /// whose iteration order is non-deterministic.
+    ///
+    /// Additionally, `DHCPPacket` does not even parse the `ciaddr` field,
+    /// so the RELEASE handler has no way to know which IP the client intends to free.
+    @Test func releaseWithMultipleIPsReleasesWrongIP() {
+        // /24 subnet: plenty of available IPs
+        let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
+        let gateway = IPv4Address(100, 64, 1, 1)
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let ip1 = IPv4Address(100, 64, 1, 10)
+        let ip2 = IPv4Address(100, 64, 1, 20)
+
+        var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        let round = RoundContext()
+
+        // MAC_A leases two IPs (same MAC, different IPs — legal per RFC 2131)
+        let req1 = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
+                               requestedIP: ip1, serverIdentifier: gateway)
+        let r1 = dhcp.process(packet: req1, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        #expect(r1 != nil, "first REQUEST should get ACK")
+
+        let req2 = DHCPPacket(op: 1, xid: 2, chaddr: clientMAC, messageType: .request,
+                               requestedIP: ip2, serverIdentifier: gateway)
+        let r2 = dhcp.process(packet: req2, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        #expect(r2 != nil, "second REQUEST should get ACK (same MAC, different IP)")
+
+        #expect(arp.isKnown(ip1) && arp.isKnown(ip2), "both IPs should be leased before RELEASE")
+
+        // Send RELEASE. handleRelease ignores ciaddr (offset 12-15 in BOOTP header)
+        // and uses ipForMAC(srcMAC) which returns an arbitrary first match from leases dict.
+        _ = dhcp.process(packet: DHCPPacket(op: 1, xid: 3, chaddr: clientMAC, messageType: .release,
+                                             requestedIP: nil, serverIdentifier: nil),
+                         srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+
+        // AUDIT #2: Only ONE IP is released — handleRelease calls ipForMAC once.
+        // The RELEASE packet has no ciaddr field in DHCPPacket, so there's no way
+        // to specify WHICH IP to release. A correct implementation would read ciaddr
+        // from the raw BOOTP header (bytes 12-15) and release that specific IP.
+        let remaining = [ip1, ip2].filter { arp.isKnown($0) }
+        let released = 2 - remaining.count
+        #expect(remaining.count == 1,
+            "AUDIT #2 FAIL: expected exactly 1 IP released, got \(released) released, \(remaining.count) remaining — handleRelease picks arbitrary IP via ipForMAC")
+    }
+
     // MARK: - Edge cases
 
     @Test func unknownEndpointIDReturnsNil() {
@@ -266,6 +320,45 @@ struct DHCPServerTests {
     }
 
     // MARK: - Full flow: DISCOVER → REQUEST
+
+    // MARK: - AUDIT #1: DHCP address stealing via pendingOffer bypass
+
+    /// Reproduces audit finding #1: `handleRequest` checks `pool.macForIP(requestedIP)`
+    /// (which looks at confirmed leases) but NOT `pendingOffers`. A second MAC can
+    /// REQUEST an IP that was offered to a different MAC and steal it.
+    ///
+    /// Expected: MAC_B's REQUEST for an IP offered to MAC_A should be rejected (nil or NAK).
+    /// Actual:   MAC_B gets an ACK and the IP is stolen.
+    @Test func requestForPendingOfferFromDifferentMACStealsIP() {
+        // /30 subnet: only .2 available. offerTimeout: 60 so offer doesn't expire.
+        let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 30)
+        let gateway = IPv4Address(100, 64, 1, 1)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let macA = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01)
+        let macB = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02)
+        let targetIP = IPv4Address(100, 64, 1, 2)
+
+        var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)], offerTimeout: 60)
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        let round = RoundContext()
+
+        // Step 1: MAC_A DISCOVER → OFFER. IP X goes to pendingOffers[macA].
+        let discover = DHCPPacket(op: 1, xid: 1, chaddr: macA,
+                                  messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let offerResult = dhcp.process(packet: discover, srcMAC: macA, endpointID: 1,
+                                        arpMapping: &arp, round: round)
+        #expect(offerResult != nil, "DISCOVER from MAC_A should get OFFER")
+
+        // Step 2: MAC_B REQUEST for same IP — should be REJECTED (IP is offered to MAC_A).
+        // BUG: macForIP only checks leases[], not pendingOffers[] → check passes → ACK.
+        let request = DHCPPacket(op: 1, xid: 2, chaddr: macB, messageType: .request,
+                                  requestedIP: targetIP, serverIdentifier: gateway)
+        let ackResult = dhcp.process(packet: request, srcMAC: macB, endpointID: 1,
+                                      arpMapping: &arp, round: round)
+
+        #expect(ackResult == nil,
+            "AUDIT #1 FAIL: MAC_B stole IP \(targetIP) that was offered to MAC_A — pendingOffer MAC not verified")
+    }
 
     @Test func fullDiscoverThenRequestFlow() {
         let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)

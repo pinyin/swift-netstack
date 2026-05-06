@@ -310,6 +310,100 @@ struct IPFragmentReassemblyTests {
             "AUDIT #4 FAIL: capacity \(storageCapacity) not a pool size — heap-allocated instead of pool-allocated")
     }
 
+    // MARK: - AUDIT #5: overlapping fragments
+
+    /// Reproduces audit finding #5: the reassembler does not handle overlapping
+    /// fragments per RFC 791. When two fragments cover the same byte range,
+    /// RFC 791 §3.2 requires "last received" data to win. The current code
+    /// stores fragments by offset and just concatenates sorted data — the
+    /// first fragment's data appears first in the output, and overlapping
+    /// regions from a later fragment are shifted past the totalLength boundary.
+    ///
+    /// Scenario:
+    ///   Fragment A: offset=0, data=[0xAA × 16], MF=1  → covers bytes 0-15
+    ///   Fragment B: offset=1, data=[0xBB × 8],  MF=0  → covers bytes 8-15 (overlap)
+    /// Expected (RFC 791): bytes 0-7 = 0xAA, bytes 8-15 = 0xBB (last received wins)
+    /// Actual (current):   bytes 0-7 = 0xAA, bytes 8-15 = 0xAA (first fragment wins)
+    @Test func overlappingFragmentsUseFirstReceivedInsteadOfLastReceived() {
+        let dataA = [UInt8](repeating: 0xAA, count: 16)
+        let dataB = [UInt8](repeating: 0xBB, count: 8)
+
+        let fragA = makeRawIPFragment(identification: 0x77, flags: 1, fragmentOffset: 0, payload: dataA)
+        let fragB = makeRawIPFragment(identification: 0x77, flags: 0, fragmentOffset: 1, payload: dataB)
+
+        guard let ipA = IPv4Header.parse(from: fragA),
+              let ipB = IPv4Header.parse(from: fragB) else {
+            Issue.record("failed to parse fragment headers")
+            return
+        }
+
+        var reasm = IPFragmentReassembler()
+        _ = reasm.process(fragment: ipA, rawIPPacket: fragA)
+        guard let result = reasm.process(fragment: ipB, rawIPPacket: fragB) else {
+            Issue.record("reassembly should have completed")
+            return
+        }
+
+        guard let fullIP = IPv4Header.parse(from: result) else {
+            Issue.record("failed to parse reassembled datagram")
+            return
+        }
+
+        #expect(fullIP.payload.totalLength == 16)
+
+        fullIP.payload.withUnsafeReadableBytes { buf in
+            let bytes = Array(buf)
+            #expect(bytes.count == 16, "payload should be 16 bytes, got \(bytes.count)")
+            // Bytes 0-7: no overlap, must be 0xAA
+            #expect(bytes[0..<8].allSatisfy { $0 == 0xAA })
+            // Bytes 8-15: overlap region — RFC 791 says last received (fragB=0xBB) wins
+            #expect(bytes[8..<16].allSatisfy { $0 == 0xBB },
+                "AUDIT #5 FAIL: overlapping bytes use first fragment (0xAA) instead of last received (0xBB)")
+        }
+    }
+
+    /// Second overlapping variant: fragment B arrives first, fragment A second.
+    /// In this case, RFC 791 dictates fragment A's data should win (last received).
+    /// But current code still uses fragment A for bytes 0-7 and fragment B for
+    /// bytes 8-15 — first-offset fragment's data wins for its own range regardless.
+    @Test func overlappingFragmentsReversedOrderStillBroken() {
+        let dataA = [UInt8](repeating: 0xAA, count: 16)
+        let dataB = [UInt8](repeating: 0xBB, count: 8)
+
+        let fragA = makeRawIPFragment(identification: 0x88, flags: 1, fragmentOffset: 0, payload: dataA)
+        let fragB = makeRawIPFragment(identification: 0x88, flags: 0, fragmentOffset: 1, payload: dataB)
+
+        guard let ipA = IPv4Header.parse(from: fragA),
+              let ipB = IPv4Header.parse(from: fragB) else {
+            Issue.record("failed to parse fragment headers")
+            return
+        }
+
+        var reasm = IPFragmentReassembler()
+        // B arrives first
+        _ = reasm.process(fragment: ipB, rawIPPacket: fragB)
+        // A arrives second — should win for overlap per RFC 791
+        guard let result = reasm.process(fragment: ipA, rawIPPacket: fragA) else {
+            Issue.record("reassembly should complete")
+            return
+        }
+
+        guard let fullIP = IPv4Header.parse(from: result) else {
+            Issue.record("failed to parse reassembled datagram")
+            return
+        }
+
+        fullIP.payload.withUnsafeReadableBytes { buf in
+            let bytes = Array(buf)
+            #expect(bytes.count == 16)
+            #expect(bytes[0..<8].allSatisfy { $0 == 0xAA })
+            // RFC 791: A arrived last, so A's 0xAA should win for bytes 8-15
+            // But current code concatenates sorted offsets: B's data (offset 8) appears after A's (offset 0)
+            #expect(bytes[8..<16].allSatisfy { $0 == 0xAA },
+                "AUDIT #5 FAIL: last-received (fragA=0xAA) should win overlap, but output uses first-by-offset (fragB=0xBB)")
+        }
+    }
+
     // MARK: - First fragment offset != 0 is dropped
 
     @Test func firstFragmentWithNonZeroOffsetIsDropped() {

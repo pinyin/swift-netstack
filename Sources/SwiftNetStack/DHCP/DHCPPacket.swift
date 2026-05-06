@@ -16,10 +16,19 @@ public enum DHCPMessageType: UInt8 {
 public struct DHCPPacket {
     public let op: UInt8              // 1=BOOTREQUEST, 2=BOOTREPLY
     public let xid: UInt32            // transaction ID
+    public let ciaddr: IPv4Address    // client IP address (RELEASE uses this, RFC 2131)
     public let chaddr: MACAddress     // client hardware address
     public let messageType: DHCPMessageType
     public let requestedIP: IPv4Address?      // option 50
     public let serverIdentifier: IPv4Address? // option 54
+
+    public init(op: UInt8, xid: UInt32, chaddr: MACAddress, messageType: DHCPMessageType,
+                ciaddr: IPv4Address = .zero, requestedIP: IPv4Address? = nil,
+                serverIdentifier: IPv4Address? = nil) {
+        self.op = op; self.xid = xid; self.ciaddr = ciaddr
+        self.chaddr = chaddr; self.messageType = messageType
+        self.requestedIP = requestedIP; self.serverIdentifier = serverIdentifier
+    }
 
     /// Parse from a UDP payload (PacketBuffer). Returns nil if too short or invalid.
     public static func parse(from pkt: PacketBuffer) -> DHCPPacket? {
@@ -35,6 +44,7 @@ public struct DHCPPacket {
             let op = buf[0]
             let xid = (UInt32(buf[4]) << 24) | (UInt32(buf[5]) << 16)
                      | (UInt32(buf[6]) << 8)  |  UInt32(buf[7])
+            let ciaddr = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[12..<16]))
             let chaddr = MACAddress(UnsafeRawBufferPointer(rebasing: buf[28..<34]))
 
             // Options start at offset 240. Must begin with magic cookie.
@@ -71,8 +81,10 @@ public struct DHCPPacket {
             guard let msgType = msgType else { return nil }
 
             return DHCPPacket(
-                op: op, xid: xid, chaddr: chaddr,
+                op: op, xid: xid,
+                chaddr: chaddr,
                 messageType: msgType,
+                ciaddr: ciaddr,
                 requestedIP: reqIP, serverIdentifier: serverID
             )
         }

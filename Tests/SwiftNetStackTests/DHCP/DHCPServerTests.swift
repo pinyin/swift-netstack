@@ -170,8 +170,8 @@ struct DHCPServerTests {
         #expect(!arp.isKnown(requestedIP))
 
         // Should be able to DISCOVER again (IP was reclaimed)
-        let discover = DHCPPacket(op: 1, xid: 3, chaddr: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), endpointID: 1, arpMapping: &arp, round: round) != nil)
+        let discover = DHCPPacket(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), endpointID: 1, arpMapping: &arp, round: round) != nil)
     }
 
     // MARK: - Edge cases

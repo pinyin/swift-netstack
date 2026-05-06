@@ -95,7 +95,7 @@ struct ARPMappingTests {
         var mapping = ARPMapping(hostMAC: MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55), endpoints: [ep])
 
         let ip = IPv4Address(10, 0, 0, 50)
-        mapping.add(ip: ip, mac: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66), endpointID: 1)
+        mapping.add(ip: ip, mac: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), endpointID: 1)
         #expect(mapping.isKnown(ip))
 
         mapping.remove(ip: ip)

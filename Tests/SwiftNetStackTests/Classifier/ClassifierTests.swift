@@ -33,14 +33,14 @@ struct ClassifierTests {
 
     @Test func nonMatchingMACGoesToUnknown() {
         let otherMAC = MACAddress(0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA)
-        let frame = makeEthernetFrame(dst: otherMAC, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66), type: .ipv4)
+        let frame = makeEthernetFrame(dst: otherMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), type: .ipv4)
 
         let result = classifyFrames([frame], hostMAC: hostMAC)
         #expect(result.unknown.count == 1)
     }
 
     @Test func broadcastMACIsAccepted() {
-        let frame = makeEthernetFrame(dst: .broadcast, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66), type: .arp, payload: validARPPayload())
+        let frame = makeEthernetFrame(dst: .broadcast, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), type: .arp, payload: validARPPayload())
 
         let result = classifyFrames([frame], hostMAC: hostMAC)
         #expect(result.arp.count == 1)
@@ -129,13 +129,13 @@ struct ClassifierTests {
     // MARK: - Mixed traffic
 
     @Test func mixedTrafficClassifiedCorrectly() {
-        let arpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x01), type: .arp, payload: validARPPayload())
-        let icmpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x02), type: .ipv4, payload: makeIPv4Payload(proto: .icmp))
-        let tcpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x03), type: .ipv4, payload: makeIPv4Payload(proto: .tcp))
-        let udpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x04), type: .ipv4, payload: makeIPv4Payload(proto: .udp))
+        let arpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x01), type: .arp, payload: validARPPayload())
+        let icmpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x02), type: .ipv4, payload: makeIPv4Payload(proto: .icmp))
+        let tcpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x03), type: .ipv4, payload: makeIPv4Payload(proto: .tcp))
+        let udpFrame = makeEthernetFrame(dst: hostMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x04), type: .ipv4, payload: makeIPv4Payload(proto: .udp))
 
         // A frame for a different MAC
-        let otherFrame = makeEthernetFrame(dst: MACAddress(0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA), src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x05), type: .ipv4, payload: makeIPv4Payload(proto: .tcp))
+        let otherFrame = makeEthernetFrame(dst: MACAddress(0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA), src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x05), type: .ipv4, payload: makeIPv4Payload(proto: .tcp))
 
         let result = classifyFrames([arpFrame, icmpFrame, tcpFrame, udpFrame, otherFrame], hostMAC: hostMAC)
 

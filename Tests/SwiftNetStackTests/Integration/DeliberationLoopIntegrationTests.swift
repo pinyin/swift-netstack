@@ -136,7 +136,7 @@ struct DeliberationLoopIntegrationTests {
         var inputs: [(endpointID: Int, packet: PacketBuffer)] = []
 
         for i in 0..<totalARP {
-            let mac = MACAddress(0xA1, 0x00, 0x00, 0x00, 0x00, UInt8(i))
+            let mac = MACAddress(0xA0, 0x00, 0x00, 0x00, 0x00, UInt8(i))
             let ip = IPv4Address(100, 64, 1, UInt8(10 + i))
             let frame = makeEthernetFrame(
                 dst: .broadcast, src: mac, type: .arp,
@@ -153,7 +153,7 @@ struct DeliberationLoopIntegrationTests {
         }
         for i in 0..<totalDHCP {
             let idx = UInt8(totalARP + totalICMP + i)
-            let mac = MACAddress(0xA3, 0x00, 0x00, 0x00, 0x00, idx)
+            let mac = MACAddress(0xA2, 0x00, 0x00, 0x00, 0x00, idx)
             let frame = makeDHCPFrame(clientMAC: mac, dstMAC: hostMAC,
                 dhcpPayload: makeDHCPPacketBytes(op: 1, xid: UInt32(1000 + i), chaddr: mac, msgType: .discover))
             inputs.append((endpointID: 1, packet: frame))
@@ -247,7 +247,7 @@ struct DeliberationLoopIntegrationTests {
         loop.runOneRound(transport: &t1)
 
         // Second VM's DISCOVER should get no reply (pool exhausted)
-        let mac2 = MACAddress(0xBB, 0x00, 0x00, 0x00, 0x00, 0x01)
+        let mac2 = MACAddress(0xBA, 0x00, 0x00, 0x00, 0x00, 0x01)
         let discover2 = makeDHCPFrame(clientMAC: mac2, dstMAC: hostMAC,
             dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: mac2, msgType: .discover))
         var t2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discover2)])

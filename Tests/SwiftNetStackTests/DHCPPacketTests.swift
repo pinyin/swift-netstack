@@ -54,7 +54,7 @@ struct DHCPPacketTests {
     }
 
     @Test func parseRequest() {
-        let chaddr = MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66)
+        let chaddr = MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66)
         let reqIP = IPv4Address(100, 64, 1, 50)
         let srvID = IPv4Address(100, 64, 1, 1)
         var ip4 = [UInt8](repeating: 0, count: 4)

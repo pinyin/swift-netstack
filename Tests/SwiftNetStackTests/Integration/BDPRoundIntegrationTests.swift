@@ -198,7 +198,7 @@ struct BDPRoundIntegrationTests {
         #expect(!arpMapping.isKnown(requestedIP))
 
         // Round 3: DISCOVER should succeed (IP was reclaimed)
-        let discoverFrame = makeDHCPFrame(clientMAC: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
+        let discoverFrame = makeDHCPFrame(clientMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
         var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discoverFrame)])
         let round3 = RoundContext()
         bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round3)

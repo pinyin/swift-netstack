@@ -36,7 +36,7 @@ struct EthernetFrameTests {
     }
 
     @Test func parseARPFrame() {
-        let pkt = makeFrame(dst: .broadcast, src: MACAddress(0x11, 0x22, 0x33, 0x44, 0x55, 0x66), type: .arp)
+        let pkt = makeFrame(dst: .broadcast, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), type: .arp)
         guard let eth = EthernetFrame.parse(from: pkt) else {
             Issue.record("parse returned nil")
             return

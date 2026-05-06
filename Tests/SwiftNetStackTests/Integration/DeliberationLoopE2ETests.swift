@@ -216,7 +216,7 @@ struct DeliberationLoopE2ETests {
         var transport: any Transport = PollingTransport(endpoints: [ep1, ep2])
 
         let mac1 = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
-        let mac2 = MACAddress(0xBB, 0x00, 0x00, 0x00, 0x00, 0x02)
+        let mac2 = MACAddress(0xBA, 0x00, 0x00, 0x00, 0x00, 0x02)
 
         // Both guests send ICMP echo to their respective gateways
         let icmp1 = makeICMPEchoFrame(clientMAC: mac1, clientIP: IPv4Address(100, 64, 1, 50), dstIP: gw1, id: 1, seq: 1)
@@ -348,7 +348,7 @@ struct DeliberationLoopE2ETests {
             let end = min(batchStart + batchSize, totalARP)
             runBatch(frameCount: end - batchStart) { i in
                 let idx = batchStart + i
-                let mac = MACAddress(0xA1, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
+                let mac = MACAddress(0xA0, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
                 let ip = IPv4Address(100, 64, 1, UInt8(10 + idx))
                 return makeEthernetFrameBytes(
                     dst: .broadcast, src: mac, type: .arp,
@@ -373,7 +373,7 @@ struct DeliberationLoopE2ETests {
             let end = min(batchStart + batchSize, totalDHCP)
             runBatch(frameCount: end - batchStart) { i in
                 let idx = totalARP + totalICMP + batchStart + i
-                let mac = MACAddress(0xA3, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
+                let mac = MACAddress(0xA2, 0x00, 0x00, 0x00, 0x00, UInt8(idx))
                 return makeDHCPFrame(clientMAC: mac,
                     dhcpPayload: makeDHCPPacketBytes(op: 1, xid: UInt32(1000 + batchStart + i), chaddr: mac, msgType: .discover))
             }

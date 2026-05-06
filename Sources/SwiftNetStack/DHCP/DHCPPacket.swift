@@ -42,6 +42,9 @@ public struct DHCPPacket {
 
         return pkt.withUnsafeReadableBytes { buf -> DHCPPacket? in
             let op = buf[0]
+            // RFC 2131 §2: htype must be 1 (Ethernet), hlen must be 6 (MAC address).
+            // Reject non-Ethernet hardware types to avoid misreading chaddr.
+            guard buf[1] == 1 && buf[2] == 6 else { return nil }
             let xid = (UInt32(buf[4]) << 24) | (UInt32(buf[5]) << 16)
                      | (UInt32(buf[6]) << 8)  |  UInt32(buf[7])
             let ciaddr = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[12..<16]))

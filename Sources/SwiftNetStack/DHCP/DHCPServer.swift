@@ -160,7 +160,20 @@ public struct DHCPServer {
         pool: DHCPPool,
         round: RoundContext
     ) -> PacketBuffer? {
-        let dhcpLen = 240 + 4 + 34  // header + magic + options
+        // Calculate total DHCP reply length from option sizes so addition/removal
+        // of options cannot cause buffer overrun. The option sizes below must
+        // match the writeOption calls that follow.
+        let optionsLen =
+            (2 + 1) +  // option 53: message type
+            (2 + 4) +  // option 1: subnet mask
+            (2 + 4) +  // option 3: router
+            (2 + 4) +  // option 6: DNS
+            (2 + 4) +  // option 51: lease time
+            (2 + 4) +  // option 54: server ID
+            1           // option 255: End
+        let magicLen = 4
+        let headerLen = 240
+        let dhcpLen = headerLen + magicLen + optionsLen
 
         var pkt = round.allocate(capacity: dhcpLen, headroom: 0)
         guard let ptr = pkt.appendPointer(count: dhcpLen) else { return nil }
@@ -191,6 +204,11 @@ public struct DHCPServer {
         writeOption(54, value: pool.gateway, ptr: ptr, offset: &optOff)
         // Option 255: End
         ptr.advanced(by: optOff).storeBytes(of: UInt8(255), as: UInt8.self)
+
+        // Verify option size computation matched actual writes.
+        // Compiled out in release; catches stale dhcpLen when options are changed.
+        assert(optOff + 1 == dhcpLen,
+            "DHCP option length mismatch: wrote \(optOff + 1 - 244) bytes, computed \(optionsLen)")
 
         return pkt
     }
@@ -247,6 +265,10 @@ private struct DHCPPool {
         let netAddr = subnet.network.addr
         let bcAddr = subnet.broadcast.addr
         let gwAddr = gateway.addr
+        // Reject degenerate subnets that would cause arithmetic overflow below.
+        // 255.255.255.255 is the limited broadcast address, never a valid network.
+        precondition(netAddr != 0xFFFFFFFF,
+            "DHCP subnet network address 255.255.255.255 is invalid")
         var ips: Set<UInt32> = []
         // Clamp pool to reasonable size (skip extremes for sanity)
         let start = max(netAddr + 1, gwAddr + 1)

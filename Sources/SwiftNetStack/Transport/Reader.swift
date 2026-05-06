@@ -6,6 +6,9 @@ import Darwin
 /// Sets O_NONBLOCK on the fd before draining so the read loop exits via EAGAIN
 /// rather than blocking. Each frame gets its own pool-allocated chunk; all
 /// allocations are tracked by the provided RoundContext for batch release.
+///
+/// Uses recvmsg() with MSG_TRUNC detection to avoid silently accepting
+/// truncated datagrams (same approach as PollingTransport).
 public struct FrameReader {
     public let mtu: Int
     private let maxPackets: Int
@@ -30,8 +33,16 @@ public struct FrameReader {
             var pkt = round.allocate(capacity: mtu, headroom: 0)
             guard let ptr = pkt.appendPointer(count: mtu) else { break }
 
-            let n = Darwin.read(fd, ptr, mtu)
+            var iov = iovec(iov_base: ptr, iov_len: mtu)
+            var msg = msghdr(msg_name: nil, msg_namelen: 0, msg_iov: &iov, msg_iovlen: 1, msg_control: nil, msg_controllen: 0, msg_flags: 0)
+            let n = Darwin.recvmsg(fd, &msg, 0)
             if n <= 0 { break }
+
+            // Detect truncated datagrams: kernel sets MSG_TRUNC in msg_flags
+            // when the datagram exceeds the receive buffer.
+            if msg.msg_flags & Int32(MSG_TRUNC) != 0 {
+                continue  // silently drop truncated frame
+            }
 
             if n < mtu {
                 pkt.trimBack(mtu - n)

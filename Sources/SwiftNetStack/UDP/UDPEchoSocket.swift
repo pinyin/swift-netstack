@@ -6,7 +6,8 @@
 /// `localIPs`: set of IP addresses this host owns. When non-empty, the echo
 /// only replies to datagrams addressed to one of these IPs, preventing
 /// UDP reflection amplification attacks. When empty (test convenience),
-/// no dstIP filtering is performed.
+/// no dstIP filtering is performed. **Production callers must always provide
+/// `localIPs` to prevent UDP reflection amplification.**
 public struct UDPEchoSocket: UDPSocket {
     public let localIPs: Set<IPv4Address>
 

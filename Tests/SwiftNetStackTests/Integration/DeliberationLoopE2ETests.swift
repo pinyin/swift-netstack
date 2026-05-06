@@ -491,6 +491,8 @@ struct DeliberationLoopE2ETests {
                                       extraOptions: [(UInt8, [UInt8])] = []) -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: 247)
         bytes[0] = op
+        bytes[1] = 1   // htype = Ethernet
+        bytes[2] = 6   // hlen = MAC address length
         bytes[4] = UInt8((xid >> 24) & 0xFF)
         bytes[5] = UInt8((xid >> 16) & 0xFF)
         bytes[6] = UInt8((xid >> 8) & 0xFF)

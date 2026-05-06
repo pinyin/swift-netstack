@@ -127,10 +127,9 @@ public func bdpRound(
     }
 #if DEBUG
     // Contract: Every ARP-parsed entry has operation == .request or .reply.
-    // ARPFrame.parse checks htype/ptype/hlen/plen but does NOT validate the
-    // operation field — a frame with an invalid opcode (e.g., 0 or 42) would
-    // silently pass parsing. This contract catches those before Phase 9 tries
-    // to process them (processARPRequest's own guard is the production fix for H3).
+    // ARPFrame.parse validates operation via ARPOperation(rawValue:) — invalid
+    // opcodes (e.g., 0 or 42) cause parse to return nil before reaching Phase 9.
+    // This contract catches any remaining edge cases that survive parsing.
     debugValidateARPParse(arpParsed)
 #endif
 
@@ -414,8 +413,8 @@ private func buildDHCPFrame(
     ckBuf[10] = UInt8(udpLen >> 8)
     ckBuf[11] = UInt8(udpLen & 0xFF)
     let udpPtr = ptr.advanced(by: udpOff)
-    for i in 0..<udpLen {
-        ckBuf[12 + i] = udpPtr.advanced(by: i).load(as: UInt8.self)
+    ckBuf.withUnsafeMutableBytes { (ckPtr: UnsafeMutableRawBufferPointer) in
+        ckPtr.baseAddress!.advanced(by: 12).copyMemory(from: udpPtr, byteCount: udpLen)
     }
     let udpCksum = ckBuf.withUnsafeBytes { internetChecksum($0) }
     writeUInt16BE(udpCksum == 0 ? 0xFFFF : udpCksum, to: ptr.advanced(by: udpOff + 6))

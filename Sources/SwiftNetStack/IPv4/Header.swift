@@ -50,6 +50,8 @@ public struct IPv4Header {
             let totalLength = (UInt16(buf[2]) << 8) | UInt16(buf[3])
             let identification = (UInt16(buf[4]) << 8) | UInt16(buf[5])
             let flagsFrag = (UInt16(buf[6]) << 8) | UInt16(buf[7])
+            // RFC 791 §3.2.1.3: reserved bit (bit 15 of flagsFrag) must be 0
+            guard flagsFrag & 0x8000 == 0 else { return nil }
             let flags = UInt8(flagsFrag >> 13)
             let fragmentOffset = flagsFrag & 0x1FFF
             let ttl = buf[8]

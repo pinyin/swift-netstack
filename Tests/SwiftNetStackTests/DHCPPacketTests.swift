@@ -9,6 +9,8 @@ struct DHCPPacketTests {
                        msgType: DHCPMessageType, options: [(UInt8, [UInt8])] = []) -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: 247)
         bytes[0] = op
+        bytes[1] = 1   // htype = Ethernet
+        bytes[2] = 6   // hlen = MAC address length
         bytes[4] = UInt8((xid >> 24) & 0xFF)
         bytes[5] = UInt8((xid >> 16) & 0xFF)
         bytes[6] = UInt8((xid >> 8) & 0xFF)
@@ -108,6 +110,8 @@ struct DHCPPacketTests {
         let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         var bytes = [UInt8](repeating: 0, count: 249)
         bytes[0] = 1  // BOOTREQUEST
+        bytes[1] = 1  // htype = Ethernet
+        bytes[2] = 6  // hlen = MAC address length
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
         bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
@@ -133,6 +137,8 @@ struct DHCPPacketTests {
         let chaddr = MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66)
         var bytes = [UInt8](repeating: 0, count: 251)
         bytes[0] = 1
+        bytes[1] = 1  // htype = Ethernet
+        bytes[2] = 6  // hlen = MAC address length
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
         bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
@@ -156,7 +162,7 @@ struct DHCPPacketTests {
 
     @Test func parseBadMagicCookie() {
         var bytes = [UInt8](repeating: 0, count: 247)
-        bytes[0] = 1; bytes[9] = 1  // hlen=1
+        bytes[0] = 1; bytes[1] = 1; bytes[2] = 6  // htype=Ethernet, hlen=MAC addr
         // Magic cookie = 0,0,0,0 (bad)
         bytes[244] = 53; bytes[245] = 1; bytes[246] = 1  // valid option after bad cookie
         let s = Storage.allocate(capacity: 247)
@@ -187,5 +193,32 @@ struct DHCPPacketTests {
         }
         #expect(dhcp.ciaddr == expectedCIAddr,
             "ciaddr should be parsed from BOOTP header bytes 12-15")
+    }
+
+    // MARK: - AUDIT #7: htype/hlen validation (RFC 2131 §2)
+
+    /// Verifies fix: DHCP packets with non-Ethernet hardware type (htype != 1)
+    /// are rejected. Without this check, IEEE 802.11 frames (htype=6, hlen=8)
+    /// would read only 6 bytes of an 8-byte hardware address.
+    @Test func nonEthernetHardwareTypeRejected() {
+        let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        var bytes = makeDHCPBytes(xid: 1, chaddr: chaddr, msgType: .discover)
+        bytes[1] = 6  // htype = IEEE 802.11 (not Ethernet)
+        let s = Storage.allocate(capacity: bytes.count)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: bytes.count)
+        #expect(DHCPPacket.parse(from: pkt) == nil,
+            "DHCP packet with htype=6 (non-Ethernet) should be rejected")
+    }
+
+    @Test func wrongHardwareAddressLengthRejected() {
+        let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        var bytes = makeDHCPBytes(xid: 1, chaddr: chaddr, msgType: .discover)
+        bytes[2] = 8  // hlen = 8 (not 6 for Ethernet MAC)
+        let s = Storage.allocate(capacity: bytes.count)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: bytes.count)
+        #expect(DHCPPacket.parse(from: pkt) == nil,
+            "DHCP packet with hlen=8 (non-MAC) should be rejected")
     }
 }

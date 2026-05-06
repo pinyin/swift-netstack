@@ -112,8 +112,13 @@ public enum ChunkPools {
     }
 
     /// Reverse lookup: given a chunk's actual capacity, return the exact pool it came from.
+    ///
     /// All standard chunk sizes are 64 << index (powers of two), so we use trailing-zero-bit count.
     /// For capacities < 64 (non-standard, heap-allocated), returns pool64B.
+    ///
+    /// - Precondition: `chunkCapacity` must be a standard pool size (64, 128, 256, … 65536)
+    ///   or < 64. Non-standard capacities (e.g., 65, 100) map to the wrong pool.
+    ///   Use `select(minCapacity:)` for new allocations — it always returns the correct pool.
     public static func poolFor(chunkCapacity: Int) -> ChunkPool {
         guard chunkCapacity > 64 else { return pool64B }
         let shifted = chunkCapacity >> 6

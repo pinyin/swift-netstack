@@ -16,8 +16,9 @@
 ///   Phase 3:  MAC filter + EtherType dispatch (branch logic only)
 ///   Phase 4:  Parse ALL IPv4 headers         (IPv4Header.parse, ~25 insns)
 ///   Phase 5:  Parse ALL ARP frames           (ARPFrame.parse, ~20 insns)
-///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + extractDHCP)
+///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + UDPHeader.parse + extractDHCP)
 ///   Phase 7:  Process ALL ICMP               (buildICMPEchoReply)
+///   Phase 7.5:Process ALL UDP sockets         (UDPSocket.handleDatagram → buildUDPFrame)
 ///   Phase 8:  Process ALL DHCP               (DHCPServer.process + buildDHCPFrame)
 ///   Phase 9:  Process ALL ARP                (processARPRequest)
 ///   Phase 10: Batch write + endRound         (syscall + reclaim)
@@ -33,6 +34,8 @@ public func bdpRound(
     arpMapping: inout ARPMapping,
     dhcpServer: inout DHCPServer,
     routingTable: RoutingTable,
+    udpSocketTable: inout UDPSocketTable,
+    ipFragmentReassembler: inout IPFragmentReassembler,
     round: RoundContext
 ) -> Int {
     // ── Phase 1: Poll + batch read ──
@@ -83,10 +86,25 @@ public func bdpRound(
 #endif
 
     // ── Phase 4: Parse ALL IPv4 headers ──
-    // I-cache: IPv4Header.parse + verifyChecksum — no business logic
+    // I-cache: IPv4Header.parse + verifyChecksum + fragment reassembly
+    //
+    // Fragment detection: (MF=1 or offset>0) means this is a fragment.
+    // Fragments are routed to the reassembler and excluded from ipv4Parsed
+    // until reassembly is complete. When the last fragment arrives, the
+    // reassembled datagram is re-parsed and injected into the pipeline.
     var ipv4Parsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
     for (ep, _, eth) in ipv4Pkts {
-        if let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() {
+        guard let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() else { continue }
+        let isFragment = (ip.flags & 0x01) != 0 || ip.fragmentOffset != 0
+        if isFragment {
+            if let reassembled = ipFragmentReassembler.process(fragment: ip, rawIPPacket: eth.payload) {
+                // Reassembly complete — re-parse the full datagram into the pipeline
+                if let fullIP = IPv4Header.parse(from: reassembled), fullIP.verifyChecksum() {
+                    ipv4Parsed.append((ep, eth, fullIP))
+                }
+            }
+            // Fragment stored but not yet complete — skip this entry
+        } else {
             ipv4Parsed.append((ep, eth, ip))
         }
     }
@@ -117,8 +135,9 @@ public func bdpRound(
 #endif
 
     // ── Phase 6: Parse ALL transport headers ──
-    // I-cache: ICMPHeader.parse + extractDHCP — no reply construction
+    // I-cache: ICMPHeader.parse + UDPHeader.parse + extractDHCP — no reply construction
     var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
+    var udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
     var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
     for (ep, eth, ip) in ipv4Parsed {
         switch ip.protocol {
@@ -127,19 +146,39 @@ public func bdpRound(
                 icmpParsed.append((ep, eth, ip, icmp))
             }
         case .udp:
-            if let dhcp = extractDHCP(from: ip.payload) {
-                dhcpParsed.append((ep, eth, ip, dhcp))
+            guard let udp = UDPHeader.parse(
+                from: ip.payload,
+                pseudoSrcAddr: ip.srcAddr,
+                pseudoDstAddr: ip.dstAddr
+            ) else { break }
+            // DHCP (ports 67/68) is a L2-stateful protocol — route it exclusively
+            // to the DHCP pipeline so it never enters the generic UDP socket table.
+            //
+            // dstPort==67 is the normal case (client → server).
+            // srcPort==67 is defense-in-depth: if a guest mistakenly runs a DHCP
+            // server and emits OFFER/ACK packets, they are captured here instead of
+            // leaking into udpParsed and potentially hitting an unrelated UDP socket.
+            if udp.dstPort == 67 || udp.srcPort == 67 {
+                if let dhcp = extractDHCP(from: udp.payload) {
+                    dhcpParsed.append((ep, eth, ip, dhcp))
+                }
+                // If the DHCP port filter matched but the payload isn't valid DHCP:
+                // explicitly discarded. This is either a malformed DHCP packet or a
+                // non-DHCP protocol misusing ports 67/68 — neither belongs in the
+                // generic UDP pipeline.
+            } else {
+                udpParsed.append((ep, eth, ip, udp))
             }
         default:
             break
         }
     }
 #if DEBUG
-    // Contract: icmpParsed contains only .icmp protocol, dhcpParsed contains only
-    // .udp protocol. The switch in Phase 6 dispatches by ip.protocol — a mismatch
-    // here means the wrong case arm matched or ICMPHeader/DHCPPacket.parse returned
-    // nil for a valid packet, which would indicate a parse regression.
-    debugValidateTransportParse(icmpParsed: icmpParsed, dhcpParsed: dhcpParsed)
+    // Contract: icmpParsed contains only .icmp protocol, udpParsed contains only .udp
+    // protocol, dhcpParsed contains only DHCP packets (from UDP port 67). The switch
+    // in Phase 6 dispatches by ip.protocol — a mismatch here means the wrong case arm
+    // matched or ICMPHeader/UDPHeader/DHCPPacket.parse returned nil for a valid packet.
+    debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed)
 #endif
 
     var replies: [(endpointID: Int, packet: PacketBuffer)] = []
@@ -174,6 +213,36 @@ public func bdpRound(
     )
 #endif
 
+    // ── Phase 7.5: Process ALL UDP sockets ──
+#if DEBUG
+    // L2 snapshot: capture udpParsed and reply count before the phase.
+    let udpSnapshot = udpParsed
+    let replyCountPreUDP = replies.count
+#endif
+    // I-cache: UDPSocketTable.lookup + UDPSocket.handleDatagram — no parsing
+    for (ep, eth, ip, udp) in udpParsed {
+        guard let socket = udpSocketTable.lookup(port: udp.dstPort) else { continue }
+        socket.handleDatagram(
+            payload: udp.payload,
+            srcIP: ip.srcAddr, dstIP: ip.dstAddr,
+            srcPort: udp.srcPort, dstPort: udp.dstPort,
+            srcMAC: eth.srcMAC,
+            endpointID: ep,
+            hostMAC: arpMapping.hostMAC,
+            replies: &replies,
+            round: round
+        )
+    }
+#if DEBUG
+    // L2: Validate every UDP reply against its matching request via
+    // (srcPort, dstPort, srcIP). Re-parses Eth→IP→UDP independently.
+    debugValidateUDPPhase(
+        requests: udpSnapshot,
+        replies: replies[replyCountPreUDP...],
+        hostMAC: arpMapping.hostMAC
+    )
+#endif
+
     // ── Phase 8: Process ALL DHCP ──
 #if DEBUG
     // L2 snapshot: DHCP replies are matched to requests via xid (RFC 2131 §2).
@@ -182,6 +251,10 @@ public func bdpRound(
 #endif
     // I-cache: DHCPServer.process + buildDHCPFrame — no parsing
     for (ep, eth, ip, dhcp) in dhcpParsed {
+        // Only process BOOTREQUEST (op=1). DHCP replies (op=2) in the inbound
+        // path are either misconfigured guest servers or routing errors — neither
+        // belongs in the server pipeline.
+        guard dhcp.op == 1 else { continue }
         if let (rawReply, targetEp) = dhcpServer.process(
             packet: dhcp, srcMAC: eth.srcMAC,
             endpointID: ep, arpMapping: &arpMapping, round: round
@@ -264,6 +337,7 @@ public func bdpRound(
     ipv4Parsed.removeAll()
     arpParsed.removeAll()
     icmpParsed.removeAll()
+    udpParsed.removeAll()
     dhcpParsed.removeAll()
     forwardPkts.removeAll()
     replies.removeAll()
@@ -272,23 +346,10 @@ public func bdpRound(
     return forwardCount + replyCount
 }
 
-/// Extract a DHCP packet from a UDP datagram payload.
-/// Returns nil if the destination port doesn't match or the DHCP packet is malformed.
-func extractDHCP(from udpPayload: PacketBuffer, srcPort: UInt16? = nil, dstPort: UInt16? = 67) -> DHCPPacket? {
-    var pkt = udpPayload
-    // UDP header: srcPort(2) + dstPort(2) + length(2) + checksum(2) = 8
-    guard pkt.totalLength >= 8 else { return nil }
-    guard pkt.pullUp(8) else { return nil }
-
-    return pkt.withUnsafeReadableBytes { buf in
-        let sp = (UInt16(buf[0]) << 8) | UInt16(buf[1])
-        let dp = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-        if let expected = srcPort, sp != expected { return nil }
-        if let expected = dstPort, dp != expected { return nil }
-
-        guard let dhcpPayload = pkt.slice(from: 8, length: pkt.totalLength - 8) else { return nil }
-        return DHCPPacket.parse(from: dhcpPayload)
-    }
+/// Extract a DHCP packet from a UDP payload (after the 8-byte UDP header).
+/// The caller is responsible for UDP header parsing and port filtering.
+func extractDHCP(from dhcpPayload: PacketBuffer) -> DHCPPacket? {
+    return DHCPPacket.parse(from: dhcpPayload)
 }
 
 /// Wrap a raw DHCP payload in Ethernet/IPv4/UDP headers.
@@ -342,6 +403,22 @@ private func buildDHCPFrame(
     dhcpPayload.withUnsafeReadableBytes { buf in
         ptr.advanced(by: dhcpOff).copyMemory(from: buf.baseAddress!, byteCount: dhcpLen)
     }
+
+    // ── UDP checksum (RFC 768 pseudo-header + UDP header + payload) ──
+    let ckBufLen = 12 + udpLen
+    var ckBuf = [UInt8](repeating: 0, count: ckBufLen)
+    var ipOut = [UInt8](repeating: 0, count: 4)
+    gatewayIP.write(to: &ipOut); ckBuf[0...3] = ipOut[0...3]
+    yiaddr.write(to: &ipOut); ckBuf[4...7] = ipOut[0...3]
+    ckBuf[9] = IPProtocol.udp.rawValue
+    ckBuf[10] = UInt8(udpLen >> 8)
+    ckBuf[11] = UInt8(udpLen & 0xFF)
+    let udpPtr = ptr.advanced(by: udpOff)
+    for i in 0..<udpLen {
+        ckBuf[12 + i] = udpPtr.advanced(by: i).load(as: UInt8.self)
+    }
+    let udpCksum = ckBuf.withUnsafeBytes { internetChecksum($0) }
+    writeUInt16BE(udpCksum == 0 ? 0xFFFF : udpCksum, to: ptr.advanced(by: udpOff + 6))
 
     return pkt
 }

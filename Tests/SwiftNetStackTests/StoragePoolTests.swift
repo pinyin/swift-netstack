@@ -131,8 +131,8 @@ struct StoragePoolTests {
     }
 
     @Test func selectMaxClamp() {
-        // Above max pool size should clamp to 64KB
-        let pool = ChunkPools.select(minCapacity: 128 * 1024)
+        // At max pool size — must be exactly 65536
+        let pool = ChunkPools.select(minCapacity: 65536)
         #expect(pool.chunkSize == 65536)
     }
 

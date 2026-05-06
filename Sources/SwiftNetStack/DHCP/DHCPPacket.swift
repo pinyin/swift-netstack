@@ -49,7 +49,7 @@ public struct DHCPPacket {
             var i = 244
             while i < buf.count {
                 let optCode = buf[i]
-                if optCode == 0 { break }    // Pad
+                if optCode == 0 { i += 1; continue }  // Pad — skip, don't terminate (RFC 2132 §3.1)
                 if optCode == 255 { break }   // End
                 if i + 1 >= buf.count { break }
                 let optLen = Int(buf[i + 1])

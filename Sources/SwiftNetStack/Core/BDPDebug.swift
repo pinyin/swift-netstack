@@ -183,15 +183,42 @@ func debugValidateDHCPPacket(_ dhcp: DHCPPacket) {
 
 func debugValidateTransportParse(
     icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)],
+    udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)],
     dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)]
 ) {
     for (_, _, ip, _) in icmpParsed {
         precondition(ip.protocol == .icmp,
             "Transport parse: ip.protocol must be .icmp for ICMP entries, got \(ip.protocol)")
     }
+    for (_, _, ip, _) in udpParsed {
+        precondition(ip.protocol == .udp,
+            "Transport parse: ip.protocol must be .udp for UDP entries, got \(ip.protocol)")
+    }
     for (_, _, ip, _) in dhcpParsed {
         precondition(ip.protocol == .udp,
             "Transport parse: ip.protocol must be .udp for DHCP entries, got \(ip.protocol)")
+    }
+}
+
+// MARK: UDP (RFC 768)
+
+func debugValidateUDPHeader(_ udp: UDPHeader) {
+    // RFC 768: length must be ≥ 8 (header size)
+    precondition(udp.length >= 8,
+        "RFC 768: UDP length must be ≥ 8, got \(udp.length)")
+    // RFC 768: length == header(8) + payload
+    precondition(Int(udp.length) == 8 + udp.payload.totalLength,
+        "RFC 768: UDP length \(udp.length) ≠ 8 + payload (\(udp.payload.totalLength))")
+    // RFC 768: pseudo-header addresses must not be zero
+    precondition(udp.pseudoSrcAddr != .zero,
+        "RFC 768: UDP pseudoSrcAddr must not be 0.0.0.0")
+    precondition(udp.pseudoDstAddr != .zero,
+        "RFC 768: UDP pseudoDstAddr must not be 0.0.0.0")
+}
+
+func debugValidateUDPParse(_ udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)]) {
+    for (_, _, _, udp) in udpParsed {
+        debugValidateUDPHeader(udp)
     }
 }
 
@@ -293,6 +320,66 @@ func debugValidateICMPPhase(
     }
 }
 
+// MARK: UDP (RFC 768) — Phase 7.5
+
+func debugValidateUDPPhase(
+    requests: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)],
+    replies: ArraySlice<(endpointID: Int, packet: PacketBuffer)>,
+    hostMAC: MACAddress
+) {
+    for (replyEp, replyPkt) in replies {
+        // ── Re-parse the reply independently ──
+        guard let eth = EthernetFrame.parse(from: replyPkt) else {
+            preconditionFailure("UDP L2: reply has invalid Ethernet")
+        }
+        guard eth.etherType == .ipv4 else {
+            preconditionFailure("UDP L2: reply EtherType is not IPv4")
+        }
+        guard let ip = IPv4Header.parse(from: eth.payload) else {
+            preconditionFailure("UDP L2: reply has invalid IPv4 header")
+        }
+        guard ip.protocol == .udp else {
+            preconditionFailure("UDP L2: reply IP protocol is not UDP")
+        }
+        guard let udp = UDPHeader.parse(
+            from: ip.payload,
+            pseudoSrcAddr: ip.srcAddr,
+            pseudoDstAddr: ip.dstAddr
+        ) else {
+            preconditionFailure("UDP L2: reply has invalid UDP header")
+        }
+
+        // ── Validate L1: IP and UDP checksums ──
+        precondition(ip.verifyChecksum(),
+            "RFC 791 §3.1: UDP reply IP checksum INVALID — stale bytes in pool chunk?")
+        precondition(udp.verifyChecksum(),
+            "RFC 768: UDP reply checksum INVALID")
+
+        // ── Match reply to request via (srcPort↔dstPort, srcIP↔dstIP) ──
+        let match = requests.first { req in
+            udp.srcPort == req.udp.dstPort
+            && udp.dstPort == req.udp.srcPort
+            && ip.srcAddr == req.ip.dstAddr
+            && ip.dstAddr == req.ip.srcAddr
+        }
+        guard let req = match else {
+            preconditionFailure(
+                "RFC 768: UDP reply (srcPort=\(udp.srcPort), dstPort=\(udp.dstPort)) has no matching request")
+        }
+
+        // ── Validate correspondence ──
+        // Reply dstMAC == request srcMAC
+        precondition(eth.dstMAC == req.eth.srcMAC,
+            "UDP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        // Reply srcMAC == host MAC
+        precondition(eth.srcMAC == hostMAC,
+            "UDP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        // Endpoint consistency
+        precondition(replyEp == req.ep,
+            "UDP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+    }
+}
+
 // MARK: ARP (RFC 826) — Phase 9
 
 func debugValidateARPPhase(
@@ -358,13 +445,19 @@ func debugValidateARPPhase(
 // MARK: DHCP (RFC 2131) — Phase 8
 
 /// Extract a DHCP packet from within a wrapped Ethernet→IP→UDP→DHCP reply frame.
-/// Delegates to the shared `extractDHCP` after unwrapping protocol layers.
+/// Parses the UDP header to get the DHCP payload, then delegates to `extractDHCP`.
 private func extractDHCPFromReplyFrame(_ pkt: PacketBuffer) -> DHCPPacket? {
     guard let eth = EthernetFrame.parse(from: pkt),
           eth.etherType == .ipv4,
           let ip = IPv4Header.parse(from: eth.payload),
-          ip.protocol == .udp else { return nil }
-    return extractDHCP(from: ip.payload, srcPort: 67, dstPort: 68)
+          ip.protocol == .udp,
+          let udp = UDPHeader.parse(
+            from: ip.payload,
+            pseudoSrcAddr: ip.srcAddr,
+            pseudoDstAddr: ip.dstAddr
+          ),
+          udp.srcPort == 67, udp.dstPort == 68 else { return nil }
+    return extractDHCP(from: udp.payload)
 }
 
 func debugValidateDHCPPhase(

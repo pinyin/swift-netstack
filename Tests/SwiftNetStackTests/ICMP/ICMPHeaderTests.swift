@@ -49,6 +49,48 @@ struct ICMPHeaderTests {
         #expect(icmp.code == 1)
     }
 
+    // MARK: - Audit issue #6: ICMP checksum not verified
+
+    /// AUDIT #6 REPRODUCTION: ICMPHeader.parse accepts packets with deliberately
+    /// wrong checksums. Unlike UDPHeader.parse which validates the checksum on
+    /// parse, ICMPHeader.parse reads the checksum field but never verifies it.
+    ///
+    /// EXPECTED: parse returns nil (bad checksum → corrupt packet)
+    /// ACTUAL:   parse succeeds (BUG)
+    @Test func badChecksumShouldCauseParseFailure() {
+        var bytes: [UInt8] = []
+        bytes.append(8); bytes.append(0)          // type=echo request, code=0
+        bytes.append(0x12); bytes.append(0x34)    // deliberately wrong checksum
+        bytes.append(0); bytes.append(1)          // id=1
+        bytes.append(0); bytes.append(1)          // seq=1
+        bytes.append(contentsOf: [0x70, 0x69, 0x6E, 0x67])  // "ping"
+
+        let pkt = packetFrom(bytes)
+        let icmp = ICMPHeader.parse(from: pkt)
+        #expect(icmp == nil,
+            "AUDIT #6 FAIL: ICMP parse should reject packet with bad checksum 0x1234")
+    }
+
+    /// AUDIT #6 REPRODUCTION: zero checksum also accepted without verification.
+    /// RFC 792 (unlike RFC 768 UDP) does not have a "checksum=0 means unused" rule
+    /// for ICMP — all ICMP messages must have a valid checksum.
+    ///
+    /// EXPECTED: parse returns nil (zero checksum is invalid for ICMP)
+    /// ACTUAL:   parse succeeds (BUG)
+    @Test func zeroChecksumShouldCauseParseFailure() {
+        var bytes: [UInt8] = []
+        bytes.append(8); bytes.append(0)          // type=echo request, code=0
+        bytes.append(0); bytes.append(0)          // zero checksum
+        bytes.append(0x12); bytes.append(0x34)    // id=0x1234
+        bytes.append(0x00); bytes.append(0x01)    // seq=1
+        bytes.append(contentsOf: [0xAA, 0xBB])
+
+        let pkt = packetFrom(bytes)
+        let icmp = ICMPHeader.parse(from: pkt)
+        #expect(icmp == nil,
+            "AUDIT #6 FAIL: ICMP parse should reject packet with zero checksum")
+    }
+
     @Test func bufferTooShortReturnsNil() {
         // ICMP needs at least 8 bytes
         let pkt = packetFrom([0x08, 0x00, 0x00, 0x00, 0x12, 0x34])

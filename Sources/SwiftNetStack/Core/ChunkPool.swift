@@ -90,6 +90,7 @@ public enum ChunkPools {
     /// Formula mirrors gVisor's getChunkPool: poolIdx = MSB(minCapacity >> 6).
     /// Clamped to [0, 10].
     public static func select(minCapacity: Int) -> ChunkPool {
+        precondition(minCapacity <= 65536, "Requested capacity \(minCapacity) exceeds maximum pool size 65536")
         guard minCapacity > 64 else { return pool64B }
         let shifted = minCapacity >> 6  // baseChunkSizeLog2 = 6
         let msbOneIndexed = 64 - shifted.leadingZeroBitCount

@@ -93,6 +93,67 @@ struct DHCPPacketTests {
         #expect(DHCPPacket.parse(from: pkt) == nil)
     }
 
+    // MARK: - Audit issue #1: DHCP Pad option (RFC 2132 §3.1)
+
+    /// AUDIT #1 REPRODUCTION: DHCP Pad option (code 0) causes the option scanner
+    /// to `break` instead of `continue`, terminating the scan before reaching
+    /// option 53 (message type). A valid DHCP packet with Pad bytes is incorrectly rejected.
+    ///
+    /// RFC 2132 §3.1: "The pad option may be used to align subsequent options on
+    /// word boundaries." The scanner MUST skip Pad (i += 1; continue), not terminate.
+    ///
+    /// EXPECTED: parse succeeds, returns DHCPPacket with messageType == .discover
+    /// ACTUAL:   parse returns nil (BUG)
+    @Test func padOptionShouldNotBreakParsing() {
+        let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        var bytes = [UInt8](repeating: 0, count: 249)
+        bytes[0] = 1  // BOOTREQUEST
+        var buf6 = [UInt8](repeating: 0, count: 6)
+        chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
+        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+
+        // Single Pad byte before option 53 — per RFC 2132 §3.1, skip and continue.
+        bytes[244] = 0     // Pad
+        bytes[245] = 53; bytes[246] = 1; bytes[247] = DHCPMessageType.discover.rawValue
+        bytes[248] = 255   // End
+
+        let s = Storage.allocate(capacity: 249)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 249) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 249)
+
+        let result = DHCPPacket.parse(from: pkt)
+        #expect(result != nil,
+            "AUDIT #1 FAIL: DHCP Pad option causes valid packet to be rejected")
+        #expect(result?.messageType == .discover,
+            "AUDIT #1 FAIL: message type should be discover")
+    }
+
+    /// AUDIT #1 REPRODUCTION variant: multiple Pad bytes interleaved.
+    @Test func multiplePadOptionsShouldNotBreakParsing() {
+        let chaddr = MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66)
+        var bytes = [UInt8](repeating: 0, count: 251)
+        bytes[0] = 1
+        var buf6 = [UInt8](repeating: 0, count: 6)
+        chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
+        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+
+        // Two Pad bytes before option 53 — common when aligning to word boundaries.
+        bytes[244] = 0     // Pad
+        bytes[245] = 0     // Pad
+        bytes[246] = 53; bytes[247] = 1; bytes[248] = DHCPMessageType.request.rawValue
+        bytes[249] = 50; bytes[250] = 0  // option 50 with zero-length (no End needed)
+
+        let s = Storage.allocate(capacity: 251)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 251) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 251)
+
+        let result = DHCPPacket.parse(from: pkt)
+        #expect(result != nil,
+            "AUDIT #1 FAIL: Multiple Pad options cause valid DHCP packet to be rejected")
+        #expect(result?.messageType == .request,
+            "AUDIT #1 FAIL: message type should be request")
+    }
+
     @Test func parseBadMagicCookie() {
         var bytes = [UInt8](repeating: 0, count: 247)
         bytes[0] = 1; bytes[9] = 1  // hlen=1

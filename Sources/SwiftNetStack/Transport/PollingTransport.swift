@@ -135,10 +135,14 @@ public struct PollingTransport: Transport {
             }
 
             let written = pkt.sendmsg(to: fd, flags: Int32(MSG_DONTWAIT))
-            if written < 0, errno == EAGAIN {
-                pendingWrites.append((epID, pkt))
-                if pendingWrites.count > kMaxPendingWrites {
-                    pendingWrites.removeFirst(pendingWrites.count - kMaxPendingWrites)
+            if written < 0 {
+                if errno == EAGAIN {
+                    pendingWrites.append((epID, pkt))
+                    if pendingWrites.count > kMaxPendingWrites {
+                        pendingWrites.removeFirst(pendingWrites.count - kMaxPendingWrites)
+                    }
+                } else {
+                    logWriteError("writePackets", fd: fd, epID: epID)
                 }
             }
         }
@@ -165,10 +169,27 @@ public struct PollingTransport: Transport {
             }
 
             let written = pkt.sendmsg(to: fd, flags: Int32(MSG_DONTWAIT))
-            if written < 0, errno == EAGAIN {
-                remaining.append((epID, pkt))
+            if written < 0 {
+                if errno == EAGAIN {
+                    remaining.append((epID, pkt))
+                } else {
+                    logWriteError("retryPendingWrites", fd: fd, epID: epID)
+                }
             }
         }
         pendingWrites = remaining
     }
+}
+
+// MARK: - Debug write error logging (H1 audit reproduction)
+
+/// H1 (audit): Non-EAGAIN write errors (EPIPE, ECONNRESET, EBADF) are silently
+/// discarded in production. This DEBUG-only logger surfaces them on stderr
+/// so test runs and development catch them.
+private func logWriteError(_ context: String, fd: Int32, epID: Int) {
+    #if DEBUG
+    let msg = "\(context): sendmsg(fd=\(fd), ep=\(epID))"
+        + " failed (\(errno)) — packet silently dropped\n"
+    _ = msg.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }
+    #endif
 }

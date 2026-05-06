@@ -195,6 +195,7 @@ struct ClassifierTests {
                                   dst: IPv4Address = IPv4Address(192, 168, 1, 1)) -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: 20)
         bytes[0] = 0x45
+        bytes[2] = 0; bytes[3] = 20  // totalLength = 20
         bytes[8] = 64
         bytes[9] = proto.rawValue
         var buf4 = [UInt8](repeating: 0, count: 4)

@@ -21,8 +21,15 @@ public struct ICMPHeader {
     /// is shorter than 8 bytes (the minimum ICMP header size).
     public static func parse(from pkt: PacketBuffer) -> ICMPHeader? {
         var pkt = pkt
-        guard pkt.totalLength >= 8 else { return nil }
-        guard pkt.pullUp(8) else { return nil }
+        let icmpLen = pkt.totalLength
+        guard icmpLen >= 8 else { return nil }
+        guard pkt.pullUp(icmpLen) else { return nil }
+
+        // Verify checksum over the entire ICMP message (RFC 792).
+        // Unlike UDP, ICMP has no "checksum=0 means unused" rule — all ICMP
+        // messages must carry a valid checksum.
+        let ckValid = pkt.withUnsafeReadableBytes { internetChecksum($0) == 0 }
+        guard ckValid else { return nil }
 
         return pkt.withUnsafeReadableBytes { buf in
             let type = buf[0]
@@ -31,7 +38,7 @@ public struct ICMPHeader {
             let identifier = (UInt16(buf[4]) << 8) | UInt16(buf[5])
             let sequenceNumber = (UInt16(buf[6]) << 8) | UInt16(buf[7])
 
-            guard let payload = pkt.slice(from: 8, length: pkt.totalLength - 8) else { return nil }
+            guard let payload = pkt.slice(from: 8, length: icmpLen - 8) else { return nil }
 
             return ICMPHeader(
                 type: type, code: code, checksum: checksum,

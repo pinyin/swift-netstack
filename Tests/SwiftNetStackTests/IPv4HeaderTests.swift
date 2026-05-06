@@ -142,6 +142,45 @@ struct IPv4HeaderTests {
         #expect(!ip.verifyChecksum())
     }
 
+    // MARK: - C1 regression: payload trimmed to IP totalLength
+
+    /// Verifies that IPv4Header.parse respects the IP header's `totalLength`
+    /// field when computing the payload slice, excluding Ethernet padding bytes.
+    @Test func ipPayloadTrimmedToDeclaredTotalLength() {
+        let declaredTotalLength: UInt16 = 28   // 20 header + 8 real payload
+        let physicalBufLen = 40                 // includes 12 bytes padding
+        let expectedPayloadLen = Int(declaredTotalLength) - 20  // 8
+
+        var bytes = [UInt8](repeating: 0, count: physicalBufLen)
+        bytes[0] = 0x45
+        bytes[2] = UInt8(declaredTotalLength >> 8)
+        bytes[3] = UInt8(declaredTotalLength & 0xFF)
+        bytes[8] = 64; bytes[9] = IPProtocol.udp.rawValue
+        IPv4Address(10, 0, 0, 1).write(to: &bytes[12])
+        IPv4Address(192, 168, 1, 1).write(to: &bytes[16])
+        for i in 20..<28 { bytes[i] = UInt8(i - 20) }       // real payload
+        for i in 28..<40 { bytes[i] = 0xFF }                 // padding
+        let cksum = bytes[0..<20].withUnsafeBytes { internetChecksum($0) }
+        bytes[10] = UInt8(cksum >> 8); bytes[11] = UInt8(cksum & 0xFF)
+
+        let s = Storage.allocate(capacity: physicalBufLen)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: physicalBufLen) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: physicalBufLen)
+
+        guard let ip = IPv4Header.parse(from: pkt) else {
+            Issue.record("parse returned nil")
+            return
+        }
+
+        #expect(ip.totalLength == declaredTotalLength)
+        #expect(ip.payload.totalLength == expectedPayloadLen)
+        ip.payload.withUnsafeReadableBytes { buf in
+            let payloadBytes = Array(buf)
+            #expect(payloadBytes.count == expectedPayloadLen)
+            #expect(!payloadBytes.contains(0xFF))
+        }
+    }
+
     // MARK: - Field accessors
 
     @Test func fieldAccessors() {

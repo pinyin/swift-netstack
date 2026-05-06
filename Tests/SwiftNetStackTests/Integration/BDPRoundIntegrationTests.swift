@@ -32,9 +32,9 @@ struct BDPRoundIntegrationTests {
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
         let routingTable = RoutingTable()
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: routingTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: routingTable, udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -75,9 +75,9 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -95,9 +95,9 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -127,9 +127,9 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -159,10 +159,10 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
         #expect(!arpMapping.isKnown(requestedIP))
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect(arpMapping.isKnown(requestedIP))
         #expect(arpMapping.lookup(ip: requestedIP) == clientMAC)
@@ -177,6 +177,8 @@ struct BDPRoundIntegrationTests {
 
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
+        var udpTable = UDPSocketTable()
+        var reasm = IPFragmentReassembler()
 
         // Round 1: REQUEST (allocate lease)
         let requestFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 1, chaddr: clientMAC, msgType: .request, extraOptions: [
@@ -185,7 +187,7 @@ struct BDPRoundIntegrationTests {
         ]))
         var transport1: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: requestFrame)])
         let round1 = RoundContext()
-        bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round1)
+        bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round1)
 
         #expect(arpMapping.isKnown(requestedIP))
 
@@ -193,7 +195,7 @@ struct BDPRoundIntegrationTests {
         let releaseFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: clientMAC, msgType: .release))
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: releaseFrame)])
         let round2 = RoundContext()
-        bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round2)
+        bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round2)
 
         #expect(!arpMapping.isKnown(requestedIP))
 
@@ -201,7 +203,7 @@ struct BDPRoundIntegrationTests {
         let discoverFrame = makeDHCPFrame(clientMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
         var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discoverFrame)])
         let round3 = RoundContext()
-        bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round3)
+        bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round3)
 
         #expect(!(transport3 as! InMemoryTransport).outputs.isEmpty)
     }
@@ -230,9 +232,9 @@ struct BDPRoundIntegrationTests {
         ])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         // Should get 2 replies: ARP reply + DHCP OFFER
         #expect((transport as! InMemoryTransport).outputs.count == 2)
@@ -250,9 +252,9 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
         var dhcpServer = DHCPServer(endpoints: [ep])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -286,6 +288,65 @@ struct BDPRoundIntegrationTests {
         #expect(icmp.sequenceNumber == 0x0001)
     }
 
+    // MARK: - Audit issue #5: DHCP reply missing UDP checksum
+
+    /// AUDIT #5 REPRODUCTION: `buildDHCPFrame` constructs the UDP header for DHCP
+    /// replies with checksum=0 (left as zero by `initializeMemory`). While RFC 768
+    /// permits zero checksum for IPv4 UDP, this is not best practice — strict
+    /// clients may reject it. Compare `buildUDPFrame` which correctly computes
+    /// the UDP pseudo-header checksum.
+    ///
+    /// EXPECTED: DHCP reply UDP checksum is non-zero and valid
+    /// ACTUAL:   checksum is 0 (BUG / suboptimal)
+    @Test func dhcpReplyHasValidUDPChecksum() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+
+        let dhcpDiscover = makeDHCPPacketBytes(op: 1, xid: 42, chaddr: clientMAC, msgType: .discover)
+        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpDiscover)
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer,
+                 routingTable: RoutingTable(), udpSocketTable: &udpTable,
+                 ipFragmentReassembler: &reasm, round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let eth = EthernetFrame.parse(from: reply),
+              eth.etherType == .ipv4,
+              let ip = IPv4Header.parse(from: eth.payload),
+              ip.protocol == .udp else {
+            Issue.record("failed to parse DHCP reply wrapper")
+            return
+        }
+
+        // Parse UDP header with pseudo-addresses to verify checksum
+        guard let udp = UDPHeader.parse(
+            from: ip.payload,
+            pseudoSrcAddr: ip.srcAddr,
+            pseudoDstAddr: ip.dstAddr
+        ) else {
+            Issue.record("failed to parse UDP header from DHCP reply")
+            return
+        }
+
+        #expect(udp.srcPort == 67, "DHCP server port should be 67")
+        #expect(udp.dstPort == 68, "DHCP client port should be 68")
+
+        // RFC 768 allows checksum=0 for IPv4 UDP, but it's not best practice.
+        // buildUDPFrame computes a real checksum; buildDHCPFrame should too.
+        #expect(udp.checksum != 0,
+            "AUDIT #5 FAIL: DHCP reply UDP checksum is 0 (unused); should compute real checksum")
+        #expect(udp.verifyChecksum(),
+            "AUDIT #5 FAIL: DHCP reply UDP checksum missing")
+    }
+
     // MARK: - L2 forwarding
 
     @Test func unicastToKnownVMIsForwarded() {
@@ -309,9 +370,9 @@ struct BDPRoundIntegrationTests {
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: l2Frame)])
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 1)
@@ -342,9 +403,9 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: l2Frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep1])
         var dhcpServer = DHCPServer(endpoints: [ep1])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -368,9 +429,9 @@ struct BDPRoundIntegrationTests {
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: arpFrame)])
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -414,9 +475,9 @@ struct BDPRoundIntegrationTests {
             (endpointID: 1, packet: forwardFrame),
         ])
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 2)
@@ -436,11 +497,157 @@ struct BDPRoundIntegrationTests {
         var transport: any Transport = InMemoryTransport()
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint()])
         var dhcpServer = DHCPServer(endpoints: [makeEndpoint()])
-        let round = RoundContext()
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    // MARK: - UDP echo
+
+    @Test func udpEchoRequestGeneratesReply() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        let payload: [UInt8] = [0x70, 0x69, 0x6E, 0x67]
+        let frame = makeUDPFrame(
+            clientMAC: clientMAC,
+            srcIP: clientIP, dstIP: gateway,
+            srcPort: 1234, dstPort: 7,
+            payload: payload
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+        udpTable.register(port: 7, socket: UDPEchoSocket())
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.count == 1)
+        guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
+        #expect((transport as! InMemoryTransport).outputs[0].endpointID == 1)
+
+        let reply = (transport as! InMemoryTransport).outputs[0].packet
+        guard let eth = EthernetFrame.parse(from: reply),
+              let ip = IPv4Header.parse(from: eth.payload),
+              let udp = UDPHeader.parse(from: ip.payload, pseudoSrcAddr: ip.srcAddr, pseudoDstAddr: ip.dstAddr) else {
+            Issue.record("failed to parse UDP echo reply")
+            return
+        }
+        #expect(eth.dstMAC == clientMAC)
+        #expect(eth.srcMAC == hostMAC)
+        #expect(ip.srcAddr == gateway)
+        #expect(ip.dstAddr == clientIP)
+        #expect(udp.srcPort == 7)
+        #expect(udp.dstPort == 1234)
+        #expect(udp.verifyChecksum())
+        udp.payload.withUnsafeReadableBytes { buf in
+            #expect([UInt8](buf) == payload)
+        }
+    }
+
+    @Test func udpEchoPayloadPreserved() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        let payload: [UInt8] = Array(0..<255)
+        let frame = makeUDPFrame(
+            clientMAC: clientMAC,
+            srcIP: clientIP, dstIP: gateway,
+            srcPort: 9999, dstPort: 7,
+            payload: payload
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+        udpTable.register(port: 7, socket: UDPEchoSocket())
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
+
+        guard (transport as! InMemoryTransport).outputs.count == 1,
+              let eth = EthernetFrame.parse(from: (transport as! InMemoryTransport).outputs[0].packet),
+              let ip = IPv4Header.parse(from: eth.payload),
+              let udp = UDPHeader.parse(from: ip.payload, pseudoSrcAddr: ip.srcAddr, pseudoDstAddr: ip.dstAddr) else {
+            Issue.record("failed to parse UDP echo reply")
+            return
+        }
+        #expect(udp.payload.totalLength == 255)
+        udp.payload.withUnsafeReadableBytes { buf in
+            #expect([UInt8](buf) == payload)
+        }
+    }
+
+    @Test func udpNonRegisteredPortIgnored() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        // Send to port 53 (no socket registered)
+        let frame = makeUDPFrame(
+            clientMAC: clientMAC,
+            srcIP: clientIP, dstIP: gateway,
+            srcPort: 1234, dstPort: 53,
+            payload: [0xAA, 0xBB]
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+        // Register echo on port 7 only — port 53 has no socket
+        udpTable.register(port: 7, socket: UDPEchoSocket())
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
+
+        #expect((transport as! InMemoryTransport).outputs.isEmpty)
+    }
+
+    @Test func mixedUDPAndICMPTraffic() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        // Frame 1: ICMP echo request
+        let icmpFrame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x42, seq: 0x01)
+
+        // Frame 2: UDP echo request to port 7
+        let udpFrame = makeUDPFrame(
+            clientMAC: clientMAC,
+            srcIP: clientIP, dstIP: gateway,
+            srcPort: 5555, dstPort: 7,
+            payload: [0x48, 0x65, 0x6C, 0x6C, 0x6F]
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [
+            (endpointID: 1, packet: icmpFrame),
+            (endpointID: 1, packet: udpFrame),
+        ])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+        udpTable.register(port: 7, socket: UDPEchoSocket())
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, routingTable: RoutingTable(), udpSocketTable: &udpTable, ipFragmentReassembler: &reasm, round: round)
+
+        let outputs = (transport as! InMemoryTransport).outputs
+        #expect(outputs.count == 2)
+
+        var icmpReplies = 0, udpReplies = 0
+        for out in outputs {
+            guard let eth = EthernetFrame.parse(from: out.packet),
+                  let ip = IPv4Header.parse(from: eth.payload) else { continue }
+            if ip.protocol == .icmp { icmpReplies += 1 }
+            if ip.protocol == .udp { udpReplies += 1 }
+        }
+        #expect(icmpReplies == 1, "expected 1 ICMP reply")
+        #expect(udpReplies == 1, "expected 1 UDP reply")
     }
 
     // MARK: - Helpers
@@ -569,6 +776,63 @@ struct BDPRoundIntegrationTests {
             src: clientMAC,
             type: .ipv4,
             payload: ipBytes + udpBytes + dhcpPayload
+        )
+    }
+
+    /// Build a full Ethernet/IPv4/UDP frame with computed checksums.
+    private func makeUDPFrame(
+        clientMAC: MACAddress,
+        srcIP: IPv4Address, dstIP: IPv4Address,
+        srcPort: UInt16, dstPort: UInt16,
+        payload: [UInt8]
+    ) -> PacketBuffer {
+        let udpLen = 8 + payload.count
+        let ipTotalLen = 20 + udpLen
+
+        // IPv4 header
+        var ipBytes = [UInt8](repeating: 0, count: 20)
+        ipBytes[0] = 0x45
+        ipBytes[2] = UInt8(ipTotalLen >> 8)
+        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
+        ipBytes[6] = 0x40; ipBytes[7] = 0x00  // DF flag
+        ipBytes[8] = 64
+        ipBytes[9] = IPProtocol.udp.rawValue
+        srcIP.write(to: &ipBytes[12])
+        dstIP.write(to: &ipBytes[16])
+        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
+        ipBytes[10] = UInt8(ipCksum >> 8)
+        ipBytes[11] = UInt8(ipCksum & 0xFF)
+
+        // UDP header: zero checksum for now, compute later
+        var udpBytes: [UInt8] = []
+        udpBytes.append(UInt8(srcPort >> 8))
+        udpBytes.append(UInt8(srcPort & 0xFF))
+        udpBytes.append(UInt8(dstPort >> 8))
+        udpBytes.append(UInt8(dstPort & 0xFF))
+        udpBytes.append(UInt8(udpLen >> 8))
+        udpBytes.append(UInt8(udpLen & 0xFF))
+        udpBytes.append(0); udpBytes.append(0)  // checksum
+        udpBytes.append(contentsOf: payload)
+
+        // Compute UDP checksum over pseudo-header
+        var ckBuf = [UInt8](repeating: 0, count: 12 + udpLen)
+        var ipOut = [UInt8](repeating: 0, count: 4)
+        srcIP.write(to: &ipOut); ckBuf[0...3] = ipOut[0...3]
+        dstIP.write(to: &ipOut); ckBuf[4...7] = ipOut[0...3]
+        ckBuf[9] = IPProtocol.udp.rawValue
+        ckBuf[10] = UInt8(udpLen >> 8)
+        ckBuf[11] = UInt8(udpLen & 0xFF)
+        for i in 0..<udpLen { ckBuf[12 + i] = udpBytes[i] }
+        let ck = ckBuf.withUnsafeBytes { internetChecksum($0) }
+        let finalCk = ck == 0 ? 0xFFFF : ck
+        udpBytes[6] = UInt8(finalCk >> 8)
+        udpBytes[7] = UInt8(finalCk & 0xFF)
+
+        return makeEthernetFrame(
+            dst: hostMAC,
+            src: clientMAC,
+            type: .ipv4,
+            payload: ipBytes + udpBytes
         )
     }
 

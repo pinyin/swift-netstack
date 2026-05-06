@@ -414,7 +414,7 @@ struct DeliberationLoopE2ETests {
               ip.protocol == .udp else { return nil }
         let udpPayload = ip.payload
         guard udpPayload.totalLength >= 8 else { return nil }
-        let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8)
+        guard let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8) else { return nil }
         return DHCPPacket.parse(from: dhcpPayload)
     }
 

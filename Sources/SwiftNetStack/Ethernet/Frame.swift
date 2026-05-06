@@ -26,7 +26,7 @@ public struct EthernetFrame {
 
             guard let etherType = EtherType(rawValue: rawEtherType) else { return nil }
 
-            let payload = pkt.slice(from: 14, length: pkt.totalLength - 14)
+            guard let payload = pkt.slice(from: 14, length: pkt.totalLength - 14) else { return nil }
             return EthernetFrame(dstMAC: dstMAC, srcMAC: srcMAC, etherType: etherType, payload: payload)
         }
     }

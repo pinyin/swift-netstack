@@ -454,7 +454,7 @@ struct BDPRoundIntegrationTests {
         // Skip UDP header (8 bytes)
         let udpPayload = ip.payload
         guard udpPayload.totalLength >= 8 else { return nil }
-        let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8)
+        guard let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8) else { return nil }
         return DHCPPacket.parse(from: dhcpPayload)
     }
 
@@ -475,7 +475,7 @@ struct BDPRoundIntegrationTests {
     /// Extract the payload after the 14-byte Ethernet header as raw bytes.
     private func extractEtherPayload(_ pkt: PacketBuffer) -> [UInt8] {
         guard pkt.totalLength > 14 else { return [] }
-        let payload = pkt.slice(from: 14, length: pkt.totalLength - 14)
+        guard let payload = pkt.slice(from: 14, length: pkt.totalLength - 14) else { return [] }
         return payload.withUnsafeReadableBytes { Array($0) }
     }
 

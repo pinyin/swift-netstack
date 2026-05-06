@@ -203,6 +203,68 @@ struct DHCPServerTests {
         #expect(dhcp.process(packet: decline, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpointID: 1, arpMapping: &arp, round: round) == nil)
     }
 
+    // MARK: - Pending offer expiration (CRITICAL: IP pool leak fix)
+
+    @Test func discoverWithoutRequestReclaimsIPAfterTimeout() {
+        // /30 subnet: network .0, gateway .1, broadcast .3 → only .2 available
+        let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 30)
+        let gateway = IPv4Address(100, 64, 1, 1)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+
+        // offerTimeout: 0 means offers expire instantly
+        var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)], offerTimeout: 0)
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        let round = RoundContext()
+
+        // First DISCOVER → OFFER (IP allocated as pending, expires immediately since timeout=0)
+        let d1 = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01),
+                            messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let result1 = dhcp.process(packet: d1, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01),
+                                   endpointID: 1, arpMapping: &arp, round: round)
+        #expect(result1 != nil)
+
+        // Second DISCOVER should also succeed — the first offer expired and IP was reclaimed
+        let d2 = DHCPPacket(op: 1, xid: 2, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
+                            messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let result2 = dhcp.process(packet: d2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
+                                   endpointID: 1, arpMapping: &arp, round: round)
+        #expect(result2 != nil, "Second DISCOVER should succeed after pending offer expired — pool leak regression")
+    }
+
+    @Test func discoverConfirmedByRequestDoesNotLeak() {
+        // Verify that a properly completed DISCOVER→REQUEST flow does NOT leak
+        let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 30)
+        let gateway = IPv4Address(100, 64, 1, 1)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01)
+        let requestedIP = IPv4Address(100, 64, 1, 2)  // the only available IP in /30
+
+        var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)], offerTimeout: 0)
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        let round = RoundContext()
+
+        // DISCOVER → OFFER (IP becomes pending)
+        let discover = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC,
+                                   messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let offerResult = dhcp.process(packet: discover, srcMAC: clientMAC,
+                                        endpointID: 1, arpMapping: &arp, round: round)
+        #expect(offerResult != nil)
+
+        // REQUEST → ACK (IP confirmed, removed from pending)
+        let request = DHCPPacket(op: 1, xid: 2, chaddr: clientMAC, messageType: .request,
+                                  requestedIP: requestedIP, serverIdentifier: gateway)
+        let ackResult = dhcp.process(packet: request, srcMAC: clientMAC,
+                                      endpointID: 1, arpMapping: &arp, round: round)
+        #expect(ackResult != nil)
+
+        // Now another DISCOVER should fail — the IP is legitimately leased, not pending
+        let discover2 = DHCPPacket(op: 1, xid: 3, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
+                                    messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let exhaustedResult = dhcp.process(packet: discover2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
+                                           endpointID: 1, arpMapping: &arp, round: round)
+        #expect(exhaustedResult == nil, "Pool should be exhausted after confirmed lease, not pending offer")
+    }
+
     // MARK: - Full flow: DISCOVER → REQUEST
 
     @Test func fullDiscoverThenRequestFlow() {

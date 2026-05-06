@@ -358,24 +358,13 @@ func debugValidateARPPhase(
 // MARK: DHCP (RFC 2131) — Phase 8
 
 /// Extract a DHCP packet from within a wrapped Ethernet→IP→UDP→DHCP reply frame.
-/// Returns nil if any layer fails to parse or ports don't match.
+/// Delegates to the shared `extractDHCP` after unwrapping protocol layers.
 private func extractDHCPFromReplyFrame(_ pkt: PacketBuffer) -> DHCPPacket? {
     guard let eth = EthernetFrame.parse(from: pkt),
           eth.etherType == .ipv4,
           let ip = IPv4Header.parse(from: eth.payload),
           ip.protocol == .udp else { return nil }
-
-    var udpPkt = ip.payload
-    guard udpPkt.totalLength >= 8 else { return nil }
-    guard udpPkt.pullUp(8) else { return nil }
-
-    return udpPkt.withUnsafeReadableBytes { buf -> DHCPPacket? in
-        let srcPort = (UInt16(buf[0]) << 8) | UInt16(buf[1])
-        let dstPort = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-        guard srcPort == 67, dstPort == 68 else { return nil }
-        let dhcpPayload = udpPkt.slice(from: 8, length: udpPkt.totalLength - 8)
-        return DHCPPacket.parse(from: dhcpPayload)
-    }
+    return extractDHCP(from: ip.payload, srcPort: 67, dstPort: 68)
 }
 
 func debugValidateDHCPPhase(

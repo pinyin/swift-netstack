@@ -273,19 +273,20 @@ public func bdpRound(
 }
 
 /// Extract a DHCP packet from a UDP datagram payload.
-/// Returns nil if the destination port is not 67 (DHCP server) or if
-/// the DHCP packet is malformed.
-func extractDHCP(from udpPayload: PacketBuffer) -> DHCPPacket? {
+/// Returns nil if the destination port doesn't match or the DHCP packet is malformed.
+func extractDHCP(from udpPayload: PacketBuffer, srcPort: UInt16? = nil, dstPort: UInt16? = 67) -> DHCPPacket? {
     var pkt = udpPayload
     // UDP header: srcPort(2) + dstPort(2) + length(2) + checksum(2) = 8
     guard pkt.totalLength >= 8 else { return nil }
     guard pkt.pullUp(8) else { return nil }
 
     return pkt.withUnsafeReadableBytes { buf in
-        let dstPort = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-        guard dstPort == 67 else { return nil }
+        let sp = (UInt16(buf[0]) << 8) | UInt16(buf[1])
+        let dp = (UInt16(buf[2]) << 8) | UInt16(buf[3])
+        if let expected = srcPort, sp != expected { return nil }
+        if let expected = dstPort, dp != expected { return nil }
 
-        let dhcpPayload = pkt.slice(from: 8, length: pkt.totalLength - 8)
+        guard let dhcpPayload = pkt.slice(from: 8, length: pkt.totalLength - 8) else { return nil }
         return DHCPPacket.parse(from: dhcpPayload)
     }
 }

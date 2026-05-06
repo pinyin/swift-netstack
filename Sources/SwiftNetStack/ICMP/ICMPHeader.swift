@@ -31,7 +31,7 @@ public struct ICMPHeader {
             let identifier = (UInt16(buf[4]) << 8) | UInt16(buf[5])
             let sequenceNumber = (UInt16(buf[6]) << 8) | UInt16(buf[7])
 
-            let payload = pkt.slice(from: 8, length: pkt.totalLength - 8)
+            guard let payload = pkt.slice(from: 8, length: pkt.totalLength - 8) else { return nil }
 
             return ICMPHeader(
                 type: type, code: code, checksum: checksum,

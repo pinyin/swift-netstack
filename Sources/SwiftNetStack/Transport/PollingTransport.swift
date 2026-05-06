@@ -52,18 +52,22 @@ private func configureNetworkFD(_ fd: Int32) {
 /// EAGAIN → internal pending queue, retried on next poll writability.
 public struct PollingTransport: Transport {
     private var endpointsByFD: [Int32: VMEndpoint]
+    private var fdByEndpointID: [Int: Int32]
     private var mtuByFD: [Int32: Int]
     private var pendingWrites: [(endpointID: Int, packet: PacketBuffer)] = []
 
     public init(endpoints: [VMEndpoint]) {
         var byFD: [Int32: VMEndpoint] = [:]
+        var fdByEP: [Int: Int32] = [:]
         var mtu: [Int32: Int] = [:]
         for ep in endpoints {
             byFD[ep.fd] = ep
+            fdByEP[ep.id] = ep.fd
             mtu[ep.fd] = ep.mtu
             configureNetworkFD(ep.fd)
         }
         self.endpointsByFD = byFD
+        self.fdByEndpointID = fdByEP
         self.mtuByFD = mtu
     }
 
@@ -92,7 +96,9 @@ public struct PollingTransport: Transport {
             let badMask = Int16(POLLNVAL | POLLERR | POLLHUP)
             guard pfd.revents & badMask != 0 else { continue }
             let fd = fds[i]
-            endpointsByFD.removeValue(forKey: fd)
+            if let ep = endpointsByFD.removeValue(forKey: fd) {
+                fdByEndpointID.removeValue(forKey: ep.id)
+            }
             mtuByFD.removeValue(forKey: fd)
         }
 
@@ -124,10 +130,9 @@ public struct PollingTransport: Transport {
 
     public mutating func writePackets(_ packets: [(endpointID: Int, packet: PacketBuffer)]) {
         for (epID, pkt) in packets {
-            guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
+            guard let fd = fdByEndpointID[epID] else {
                 continue
             }
-            let fd = entry.key
 
             let written = pkt.sendmsg(to: fd, flags: Int32(MSG_DONTWAIT))
             if written < 0, errno == EAGAIN {
@@ -151,10 +156,9 @@ public struct PollingTransport: Transport {
 
         var remaining: [(endpointID: Int, packet: PacketBuffer)] = []
         for (epID, pkt) in pendingWrites {
-            guard let entry = endpointsByFD.first(where: { $0.value.id == epID }) else {
+            guard let fd = fdByEndpointID[epID] else {
                 continue
             }
-            let fd = entry.key
             guard writableFDs.contains(fd) else {
                 remaining.append((epID, pkt))
                 continue

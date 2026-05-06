@@ -128,7 +128,10 @@ struct PacketBufferTests {
         }
         for i in 0..<50 { ptr.advanced(by: i).storeBytes(of: UInt8(i), as: UInt8.self) }
 
-        let s = pkt.slice(from: 10, length: 20)
+        guard let s = pkt.slice(from: 10, length: 20) else {
+            Issue.record("slice returned nil")
+            return
+        }
         #expect(s.totalLength == 20)
         s.withUnsafeReadableBytes { buf in
             let bytes = [UInt8](buf)
@@ -151,7 +154,10 @@ struct PacketBufferTests {
         pkt.appendView(pkt2)
 
         // Slice across the boundary
-        let s = pkt.slice(from: 15, length: 10)
+        guard let s = pkt.slice(from: 15, length: 10) else {
+            Issue.record("slice returned nil")
+            return
+        }
         #expect(s.totalLength == 10)
         s.withUnsafeReadableBytes { buf in
             let bytes = [UInt8](buf)

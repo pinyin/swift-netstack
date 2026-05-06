@@ -61,7 +61,7 @@ public struct IPv4Header {
             let srcAddr = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[12..<16]))
             let dstAddr = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[16..<20]))
 
-            let payload = pkt.slice(from: headerLen, length: pkt.totalLength - headerLen)
+            guard let payload = pkt.slice(from: headerLen, length: pkt.totalLength - headerLen) else { return nil }
 
             // Compute checksum from raw bytes covering IHL*4 bytes (includes options)
             let headerBuf = UnsafeRawBufferPointer(start: buf.baseAddress!, count: headerLen)

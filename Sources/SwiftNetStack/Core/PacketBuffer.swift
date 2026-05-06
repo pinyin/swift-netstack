@@ -77,8 +77,8 @@ public struct PacketBuffer {
     // MARK: - Zero-copy read operations
 
     /// Create a new view into a subrange (zero-copy, shares Storage).
-    /// - Precondition: `from + length` ≤ totalLength
-    public func slice(from start: Int, length: Int) -> PacketBuffer {
+    /// Returns nil if `from + length` exceeds totalLength.
+    public func slice(from start: Int, length: Int) -> PacketBuffer? {
         precondition(start >= 0 && length >= 0)
         var remaining = start
         var need = length
@@ -98,7 +98,7 @@ public struct PacketBuffer {
             if need == 0 { break }
         }
 
-        precondition(need == 0, "slice range exceeds buffer length")
+        guard need == 0 else { return nil }
         var pb = PacketBuffer.empty
         pb._views = newViews
         return pb

@@ -77,6 +77,7 @@ public func classifyFrames(
         case .icmp: result.ipv4ICMP.append((eth, ip))
         case .tcp:  result.ipv4TCP.append((eth, ip))
         case .udp:  result.ipv4UDP.append((eth, ip))
+        default:    result.ipv4Unknown.append((eth, ip))
         }
     }
 

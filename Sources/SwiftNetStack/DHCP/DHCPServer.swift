@@ -1,14 +1,19 @@
+import Darwin
+
 /// Simplified DHCP server (RFC 2131 subset).
 ///
 /// Handles DISCOVER → OFFER, REQUEST → ACK, RELEASE → reclaim.
 /// Writes IP→MAC mappings into ARPMapping on lease allocation.
+///
+/// `offerTimeout`: seconds before an unconfirmed OFFER is reclaimed.
+/// Set to 0 in tests to instantly expire pending offers.
 public struct DHCPServer {
     private var pools: [Int: DHCPPool]   // endpointID → pool
 
-    public init(endpoints: [VMEndpoint]) {
+    public init(endpoints: [VMEndpoint], offerTimeout: UInt64 = 60) {
         var pools: [Int: DHCPPool] = [:]
         for ep in endpoints {
-            pools[ep.id] = DHCPPool(subnet: ep.subnet, gateway: ep.gateway)
+            pools[ep.id] = DHCPPool(subnet: ep.subnet, gateway: ep.gateway, offerTimeout: offerTimeout)
         }
         self.pools = pools
     }
@@ -57,7 +62,11 @@ public struct DHCPServer {
         packet: DHCPPacket, srcMAC: MACAddress,
         endpointID: Int, pool: inout DHCPPool, round: RoundContext
     ) -> PacketBuffer? {
-        guard let offeredIP = pool.allocate() else { return nil }
+        // Reclaim expired pending offers before allocating.
+        // RFC 2131 §4.4.1: servers SHOULD reuse addresses from clients that
+        // fail to complete the handshake within a reasonable time.
+        pool.reapExpiredOffers()
+        guard let offeredIP = pool.allocate(clientMAC: srcMAC) else { return nil }
 
         return buildDHCPReply(
             messageType: .offer,
@@ -99,6 +108,7 @@ public struct DHCPServer {
 
         // Confirm the lease
         pool.confirm(requestedIP, mac: srcMAC)
+        pool.removePendingOffer(requestedIP)
         arpMapping.add(ip: requestedIP, mac: srcMAC, endpointID: endpointID)
 
         return buildDHCPReply(
@@ -122,6 +132,7 @@ public struct DHCPServer {
         // In our simplified impl, we trust the chaddr and release its lease
         if let ip = pool.ipForMAC(srcMAC) {
             pool.release(ip)
+            pool.removePendingOffer(ip)
             arpMapping.remove(ip: ip)
         }
     }
@@ -208,13 +219,18 @@ private struct DHCPPool {
     let subnet: IPv4Subnet
     let gateway: IPv4Address
     let leaseTime: UInt32 = 3600   // 1 hour
+    let offerTimeout: UInt64       // seconds before unconfirmed OFFER expires
 
     private var available: Set<UInt32>
     private var leases: [UInt32: MACAddress] = [:]  // ip.addr → mac
+    /// IPs allocated by DISCOVER but not yet confirmed by REQUEST.
+    /// Each entry records the (address, clientMAC, deadline as seconds-since-epoch).
+    private var pendingOffers: [(addr: UInt32, mac: MACAddress, deadline: UInt64)] = []
 
-    init(subnet: IPv4Subnet, gateway: IPv4Address) {
+    init(subnet: IPv4Subnet, gateway: IPv4Address, offerTimeout: UInt64 = 60) {
         self.subnet = subnet
         self.gateway = gateway
+        self.offerTimeout = offerTimeout
 
         // Available: all IPs in subnet except network, gateway, and broadcast
         let netAddr = subnet.network.addr
@@ -233,16 +249,66 @@ private struct DHCPPool {
         self.available = ips
     }
 
-    /// Allocate a free IP. Returns nil if pool exhausted.
-    mutating func allocate() -> IPv4Address? {
+    // MARK: - Time
+
+    private static func now() -> UInt64 {
+        UInt64(Darwin.time(nil))
+    }
+
+    // MARK: - Offer expiration
+
+    /// Reclaim expired pending offers, returning their IPs to the available pool.
+    mutating func reapExpiredOffers() {
+        let currentTime = Self.now()
+        var reclaimed: [UInt32] = []
+        pendingOffers.removeAll { offer in
+            if offer.deadline <= currentTime {
+                reclaimed.append(offer.addr)
+                return true
+            }
+            return false
+        }
+        for addr in reclaimed {
+            available.insert(addr)
+        }
+    }
+
+    // MARK: - Pool operations
+
+    /// Allocate a free IP for a DISCOVER. Records a pending offer with expiration.
+    /// Returns nil if pool exhausted.
+    mutating func allocate(clientMAC: MACAddress) -> IPv4Address? {
+        // Reap expired offers before every allocation attempt
+        reapExpiredOffers()
+
         guard let addr = available.popFirst() else { return nil }
+
+        let deadline = Self.now() + offerTimeout
+        pendingOffers.append((addr: addr, mac: clientMAC, deadline: deadline))
+
+        #if DEBUG
+        // Pool integrity: the sum of available + leased + pending must be
+        // invariant (total pool size minus reserved addresses).
+        // This catches both leaks and double-allocations.
+        debugCheckPoolIntegrity()
+        #endif
+
         return IPv4Address(addr: addr)
     }
 
-    /// Confirm a lease.
+    /// Confirm a lease (REQUEST → ACK). Moves IP from available to leases.
     mutating func confirm(_ ip: IPv4Address, mac: MACAddress) {
         available.remove(ip.addr)
         leases[ip.addr] = mac
+    }
+
+    /// Remove an IP from pending offers (called on REQUEST or RELEASE).
+    mutating func removePendingOffer(_ ip: IPv4Address) {
+        pendingOffers.removeAll { $0.addr == ip.addr }
+
+        #if DEBUG
+        debugCheckPoolIntegrity()
+        #endif
     }
 
     /// Release an IP back to the pool.
@@ -263,6 +329,27 @@ private struct DHCPPool {
     func macForIP(_ ip: IPv4Address) -> MACAddress? {
         return leases[ip.addr]
     }
+
+    // MARK: - DEBUG integrity check
+
+    #if DEBUG
+    private func debugCheckPoolIntegrity() {
+        // Pool size invariant: the total pool is all addresses from
+        // (max(netAddr+1, gwAddr+1)) to broadcast, clamped to 65536.
+        // available + leased + pending should sum to the initial pool size.
+        let totalTracked = available.count + leases.count + pendingOffers.count
+        // There's no regression in release: compute the expected total
+        let netAddr = subnet.network.addr
+        let bcAddr = subnet.broadcast.addr
+        let gwAddr = gateway.addr
+        let start = max(netAddr + 1, gwAddr + 1)
+        if start < bcAddr {
+            let expectedTotal = Int(min(bcAddr - start, 65536))
+            precondition(totalTracked == expectedTotal,
+                "DHCP pool integrity violation: available(\(available.count)) + leased(\(leases.count)) + pending(\(pendingOffers.count)) = \(totalTracked), expected \(expectedTotal)")
+        }
+    }
+    #endif
 }
 
 // MARK: - Helpers

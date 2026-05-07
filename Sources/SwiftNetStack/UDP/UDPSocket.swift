@@ -1,8 +1,8 @@
-/// Protocol for UDP socket implementations.
+/// Protocol for socket handler implementations.
 ///
-/// Each registered socket handles datagrams addressed to its port.
-/// Sockets produce outbound frames by appending to `replies`.
-public protocol UDPSocket {
+/// Each registered handler processes transport-layer data addressed to its port.
+/// Handlers produce outbound frames by appending to `replies`.
+public protocol SocketHandler {
     func handleDatagram(
         payload: PacketBuffer,
         srcIP: IPv4Address,
@@ -17,23 +17,23 @@ public protocol UDPSocket {
     )
 }
 
-/// Port → socket registry.
+/// Port → handler registry.
 ///
 /// Simple mutable value type passed via `inout`, following the `ARPMapping` pattern.
-public struct UDPSocketTable {
-    private var sockets: [UInt16: any UDPSocket] = [:]
+public struct SocketRegistry {
+    private var handlers: [UInt16: any SocketHandler] = [:]
 
     public init() {}
 
-    public mutating func register(port: UInt16, socket: any UDPSocket) {
-        sockets[port] = socket
+    public mutating func register(port: UInt16, handler: any SocketHandler) {
+        handlers[port] = handler
     }
 
     public mutating func unregister(port: UInt16) {
-        sockets[port] = nil
+        handlers[port] = nil
     }
 
-    public func lookup(port: UInt16) -> (any UDPSocket)? {
-        sockets[port]
+    public func lookup(port: UInt16) -> (any SocketHandler)? {
+        handlers[port]
     }
 }

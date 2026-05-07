@@ -17,16 +17,20 @@ public struct DeliberationLoop {
     public var arpMapping: ARPMapping
     public var dhcpServer: DHCPServer
     public let routingTable: RoutingTable
-    public var udpSocketTable: UDPSocketTable
+    public var socketRegistry: SocketRegistry
     public var ipFragmentReassembler: IPFragmentReassembler
+    public var natTable: NATTable
+    public var dnsServer: DNSServer
 
-    public init(endpoints: [VMEndpoint], hostMAC: MACAddress) {
+    public init(endpoints: [VMEndpoint], hostMAC: MACAddress, portForwards: [PortForwardEntry] = [], hosts: [String: IPv4Address] = [:]) {
         self.hostMAC = hostMAC
         self.arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: endpoints)
         self.dhcpServer = DHCPServer(endpoints: endpoints)
         self.routingTable = RoutingTable()
-        self.udpSocketTable = UDPSocketTable()
+        self.socketRegistry = SocketRegistry()
         self.ipFragmentReassembler = IPFragmentReassembler()
+        self.natTable = NATTable(portForwards: portForwards)
+        self.dnsServer = DNSServer(hosts: hosts)
     }
 
     /// Execute one BDP deliberation round.
@@ -40,9 +44,11 @@ public struct DeliberationLoop {
             transport: &transport,
             arpMapping: &arpMapping,
             dhcpServer: &dhcpServer,
+            dnsServer: &dnsServer,
             routingTable: routingTable,
-            udpSocketTable: &udpSocketTable,
+            socketRegistry: &socketRegistry,
             ipFragmentReassembler: &ipFragmentReassembler,
+            natTable: &natTable,
             round: round
         )
         return replyCount

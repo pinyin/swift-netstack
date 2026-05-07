@@ -30,8 +30,13 @@ public struct UDPHeader {
         pseudoDstAddr: IPv4Address
     ) -> UDPHeader? {
         var pkt = pkt
-        guard pkt.totalLength >= 8 else { return nil }
-        guard pkt.pullUp(8) else { return nil }
+        let tl = pkt.totalLength
+        guard tl >= 8 else {
+            return nil
+        }
+        guard pkt.pullUp(8) else {
+            return nil
+        }
 
         return pkt.withUnsafeReadableBytes { buf in
             let srcPort  = (UInt16(buf[0]) << 8) | UInt16(buf[1])
@@ -39,18 +44,24 @@ public struct UDPHeader {
             let length   = (UInt16(buf[4]) << 8) | UInt16(buf[5])
             let checksum = (UInt16(buf[6]) << 8) | UInt16(buf[7])
 
-            guard Int(length) >= 8 else { return nil }
+            guard Int(length) >= 8 else {
+                return nil
+            }
             // Trim to declared length so payload boundary and pseudo-header
             // checksum both respect the UDP length field (not physical buffer).
             let udpLen = min(Int(length), pkt.totalLength)
             let ckPkt: PacketBuffer
             if udpLen < pkt.totalLength {
-                guard let t = pkt.slice(from: 0, length: udpLen) else { return nil }
+                guard let t = pkt.slice(from: 0, length: udpLen) else {
+                    return nil
+                }
                 ckPkt = t
             } else {
                 ckPkt = pkt
             }
-            guard let payload = ckPkt.slice(from: 8, length: udpLen - 8) else { return nil }
+            guard let payload = ckPkt.slice(from: 8, length: udpLen - 8) else {
+                return nil
+            }
 
             // RFC 768: checksum 0 means unused (IPv4). Non-zero: verify.
             let valid: Bool

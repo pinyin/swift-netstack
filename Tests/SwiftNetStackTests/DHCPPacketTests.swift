@@ -7,7 +7,7 @@ struct DHCPPacketTests {
 
     func makeDHCPBytes(op: UInt8 = 1, xid: UInt32, chaddr: MACAddress,
                        msgType: DHCPMessageType, options: [(UInt8, [UInt8])] = []) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: 247)
+        var bytes = [UInt8](repeating: 0, count: 243)
         bytes[0] = op
         bytes[1] = 1   // htype = Ethernet
         bytes[2] = 6   // hlen = MAC address length
@@ -17,13 +17,13 @@ struct DHCPPacketTests {
         bytes[7] = UInt8(xid & 0xFF)
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
-        // Magic cookie
-        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+        // Magic cookie at offset 236 (RFC 2131 §3: BOOTP header is 236 bytes)
+        bytes[236] = 99; bytes[237] = 130; bytes[238] = 83; bytes[239] = 99
         // Option 53 (required)
-        bytes[244] = 53; bytes[245] = 1; bytes[246] = msgType.rawValue
+        bytes[240] = 53; bytes[241] = 1; bytes[242] = msgType.rawValue
 
         // Append additional options after the base
-        var optIdx = 247
+        var optIdx = 243
         for (code, value) in options {
             if optIdx + 2 + value.count > bytes.count {
                 bytes.append(contentsOf: [UInt8](repeating: 0, count: optIdx + 2 + value.count - bytes.count))
@@ -90,8 +90,8 @@ struct DHCPPacketTests {
     }
 
     @Test func parseTooShort() {
-        let s = Storage.allocate(capacity: 240)
-        let pkt = PacketBuffer(storage: s, offset: 0, length: 240)
+        let s = Storage.allocate(capacity: 236)
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 236)
         #expect(DHCPPacket.parse(from: pkt) == nil)
     }
 
@@ -108,22 +108,22 @@ struct DHCPPacketTests {
     /// ACTUAL:   parse returns nil (BUG)
     @Test func padOptionShouldNotBreakParsing() {
         let chaddr = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-        var bytes = [UInt8](repeating: 0, count: 249)
+        var bytes = [UInt8](repeating: 0, count: 245)
         bytes[0] = 1  // BOOTREQUEST
         bytes[1] = 1  // htype = Ethernet
         bytes[2] = 6  // hlen = MAC address length
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
-        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+        bytes[236] = 99; bytes[237] = 130; bytes[238] = 83; bytes[239] = 99
 
         // Single Pad byte before option 53 — per RFC 2132 §3.1, skip and continue.
-        bytes[244] = 0     // Pad
-        bytes[245] = 53; bytes[246] = 1; bytes[247] = DHCPMessageType.discover.rawValue
-        bytes[248] = 255   // End
+        bytes[240] = 0     // Pad
+        bytes[241] = 53; bytes[242] = 1; bytes[243] = DHCPMessageType.discover.rawValue
+        bytes[244] = 255   // End
 
-        let s = Storage.allocate(capacity: 249)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 249) }
-        let pkt = PacketBuffer(storage: s, offset: 0, length: 249)
+        let s = Storage.allocate(capacity: 245)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 245) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 245)
 
         let result = DHCPPacket.parse(from: pkt)
         #expect(result != nil,
@@ -135,23 +135,23 @@ struct DHCPPacketTests {
     /// AUDIT #1 REPRODUCTION variant: multiple Pad bytes interleaved.
     @Test func multiplePadOptionsShouldNotBreakParsing() {
         let chaddr = MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66)
-        var bytes = [UInt8](repeating: 0, count: 251)
+        var bytes = [UInt8](repeating: 0, count: 247)
         bytes[0] = 1
         bytes[1] = 1  // htype = Ethernet
         bytes[2] = 6  // hlen = MAC address length
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
-        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
+        bytes[236] = 99; bytes[237] = 130; bytes[238] = 83; bytes[239] = 99
 
         // Two Pad bytes before option 53 — common when aligning to word boundaries.
-        bytes[244] = 0     // Pad
-        bytes[245] = 0     // Pad
-        bytes[246] = 53; bytes[247] = 1; bytes[248] = DHCPMessageType.request.rawValue
-        bytes[249] = 50; bytes[250] = 0  // option 50 with zero-length (no End needed)
+        bytes[240] = 0     // Pad
+        bytes[241] = 0     // Pad
+        bytes[242] = 53; bytes[243] = 1; bytes[244] = DHCPMessageType.request.rawValue
+        bytes[245] = 50; bytes[246] = 0  // option 50 with zero-length (no End needed)
 
-        let s = Storage.allocate(capacity: 251)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 251) }
-        let pkt = PacketBuffer(storage: s, offset: 0, length: 251)
+        let s = Storage.allocate(capacity: 247)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 247) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 247)
 
         let result = DHCPPacket.parse(from: pkt)
         #expect(result != nil,
@@ -161,13 +161,13 @@ struct DHCPPacketTests {
     }
 
     @Test func parseBadMagicCookie() {
-        var bytes = [UInt8](repeating: 0, count: 247)
+        var bytes = [UInt8](repeating: 0, count: 243)
         bytes[0] = 1; bytes[1] = 1; bytes[2] = 6  // htype=Ethernet, hlen=MAC addr
-        // Magic cookie = 0,0,0,0 (bad)
-        bytes[244] = 53; bytes[245] = 1; bytes[246] = 1  // valid option after bad cookie
-        let s = Storage.allocate(capacity: 247)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 247) }
-        let pkt = PacketBuffer(storage: s, offset: 0, length: 247)
+        // Magic cookie = 0,0,0,0 (bad at offset 236)
+        bytes[240] = 53; bytes[241] = 1; bytes[242] = 1  // valid option after bad cookie
+        let s = Storage.allocate(capacity: 243)
+        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: 243) }
+        let pkt = PacketBuffer(storage: s, offset: 0, length: 243)
         #expect(DHCPPacket.parse(from: pkt) == nil)
     }
 

@@ -33,25 +33,34 @@ public struct DHCPPacket {
     /// Parse from a UDP payload (PacketBuffer). Returns nil if too short or invalid.
     public static func parse(from pkt: PacketBuffer) -> DHCPPacket? {
         var pkt = pkt
-        // Minimum: 240-byte fixed header + magic cookie (4) + option 53 (3) = 247
-        guard pkt.totalLength >= 247 else { return nil }
+        // Minimum: 236-byte BOOTP header + magic cookie (4) + option 53 (3) = 243
+        let tl = pkt.totalLength
+        guard tl >= 243 else {
+            return nil
+        }
         // Pull up the entire DHCP payload for single-view option scanning.
         // DHCP packets are small (typically ~300 bytes), so this copy is cheap.
         let len = pkt.totalLength
-        guard pkt.pullUp(len) else { return nil }
+        guard pkt.pullUp(len) else {
+            return nil
+        }
 
         return pkt.withUnsafeReadableBytes { buf -> DHCPPacket? in
             let op = buf[0]
             // RFC 2131 §2: htype must be 1 (Ethernet), hlen must be 6 (MAC address).
             // Reject non-Ethernet hardware types to avoid misreading chaddr.
-            guard buf[1] == 1 && buf[2] == 6 else { return nil }
+            guard buf[1] == 1 && buf[2] == 6 else {
+                return nil
+            }
             let xid = (UInt32(buf[4]) << 24) | (UInt32(buf[5]) << 16)
                      | (UInt32(buf[6]) << 8)  |  UInt32(buf[7])
             let ciaddr = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[12..<16]))
             let chaddr = MACAddress(UnsafeRawBufferPointer(rebasing: buf[28..<34]))
 
-            // Options start at offset 240. Must begin with magic cookie.
-            guard buf[240] == 99, buf[241] == 130, buf[242] == 83, buf[243] == 99 else {
+            // BOOTP header is 236 bytes. Magic cookie starts at offset 236
+            // (RFC 2131 §3). DHCP options follow at offset 240.
+            guard buf[236] == 99, buf[237] == 130, buf[238] == 83, buf[239] == 99 else {
+                let mc = (buf[236], buf[237], buf[238], buf[239])
                 return nil // bad magic cookie
             }
 
@@ -59,7 +68,7 @@ public struct DHCPPacket {
             var msgType: DHCPMessageType? = nil
             var reqIP: IPv4Address? = nil
             var serverID: IPv4Address? = nil
-            var i = 244
+            var i = 240
             while i < buf.count {
                 let optCode = buf[i]
                 if optCode == 0 { i += 1; continue }  // Pad — skip, don't terminate (RFC 2132 §3.1)

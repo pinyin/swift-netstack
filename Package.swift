@@ -11,6 +11,14 @@ let package = Package(
             name: "SwiftNetStack",
             path: "Sources/SwiftNetStack"
         ),
+        .executableTarget(
+            name: "SwiftNetStackDemo",
+            dependencies: ["SwiftNetStack"],
+            path: "Sources/SwiftNetStackDemo",
+            linkerSettings: [
+                .linkedFramework("Virtualization")
+            ]
+        ),
         .testTarget(
             name: "SwiftNetStackTests",
             dependencies: ["SwiftNetStack"],

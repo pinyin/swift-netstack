@@ -8,7 +8,7 @@
 /// UDP reflection amplification attacks. When empty (test convenience),
 /// no dstIP filtering is performed. **Production callers must always provide
 /// `localIPs` to prevent UDP reflection amplification.**
-public struct UDPEchoSocket: UDPSocket {
+public struct UDPEchoSocket: SocketHandler {
     public let localIPs: Set<IPv4Address>
 
     public init(localIPs: Set<IPv4Address> = []) {

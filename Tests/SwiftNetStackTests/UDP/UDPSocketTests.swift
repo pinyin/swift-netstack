@@ -4,44 +4,44 @@ import Testing
 @Suite(.serialized)
 struct UDPSocketTests {
 
-    // MARK: - UDPSocketTable
+    // MARK: - SocketRegistry
 
     @Test func registerAndLookup() {
-        var table = UDPSocketTable()
+        var table = SocketRegistry()
         let echo = UDPEchoSocket()
-        table.register(port: 7, socket: echo)
+        table.register(port: 7, handler:echo)
         #expect(table.lookup(port: 7) != nil)
     }
 
     @Test func lookupUnregisteredPortReturnsNil() {
-        let table = UDPSocketTable()
+        let table = SocketRegistry()
         #expect(table.lookup(port: 9999) == nil)
     }
 
     @Test func unregisterRemovesSocket() {
-        var table = UDPSocketTable()
-        table.register(port: 7, socket: UDPEchoSocket())
+        var table = SocketRegistry()
+        table.register(port: 7, handler:UDPEchoSocket())
         table.unregister(port: 7)
         #expect(table.lookup(port: 7) == nil)
     }
 
     @Test func unregisterNonexistentPortIsNoop() {
-        var table = UDPSocketTable()
+        var table = SocketRegistry()
         table.unregister(port: 42)
         #expect(table.lookup(port: 42) == nil)
     }
 
     @Test func reregisterOverwritesSocket() {
-        var table = UDPSocketTable()
-        table.register(port: 7, socket: UDPEchoSocket())
-        table.register(port: 7, socket: UDPEchoSocket())
+        var table = SocketRegistry()
+        table.register(port: 7, handler:UDPEchoSocket())
+        table.register(port: 7, handler:UDPEchoSocket())
         #expect(table.lookup(port: 7) != nil)
     }
 
     @Test func multiplePortsIndependent() {
-        var table = UDPSocketTable()
-        table.register(port: 7, socket: UDPEchoSocket())
-        table.register(port: 53, socket: UDPEchoSocket())
+        var table = SocketRegistry()
+        table.register(port: 7, handler:UDPEchoSocket())
+        table.register(port: 53, handler:UDPEchoSocket())
         #expect(table.lookup(port: 7) != nil)
         #expect(table.lookup(port: 53) != nil)
         table.unregister(port: 7)

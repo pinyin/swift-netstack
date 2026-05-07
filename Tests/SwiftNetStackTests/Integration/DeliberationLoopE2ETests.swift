@@ -489,7 +489,7 @@ struct DeliberationLoopE2ETests {
     private func makeDHCPPacketBytes(op: UInt8, xid: UInt32, chaddr: MACAddress,
                                       msgType: DHCPMessageType,
                                       extraOptions: [(UInt8, [UInt8])] = []) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: 247)
+        var bytes = [UInt8](repeating: 0, count: 243)
         bytes[0] = op
         bytes[1] = 1   // htype = Ethernet
         bytes[2] = 6   // hlen = MAC address length
@@ -499,10 +499,10 @@ struct DeliberationLoopE2ETests {
         bytes[7] = UInt8(xid & 0xFF)
         var buf6 = [UInt8](repeating: 0, count: 6)
         chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
-        bytes[240] = 99; bytes[241] = 130; bytes[242] = 83; bytes[243] = 99
-        bytes[244] = 53; bytes[245] = 1; bytes[246] = msgType.rawValue
+        bytes[236] = 99; bytes[237] = 130; bytes[238] = 83; bytes[239] = 99
+        bytes[240] = 53; bytes[241] = 1; bytes[242] = msgType.rawValue
 
-        var optIdx = 247
+        var optIdx = 243
         for (code, value) in extraOptions {
             if optIdx + 2 + value.count > bytes.count {
                 bytes.append(contentsOf: [UInt8](repeating: 0, count: optIdx + 2 + value.count - bytes.count))

@@ -71,9 +71,8 @@ func debugValidateIPv4Header(_ ip: IPv4Header) {
     // RFC 791 §3.1: TTL must be > 0
     precondition(ip.ttl > 0,
         "RFC 791 §3.1: TTL must be > 0, got \(ip.ttl)")
-    // RFC 791 §3.2.1.3: Source address must not be 0.0.0.0, loopback, or multicast
-    precondition(ip.srcAddr != .zero,
-        "RFC 791 §3.2.1.3: srcAddr must not be 0.0.0.0")
+    // RFC 791 §3.2.1.3: Source address must not be loopback or multicast.
+    // 0.0.0.0 is allowed for DHCP bootstrap (client has no IP yet).
     precondition((ip.srcAddr.addr & 0xFF) != 127,
         "RFC 791 §3.2.1.3: srcAddr must not be loopback (127.0.0.0/8)")
     precondition((ip.srcAddr.addr >> 28) != 0xE,
@@ -185,6 +184,7 @@ func debugValidateTransportParse(
     icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)],
     udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)],
     dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)],
+    tcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)],
     unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)]
 ) {
     for (_, _, ip, _) in icmpParsed {
@@ -199,9 +199,13 @@ func debugValidateTransportParse(
         precondition(ip.protocol == .udp,
             "Transport parse: ip.protocol must be .udp for DHCP entries, got \(ip.protocol)")
     }
+    for (_, _, ip, _) in tcpParsed {
+        precondition(ip.protocol == .tcp,
+            "Transport parse: ip.protocol must be .tcp for TCP entries, got \(ip.protocol)")
+    }
     for (_, _, ip) in unreachableParsed {
-        precondition(ip.protocol != .icmp && ip.protocol != .udp,
-            "Transport parse: unreachable protocol must not be .icmp or .udp, got \(ip.protocol)")
+        precondition(ip.protocol != .icmp && ip.protocol != .udp && ip.protocol != .tcp,
+            "Transport parse: unreachable protocol must not be a handled protocol, got \(ip.protocol)")
     }
 }
 
@@ -530,9 +534,10 @@ func debugValidateDHCPPhase(
             preconditionFailure(
                 "RFC 2131 §4.3.1: invalid DHCP message transition \(req.dhcp.messageType) → \(dhcp.messageType)")
         }
-        // RFC 2131: Reply srcIP == gateway IP (which is request dstIP)
-        precondition(ip.srcAddr == req.ip.dstAddr,
-            "RFC 2131: DHCP reply srcIP \(ip.srcAddr) ≠ gateway IP \(req.ip.dstAddr)")
+        // DHCP reply srcIP must be non-zero (gateway IP). Cannot compare to
+        // request dstIP because DISCOVER broadcasts to 255.255.255.255.
+        precondition(ip.srcAddr != .zero,
+            "RFC 2131: DHCP reply srcIP must not be 0.0.0.0")
         // Endpoint consistency
         precondition(replyEp == req.ep,
             "DHCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
@@ -567,6 +572,75 @@ func debugValidateReplies(_ replies: [(endpointID: Int, packet: PacketBuffer)]) 
     for (ep, pkt) in replies {
         precondition(ep >= 0, "Batch write: invalid endpoint ID \(ep)")
         precondition(pkt.totalLength >= 14, "Batch write: reply too short (\(pkt.totalLength) bytes)")
+    }
+}
+
+// MARK: TCP (RFC 793) — Phase 10
+
+func debugValidateTCPPhase(
+    requests: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)],
+    replies: ArraySlice<(endpointID: Int, packet: PacketBuffer)>,
+    hostMAC: MACAddress
+) {
+    for (replyEp, replyPkt) in replies {
+        guard let eth = EthernetFrame.parse(from: replyPkt) else {
+            preconditionFailure("TCP L2: reply has invalid Ethernet")
+        }
+        guard eth.etherType == .ipv4 else {
+            preconditionFailure("TCP L2: reply EtherType is not IPv4")
+        }
+        guard let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() else {
+            preconditionFailure("TCP L2: reply has invalid IPv4 header")
+        }
+        guard ip.protocol == .tcp else {
+            preconditionFailure("TCP L2: reply IP protocol is not TCP")
+        }
+        guard let tcp = TCPHeader.parse(
+            from: ip.payload,
+            pseudoSrcAddr: ip.srcAddr,
+            pseudoDstAddr: ip.dstAddr
+        ) else {
+            preconditionFailure("TCP L2: reply has invalid TCP header")
+        }
+
+        // L1: structural constraints
+        precondition(tcp.dataOffset >= 5 && tcp.dataOffset <= 15,
+            "RFC 793: TCP dataOffset must be in [5,15], got \(tcp.dataOffset)")
+
+        // L2: correspondence — reply src = request dst, reply dst = request src
+        let match = requests.first { req in
+            // TCP reply: (srcPort, dstPort, srcIP, dstIP) swapped
+            tcp.srcPort == req.tcp.dstPort
+            && tcp.dstPort == req.tcp.srcPort
+            && ip.srcAddr == req.ip.dstAddr
+            && ip.dstAddr == req.ip.srcAddr
+        }
+        guard let req = match else {
+            preconditionFailure(
+                "RFC 793: TCP reply (srcPort=\(tcp.srcPort), dstPort=\(tcp.dstPort)) has no matching request")
+        }
+
+        precondition(eth.dstMAC == req.eth.srcMAC,
+            "TCP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        precondition(eth.srcMAC == hostMAC,
+            "TCP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        precondition(replyEp == req.ep,
+            "TCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+    }
+}
+
+// MARK: NAT Poll — Phase 11
+
+func debugValidateNATPoll(
+    preReplies: Int,
+    replies: [(endpointID: Int, packet: PacketBuffer)]
+) {
+    // NAT poll may inject new frames (external data, retransmissions).
+    // Every injected frame must be a valid Ethernet frame targeting a valid endpoint.
+    let injected = replies[preReplies...]
+    for (ep, pkt) in injected {
+        precondition(ep >= 0, "NAT poll: invalid endpoint ID \(ep)")
+        precondition(pkt.totalLength >= 14, "NAT poll: frame too short (\(pkt.totalLength) bytes)")
     }
 }
 

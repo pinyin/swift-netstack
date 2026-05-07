@@ -16,13 +16,16 @@
 ///   Phase 3:  MAC filter + EtherType dispatch (branch logic only)
 ///   Phase 4:  Parse ALL IPv4 headers         (IPv4Header.parse, ~25 insns)
 ///   Phase 5:  Parse ALL ARP frames           (ARPFrame.parse, ~20 insns)
-///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + UDPHeader.parse + DHCPPacket.parse)
+///   Phase 6:  Parse ALL transport headers   (ICMP + UDP + DHCP + DNS + TCP parse)
 ///   Phase 7:  Process ALL ICMP Echo           (buildICMPEchoReply)
-///   Phase 8:  Process ALL ICMP Unreachable    (buildICMPProtocolUnreachable for TCP etc.)
-///   Phase 9:  Process ALL UDP sockets         (UDPSocket.handleDatagram → buildUDPFrame)
-///   Phase 10: Process ALL DHCP               (DHCPServer.process)
-///   Phase 11: Process ALL ARP                (processARPRequest)
-///   Phase 12: Batch write + endRound         (syscall + reclaim)
+///   Phase 8:  Process ALL ICMP Unreachable    (buildICMPProtocolUnreachable, unsupported proto)
+///   Phase 9:  Process ALL UDP                 (SocketHandler or NATTable.processUDP)
+///   Phase 9a: Process ALL DNS                 (DNSServer.processQuery)
+///   Phase 10: Process ALL TCP                 (NATTable.processTCP, VM→external)
+///   Phase 11: NAT socket poll                 (NATTable.pollSockets, external→VM, TCP+UDP)
+///   Phase 12: Process ALL DHCP                (DHCPServer.process, L2/L3 bootstrapping)
+///   Phase 13: Process ALL ARP                 (processARPRequest)
+///   Phase 14: Batch write + endRound          (syscall + reclaim)
 ///
 /// Zero-copy throughout: every .parse returns a view (slice) over the original
 /// PacketBuffer. Intermediate arrays hold small value types (MAC, IP, headers)
@@ -34,14 +37,37 @@ public func bdpRound(
     transport: inout Transport,
     arpMapping: inout ARPMapping,
     dhcpServer: inout DHCPServer,
+    dnsServer: inout DNSServer,
     routingTable: RoutingTable,
-    udpSocketTable: inout UDPSocketTable,
+    socketRegistry: inout SocketRegistry,
     ipFragmentReassembler: inout IPFragmentReassembler,
-    round: RoundContext
+    natTable: inout NATTable,
+    round: RoundContext,
+    pcapWriter: PCAPWriter? = nil
 ) -> Int {
     // ── Phase 1: Poll + batch read ──
     var taggedFrames = transport.readPackets(round: round)
+    if let pw = pcapWriter {
+        for (_, pkt) in taggedFrames { pw.write(packet: pkt) }
+    }
+
+    // Phases 2–10 and 12–13 are skipped when there are no VM frames, but
+    // Phase 11 (pollSockets) must still run — external TCP/UDP sockets may
+    // have data waiting regardless of VM-side activity.
     if taggedFrames.isEmpty {
+        var replies: [(endpointID: Int, packet: PacketBuffer)] = []
+        natTable.pollSockets(
+            hostMAC: arpMapping.hostMAC,
+            arpMapping: arpMapping,
+            replies: &replies, round: round
+        )
+        if !replies.isEmpty {
+            transport.writePackets(replies)
+            if let pw = pcapWriter {
+                for (_, pkt) in replies { pw.write(packet: pkt) }
+            }
+        }
+        replies.removeAll()
         round.endRound()
         return 0
     }
@@ -135,10 +161,12 @@ public func bdpRound(
 #endif
 
     // ── Phase 6: Parse ALL transport headers ──
-    // I-cache: ICMPHeader.parse + UDPHeader.parse + DHCPPacket.parse — no reply construction
+    // I-cache: ICMPHeader.parse + UDPHeader.parse + DHCPPacket.parse + TCPHeader.parse
     var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
     var udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
     var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
+    var dnsParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
+    var tcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)] = []
     var unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
     for (ep, eth, ip) in ipv4Parsed {
         switch ip.protocol {
@@ -152,27 +180,23 @@ public func bdpRound(
                 pseudoSrcAddr: ip.srcAddr,
                 pseudoDstAddr: ip.dstAddr
             ) else { break }
-            // DHCP (ports 67/68) is a L2-stateful protocol — route it exclusively
-            // to the DHCP pipeline so it never enters the generic UDP socket table.
-            //
-            // dstPort==67 is the normal case (client → server).
-            // srcPort==67 is defense-in-depth: if a guest mistakenly runs a DHCP
-            // server and emits OFFER/ACK packets, they are captured here instead of
-            // leaking into udpParsed and potentially hitting an unrelated UDP socket.
             if udp.dstPort == 67 || udp.srcPort == 67 {
                 if let dhcp = DHCPPacket.parse(from: udp.payload) {
                     dhcpParsed.append((ep, eth, ip, dhcp))
                 }
-                // If the DHCP port filter matched but the payload isn't valid DHCP:
-                // explicitly discarded. This is either a malformed DHCP packet or a
-                // non-DHCP protocol misusing ports 67/68 — neither belongs in the
-                // generic UDP pipeline.
+            } else if udp.dstPort == 53 {
+                dnsParsed.append((ep, eth, ip, udp))
             } else {
                 udpParsed.append((ep, eth, ip, udp))
             }
-        default:
-            // Unsupported transport protocol (e.g., TCP=6). Track for ICMP
-            // Protocol Unreachable reply (RFC 792 Type 3 Code 2).
+        case .tcp:
+            guard let tcp = TCPHeader.parse(
+                from: ip.payload,
+                pseudoSrcAddr: ip.srcAddr,
+                pseudoDstAddr: ip.dstAddr
+            ) else { break }
+            tcpParsed.append((ep, eth, ip, tcp))
+        @unknown default:
             unreachableParsed.append((ep, eth, ip))
         }
     }
@@ -181,8 +205,9 @@ public func bdpRound(
     // protocol, dhcpParsed contains only DHCP packets (from UDP port 67). The switch
     // in Phase 6 dispatches by ip.protocol — a mismatch here means the wrong case arm
     // matched or ICMPHeader/UDPHeader/DHCPPacket.parse returned nil for a valid packet.
-    debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed, unreachableParsed: unreachableParsed)
+    debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed, tcpParsed: tcpParsed, unreachableParsed: unreachableParsed)
 #endif
+
 
     var replies: [(endpointID: Int, packet: PacketBuffer)] = []
 
@@ -232,25 +257,32 @@ public func bdpRound(
         }
     }
 
-    // ── Phase 9: Process ALL UDP sockets ──
+    // ── Phase 9: Process ALL UDP ──
+    // I-cache: SocketRegistry.lookup + NATTable.processUDP
+    // Registered socket handlers take priority; unmatched traffic is NATed.
 #if DEBUG
-    // L2 snapshot: capture udpParsed and reply count before the phase.
     let udpSnapshot = udpParsed
     let replyCountPreUDP = replies.count
 #endif
-    // I-cache: UDPSocketTable.lookup + UDPSocket.handleDatagram — no parsing
     for (ep, eth, ip, udp) in udpParsed {
-        guard let socket = udpSocketTable.lookup(port: udp.dstPort) else { continue }
-        socket.handleDatagram(
-            payload: udp.payload,
-            srcIP: ip.srcAddr, dstIP: ip.dstAddr,
-            srcPort: udp.srcPort, dstPort: udp.dstPort,
-            srcMAC: eth.srcMAC,
-            endpointID: ep,
-            hostMAC: arpMapping.hostMAC,
-            replies: &replies,
-            round: round
-        )
+        if let socket = socketRegistry.lookup(port: udp.dstPort) {
+            socket.handleDatagram(
+                payload: udp.payload,
+                srcIP: ip.srcAddr, dstIP: ip.dstAddr,
+                srcPort: udp.srcPort, dstPort: udp.dstPort,
+                srcMAC: eth.srcMAC,
+                endpointID: ep,
+                hostMAC: arpMapping.hostMAC,
+                replies: &replies,
+                round: round
+            )
+        } else {
+            natTable.processUDP(
+                eth: eth, ip: ip, udp: udp, endpointID: ep,
+                hostMAC: arpMapping.hostMAC,
+                replies: &replies, round: round
+            )
+        }
     }
 #if DEBUG
     // L2: Validate every UDP reply against its matching request via
@@ -262,7 +294,60 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 10: Process ALL DHCP ──
+    // ── Phase 9a: Process ALL DNS ──
+    // I-cache: DNSServer.processQuery — hosts-file lookup only
+    for (ep, eth, ip, udp) in dnsParsed {
+        dnsServer.processQuery(
+            payload: udp.payload,
+            srcIP: ip.srcAddr, dstIP: ip.dstAddr,
+            srcPort: udp.srcPort, dstPort: udp.dstPort,
+            srcMAC: eth.srcMAC,
+            endpointID: ep,
+            hostMAC: arpMapping.hostMAC,
+            replies: &replies,
+            round: round
+        )
+    }
+
+    // ── Phase 10: Process ALL TCP (VM → external) ──
+    // I-cache: NATTable.processTCP — FSM dispatch only, no syscalls
+#if DEBUG
+    let tcpSnapshot = tcpParsed
+    let replyCountPreTCP = replies.count
+#endif
+    for (ep, eth, ip, tcp) in tcpParsed {
+        natTable.processTCP(
+            eth: eth, ip: ip, tcp: tcp, endpointID: ep,
+            hostMAC: arpMapping.hostMAC,
+            replies: &replies, round: round
+        )
+    }
+#if DEBUG
+    debugValidateTCPPhase(
+        requests: tcpSnapshot,
+        replies: replies[replyCountPreTCP...],
+        hostMAC: arpMapping.hostMAC
+    )
+#endif
+
+    // ── Phase 11: NAT socket poll (external → VM) ──
+    // I-cache: NATTable.pollSockets — poll + read/write, both TCP and UDP
+#if DEBUG
+    let replyCountPreNAT = replies.count
+#endif
+    natTable.pollSockets(
+        hostMAC: arpMapping.hostMAC,
+        arpMapping: arpMapping,
+        replies: &replies, round: round
+    )
+#if DEBUG
+    debugValidateNATPoll(
+        preReplies: replyCountPreNAT,
+        replies: replies
+    )
+#endif
+
+    // ── Phase 12: Process ALL DHCP ──
 #if DEBUG
     // L2 snapshot: DHCP replies are matched to requests via xid (RFC 2131 §2).
     let dhcpSnapshot = dhcpParsed
@@ -293,7 +378,7 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 11: Process ALL ARP ──
+    // ── Phase 13: Process ALL ARP ──
 #if DEBUG
     // L2 snapshot: ARP replies are matched to requests via (targetIP, senderIP).
     let arpSnapshot = arpParsed
@@ -316,7 +401,7 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 12: Batch write + endRound ──
+    // ── Phase 14: Batch write + endRound ──
 #if DEBUG
     // L3: Phase flow integrity. After all processing phases, every reply and
     // forwarded frame must have a valid endpoint ID and ≥14 bytes. Protocol-level
@@ -324,6 +409,10 @@ public func bdpRound(
     debugValidateReplies(replies)
     debugValidateReplies(forwardPkts)
 #endif
+    if let pw = pcapWriter {
+        for (_, pkt) in forwardPkts { pw.write(packet: pkt) }
+        for (_, pkt) in replies  { pw.write(packet: pkt) }
+    }
     let forwardCount = forwardPkts.count
     let replyCount = replies.count
     if !forwardPkts.isEmpty {
@@ -344,6 +433,8 @@ public func bdpRound(
     icmpParsed.removeAll()
     udpParsed.removeAll()
     dhcpParsed.removeAll()
+    dnsParsed.removeAll()
+    tcpParsed.removeAll()
     unreachableParsed.removeAll()
     forwardPkts.removeAll()
     replies.removeAll()

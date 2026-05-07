@@ -28,7 +28,9 @@ public struct DHCPServer {
         arpMapping: inout ARPMapping,
         round: RoundContext
     ) -> (PacketBuffer, endpointID: Int)? {
-        guard var pool = pools[endpointID] else { return nil }
+        guard var pool = pools[endpointID] else {
+            return nil
+        }
 
         let result: (dhcpPayload: PacketBuffer, yiaddr: IPv4Address)?
         switch packet.messageType {
@@ -37,6 +39,7 @@ public struct DHCPServer {
                 packet: packet, srcMAC: srcMAC,
                 endpointID: endpointID, pool: &pool, round: round
             )
+            if result == nil { }
         case .request:
             result = handleRequest(
                 packet: packet, srcMAC: srcMAC,
@@ -70,8 +73,9 @@ public struct DHCPServer {
         packet: DHCPPacket, srcMAC: MACAddress,
         endpointID: Int, pool: inout DHCPPool, round: RoundContext
     ) -> (PacketBuffer, IPv4Address)? {
-        guard let offeredIP = pool.allocate(clientMAC: srcMAC) else { return nil }
-
+        guard let offeredIP = pool.allocate(clientMAC: srcMAC) else {
+            return nil
+        }
         guard let pkt = buildDHCPReply(
             messageType: .offer,
             xid: packet.xid,
@@ -79,7 +83,9 @@ public struct DHCPServer {
             yiaddr: offeredIP,
             pool: pool,
             round: round
-        ) else { return nil }
+        ) else {
+            return nil
+        }
         return (pkt, offeredIP)
     }
 
@@ -178,7 +184,7 @@ public struct DHCPServer {
             (2 + 4) +  // option 54: server ID
             1           // option 255: End
         let magicLen = 4
-        let headerLen = 240
+        let headerLen = 236
         let dhcpLen = headerLen + magicLen + optionsLen
 
         var pkt = round.allocate(capacity: dhcpLen, headroom: 0)
@@ -195,13 +201,13 @@ public struct DHCPServer {
         chaddr.write(to: ptr.advanced(by: 28))                          // chaddr
 
         // Magic cookie
-        ptr.advanced(by: 240).storeBytes(of: UInt8(99), as: UInt8.self)
-        ptr.advanced(by: 241).storeBytes(of: UInt8(130), as: UInt8.self)
-        ptr.advanced(by: 242).storeBytes(of: UInt8(83), as: UInt8.self)
-        ptr.advanced(by: 243).storeBytes(of: UInt8(99), as: UInt8.self)
+        ptr.advanced(by: 236).storeBytes(of: UInt8(99), as: UInt8.self)
+        ptr.advanced(by: 237).storeBytes(of: UInt8(130), as: UInt8.self)
+        ptr.advanced(by: 238).storeBytes(of: UInt8(83), as: UInt8.self)
+        ptr.advanced(by: 239).storeBytes(of: UInt8(99), as: UInt8.self)
 
         // Options
-        var optOff = 244
+        var optOff = 240
         writeOption(53, value: [messageType.rawValue], ptr: ptr, offset: &optOff)
         writeOption(1, value: subnetMaskBytes(pool.subnet.mask), ptr: ptr, offset: &optOff)
         writeOption(3, value: pool.gateway, ptr: ptr, offset: &optOff)

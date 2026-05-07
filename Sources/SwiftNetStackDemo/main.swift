@@ -93,7 +93,7 @@ struct VZTransport: Transport {
             pollfd(fd: shutdownFD, events: Int16(POLLIN), revents: 0),
         ]
 
-        let rc = Darwin.poll(&pollfds, UInt32(pollfds.count), -1)
+        let rc = Darwin.poll(&pollfds, UInt32(pollfds.count), 100)  // 100ms timeout so pollSockets runs periodically
         guard rc > 0 else { return [] }
 
         // Shutdown signal — drain the byte, set flag, return empty

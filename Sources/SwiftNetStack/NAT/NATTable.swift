@@ -58,7 +58,7 @@ public struct NATTable {
                 }
             }
             guard ok >= 0 else { return nil }
-            return addr.sin_port
+            return addr.sin_port.bigEndian
         }
     }
 
@@ -398,7 +398,7 @@ public struct NATTable {
 
         guard let pf = findTCPListener(fd: listenerFd) else { close(newFd); return }
         let externalIP = IPv4Address(addr: clientAddr.sin_addr.s_addr.bigEndian)
-        let externalPort = clientAddr.sin_port
+        let externalPort = clientAddr.sin_port.bigEndian
 
         let key = NATKey(vmIP: pf.vmIP, vmPort: pf.vmPort, dstIP: externalIP, dstPort: externalPort, protocol: .tcp)
 
@@ -798,7 +798,7 @@ private func withSockAddr<T>(ip: IPv4Address, port: UInt16, _ body: (UnsafePoint
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port
+    addr.sin_port = port.bigEndian
     withUnsafeMutableBytes(of: &addr.sin_addr) { ip.write(to: $0.baseAddress!) }
     return withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { body($0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
 }
@@ -825,7 +825,7 @@ private func bindAndListen(fd: Int32, port: UInt16) -> Int32? {
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port
+    addr.sin_port = port.bigEndian
     addr.sin_addr.s_addr = INADDR_ANY
 
     let b = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
@@ -839,7 +839,7 @@ private func bindOnly(fd: Int32, port: UInt16) -> Int32? {
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port
+    addr.sin_port = port.bigEndian
     addr.sin_addr.s_addr = INADDR_ANY
 
     let b = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }

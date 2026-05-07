@@ -24,9 +24,9 @@ chmod +x "$BUILD_DIR/bin/busybox"
 BUSYBOX_APPLETS=(
     sh ash cat echo mount umount sleep
     ip ifconfig route ping
-    udhcpc nslookup
+    udhcpc nslookup nc
     ls mkdir poweroff
-    awk grep head tail sed wc tr
+    awk grep head tail sed wc tr cut
     chmod cp ln arp
 )
 for applet in "${BUSYBOX_APPLETS[@]}"; do

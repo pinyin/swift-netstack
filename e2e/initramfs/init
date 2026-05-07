@@ -35,12 +35,12 @@ TEST_COUNT=0
 # dns validates hosts-file DNS resolution.
 # routing validates default and subnet routes.
 
-TESTS="dhcp icmp arp dns routing"
+TESTS="dhcp icmp arp dns routing nat-udp nat-tcp"
 
 for t in $TESTS; do
     TEST_SCRIPT="/tests/test-${t}.sh"
     if [ -f "$TEST_SCRIPT" ]; then
-        . "$TEST_SCRIPT"
+        set +e; . "$TEST_SCRIPT"; set -e
     else
         echo "[TEST] $t SKIP (not found)"
     fi

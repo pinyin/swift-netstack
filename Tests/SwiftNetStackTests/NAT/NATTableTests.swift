@@ -50,7 +50,7 @@ struct NATTableTests {
                 getsockname(fd, $0, &len)
             }
         }
-        let port = boundAddr.sin_port
+        let port = boundAddr.sin_port.bigEndian
 
         // Set non-blocking for accept
         let flags = fcntl(fd, F_GETFL, 0)
@@ -192,7 +192,7 @@ struct NATTableTests {
         _ = withUnsafeMutablePointer(to: &boundAddr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
         }
-        let port = boundAddr.sin_port
+        let port = boundAddr.sin_port.bigEndian
 
         // Pipe for signaling completion
         var pipeFDs: [Int32] = [0, 0]
@@ -487,7 +487,7 @@ struct NATTableTests {
                 getsockname(udpFD, $0, &len)
             }
         }
-        let udpPort = boundAddr.sin_port
+        let udpPort = boundAddr.sin_port.bigEndian
 
         // Set non-blocking
         let flags = fcntl(udpFD, F_GETFL, 0)
@@ -652,7 +652,7 @@ struct NATTableTests {
             var addr = sockaddr_in()
             addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = ctx.port
+            addr.sin_port = ctx.port.bigEndian
             addr.sin_addr.s_addr = inet_addr("127.0.0.1")
 
             let connOK = withUnsafePointer(to: &addr) {

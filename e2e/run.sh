@@ -20,6 +20,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TIMEOUT=25
+TCP_PORT=7777
+UDP_PORT=7778
 INIT="/init"
 HOST_ARGS=()
 
@@ -66,10 +68,35 @@ if ! codesign -d "$DEMO_BIN" 2>/dev/null | grep -q 'authority'; then
     codesign -s - --entitlements /tmp/vm-demo.entitlements -f "$DEMO_BIN" 2>/dev/null || true
 fi
 
+# ── NAT echo servers ──
+
+HOST_IP=$(ifconfig en0 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+if [ -z "$HOST_IP" ]; then
+    HOST_IP=$(ifconfig en1 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+fi
+
+ECHO_PID=""
+NAT_CMD=""
+
+if [ -n "$HOST_IP" ] && command -v python3 &>/dev/null; then
+    python3 "$SCRIPT_DIR/echo_servers.py" "$TCP_PORT" "$UDP_PORT" &
+    ECHO_PID=$!
+    sleep 0.5
+    if kill -0 "$ECHO_PID" 2>/dev/null; then
+        NAT_CMD="nat_target=$HOST_IP nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT"
+        echo "Echo servers: TCP:$TCP_PORT UDP:$UDP_PORT (target=$HOST_IP)"
+    else
+        ECHO_PID=""
+        echo "WARNING: Echo servers failed to start, NAT tests will skip"
+    fi
+else
+    echo "WARNING: python3 or host IP not available, NAT tests will skip"
+fi
+
 # ── Run test ──
 
 TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
-trap 'rm -f "$TMPLOG"' EXIT
+trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
 
 echo "========================================="
 echo "SwiftNetStack E2E Test Suite"
@@ -87,7 +114,7 @@ echo "Starting demo..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10" \
+    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 $NAT_CMD" \
     --cpus 1 --memory 512 \
     ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
     >"$TMPLOG" 2>&1 &
@@ -147,6 +174,7 @@ echo "========================================="
 # Cleanup
 kill "$DEMOPID" 2>/dev/null || true
 wait "$DEMOPID" 2>/dev/null || true
+[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null || true
 
 if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1

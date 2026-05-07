@@ -61,6 +61,10 @@ public func bdpRound(
             arpMapping: arpMapping,
             replies: &replies, round: round
         )
+        dnsServer.pollUpstream(
+            hostMAC: arpMapping.hostMAC,
+            replies: &replies, round: round
+        )
         if !replies.isEmpty {
             transport.writePackets(replies)
             if let pw = pcapWriter {
@@ -346,6 +350,12 @@ public func bdpRound(
         replies: replies
     )
 #endif
+
+    // ── Phase 11a: DNS upstream poll ──
+    dnsServer.pollUpstream(
+        hostMAC: arpMapping.hostMAC,
+        replies: &replies, round: round
+    )
 
     // ── Phase 12: Process ALL DHCP ──
 #if DEBUG

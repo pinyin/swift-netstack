@@ -22,7 +22,13 @@ public struct DeliberationLoop {
     public var natTable: NATTable
     public var dnsServer: DNSServer
 
-    public init(endpoints: [VMEndpoint], hostMAC: MACAddress, portForwards: [PortForwardEntry] = [], hosts: [String: IPv4Address] = [:]) {
+    public init(
+        endpoints: [VMEndpoint],
+        hostMAC: MACAddress,
+        portForwards: [PortForwardEntry] = [],
+        hosts: [String: IPv4Address] = [:],
+        upstreamDNS: IPv4Address? = nil
+    ) {
         self.hostMAC = hostMAC
         self.arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: endpoints)
         self.dhcpServer = DHCPServer(endpoints: endpoints)
@@ -30,8 +36,22 @@ public struct DeliberationLoop {
         self.socketRegistry = SocketRegistry()
         self.ipFragmentReassembler = IPFragmentReassembler()
         self.natTable = NATTable(portForwards: portForwards)
-        self.dnsServer = DNSServer(hosts: hosts)
+        self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
     }
+
+    // MARK: - Dynamic port forwarding
+
+    public var activePortForwards: [PortForwardEntry] { natTable.activePortForwards }
+
+    @discardableResult
+    public mutating func addPortForward(_ pf: PortForwardEntry) -> Bool { natTable.addPortForward(pf) }
+
+    @discardableResult
+    public mutating func removePortForward(hostPort: UInt16, protocol: IPProtocol) -> Bool {
+        natTable.removePortForward(hostPort: hostPort, protocol: `protocol`)
+    }
+
+    // MARK: - Main loop
 
     /// Execute one BDP deliberation round.
     ///

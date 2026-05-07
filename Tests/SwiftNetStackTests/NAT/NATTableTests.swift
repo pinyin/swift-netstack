@@ -1031,6 +1031,97 @@ struct NATTableTests {
         #expect(natTable.tcpCount == 2, "expected 2 TCP entries, got \(natTable.tcpCount)")
     }
 
+    // MARK: - Dynamic port forwarding
+
+    @Test func addPortForwardTCP() {
+        var natTable = NATTable()
+        let pf = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 8080, protocol: .tcp)
+        let ok = natTable.addPortForward(pf)
+        #expect(ok)
+        #expect(natTable.activePortForwards.count == 1)
+        #expect(natTable.tcpListenerPorts.count == 1)
+    }
+
+    @Test func addPortForwardUDP() {
+        var natTable = NATTable()
+        let pf = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 5353, protocol: .udp)
+        let ok = natTable.addPortForward(pf)
+        #expect(ok)
+        #expect(natTable.activePortForwards.count == 1)
+    }
+
+    @Test func removePortForwardTCP() {
+        var natTable = NATTable()
+        let pf = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 8080, protocol: .tcp)
+        _ = natTable.addPortForward(pf)
+        guard let port = natTable.tcpListenerPorts.first else {
+            Issue.record("no listener port"); return
+        }
+        let removed = natTable.removePortForward(hostPort: port, protocol: .tcp)
+        #expect(removed)
+        #expect(natTable.activePortForwards.isEmpty)
+    }
+
+    @Test func removePortForwardUDP() {
+        var natTable = NATTable()
+        let pf = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 5353, protocol: .udp)
+        _ = natTable.addPortForward(pf)
+        // Use the listener fd directly to get the actual bound port
+        guard let listener = natTable.udpListenerPorts.first else {
+            Issue.record("no UDP listener port"); return
+        }
+        let removed = natTable.removePortForward(hostPort: listener, protocol: .udp)
+        #expect(removed)
+        #expect(natTable.activePortForwards.isEmpty)
+    }
+
+    @Test func addPortForwardDuplicatePortFails() {
+        var natTable = NATTable()
+        let pf1 = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 8080, protocol: .tcp)
+        _ = natTable.addPortForward(pf1)
+        guard let port = natTable.tcpListenerPorts.first else {
+            Issue.record("no listener port"); return
+        }
+        let pf2 = PortForwardEntry(hostPort: port, vmIP: vmIP, vmPort: 9090, protocol: .tcp)
+        let duplicate = natTable.addPortForward(pf2)
+        #expect(!duplicate)
+        #expect(natTable.activePortForwards.count == 1)
+    }
+
+    @Test func removeNonexistentPortForwardFails() {
+        var natTable = NATTable()
+        let r1 = natTable.removePortForward(hostPort: 9999, protocol: .tcp)
+        let r2 = natTable.removePortForward(hostPort: 9999, protocol: .udp)
+        #expect(!r1)
+        #expect(!r2)
+    }
+
+    @Test func activePortForwardsSnapshot() {
+        var natTable = NATTable()
+        #expect(natTable.activePortForwards.isEmpty)
+
+        let tcpPF = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 80, protocol: .tcp)
+        let udpPF = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 53, protocol: .udp)
+        _ = natTable.addPortForward(tcpPF)
+        _ = natTable.addPortForward(udpPF)
+        #expect(natTable.activePortForwards.count == 2)
+
+        let snapshots = natTable.activePortForwards
+        #expect(snapshots.contains(where: { $0.vmPort == 80 && $0.protocol == .tcp }))
+        #expect(snapshots.contains(where: { $0.vmPort == 53 && $0.protocol == .udp }))
+    }
+
+    @Test func initWithPortForwardsThenAddDynamic() {
+        let initPF = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 8080, protocol: .tcp)
+        var natTable = NATTable(portForwards: [initPF])
+        #expect(natTable.activePortForwards.count == 1)
+
+        let dynPF = PortForwardEntry(hostPort: 0, vmIP: vmIP, vmPort: 9090, protocol: .tcp)
+        let added = natTable.addPortForward(dynPF)
+        #expect(added)
+        #expect(natTable.activePortForwards.count == 2)
+    }
+
     private func makeEthernetFrameSimple(dst: MACAddress, src: MACAddress, type: EtherType,
                                           payload: [UInt8]) -> PacketBuffer {
         var bytes: [UInt8] = []

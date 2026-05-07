@@ -129,6 +129,109 @@ public enum DNSPacket {
         return pkt
     }
 
+    /// Build a DNS query for upstream forwarding (RD=1, standard query).
+    public static func buildQuery(
+        txID: UInt16,
+        question: DNSQuestion,
+        round: RoundContext
+    ) -> PacketBuffer? {
+        let qnameLabels = encodeQName(question.name)
+        let totalLen = 12 + qnameLabels.count + 4
+
+        var pkt = round.allocate(capacity: totalLen, headroom: 0)
+        guard let ptr = pkt.appendPointer(count: totalLen) else { return nil }
+
+        writeUInt16BE(txID, to: ptr)                           // Transaction ID
+        writeUInt16BE(0x0100, to: ptr.advanced(by: 2))         // Flags: RD=1 (standard query)
+        writeUInt16BE(1, to: ptr.advanced(by: 4))               // QDCOUNT = 1
+        writeUInt16BE(0, to: ptr.advanced(by: 6))               // ANCOUNT
+        writeUInt16BE(0, to: ptr.advanced(by: 8))               // NSCOUNT
+        writeUInt16BE(0, to: ptr.advanced(by: 10))              // ARCOUNT
+
+        var off = 12
+        ptr.advanced(by: off).copyMemory(from: qnameLabels, byteCount: qnameLabels.count)
+        off += qnameLabels.count
+        writeUInt16BE(question.type, to: ptr.advanced(by: off)); off += 2
+        writeUInt16BE(question.class, to: ptr.advanced(by: off))
+
+        return pkt
+    }
+
+    /// Parse a DNS response from upstream. Returns the transaction ID and the
+    /// first question found. Returns nil if not a valid response.
+    public static func parseResponse(from payload: PacketBuffer) -> (txID: UInt16, question: DNSQuestion)? {
+        guard payload.totalLength >= 12 else { return nil }
+        return payload.withUnsafeReadableBytes { buf in
+            guard let base = buf.baseAddress else { return nil }
+
+            let txID = readUInt16BE(base, 0)
+            let flags = readUInt16BE(base, 2)
+            let qdcount = readUInt16BE(base, 4)
+
+            // QR must be 1 (response)
+            guard (flags & 0x8000) != 0 else { return nil }
+            guard qdcount >= 1 else { return nil }
+
+            guard let (name, bytesUsed) = parseQName(from: buf, startOffset: 12) else { return nil }
+            let qOffset = 12 + bytesUsed
+            guard qOffset + 4 <= buf.count else { return nil }
+
+            let qtype  = readUInt16BE(base, qOffset)
+            let qclass = readUInt16BE(base, qOffset + 2)
+
+            return (txID, DNSQuestion(name: name, type: qtype, class: qclass))
+        }
+    }
+
+    /// Extract the first A record (IPv4) from a DNS response.
+    /// Walks past the question section and answer header to find RDATA.
+    public static func extractFirstA(from payload: PacketBuffer) -> IPv4Address? {
+        guard payload.totalLength >= 12 else { return nil }
+        return payload.withUnsafeReadableBytes { buf in
+            guard let base = buf.baseAddress else { return nil }
+
+            let ancount = readUInt16BE(base, 6)
+            guard ancount >= 1 else { return nil }
+
+            // Skip past the header (12) and question section
+            var off = 12
+            for _ in 0..<Int(readUInt16BE(base, 4)) {  // QDCOUNT
+                guard let (_, consumed) = parseQName(from: buf, startOffset: off) else { return nil }
+                off += consumed + 4  // QNAME + QTYPE + QCLASS
+            }
+
+            // Walk each answer looking for TYPE=A (1)
+            for _ in 0..<Int(ancount) {
+                guard off + 10 <= buf.count else { return nil }
+                // Answer NAME (may use compression pointers)
+                let nameOff = off
+                var nameLen = 0
+                if buf[nameOff] & 0xC0 == 0xC0 {
+                    nameLen = 2  // compression pointer
+                } else {
+                    guard let (_, consumed) = parseQName(from: buf, startOffset: nameOff) else { return nil }
+                    nameLen = consumed
+                }
+                off = nameOff + nameLen
+
+                guard off + 10 <= buf.count else { return nil }
+                let atype  = readUInt16BE(base, off); off += 2
+                let aclass = readUInt16BE(base, off); off += 2
+                off += 4  // TTL
+                let rdlen  = readUInt16BE(base, off); off += 2
+                if atype == 1, aclass == 1, rdlen == 4, off + 4 <= buf.count {
+                    let a = buf[off]
+                    let b = buf[off + 1]
+                    let c = buf[off + 2]
+                    let d = buf[off + 3]
+                    return IPv4Address(a, b, c, d)
+                }
+                off += Int(rdlen)
+            }
+            return nil
+        }
+    }
+
     // MARK: - Internal helpers
 
     /// Parse a DNS QNAME starting at `startOffset`.

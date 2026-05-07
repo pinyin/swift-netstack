@@ -49,17 +49,95 @@ public struct NATTable {
 
     /// TCP port-forward listener ports (for tests to discover OS-assigned ports).
     public var tcpListenerPorts: [UInt16] {
-        tcpListeners.compactMap { listener in
-            var addr = sockaddr_in()
-            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let ok = withUnsafeMutablePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    getsockname(listener.fd, $0, &len)
-                }
-            }
-            guard ok >= 0 else { return nil }
-            return addr.sin_port.bigEndian
+        tcpListeners.compactMap { listenerPort($0.fd) }
+    }
+
+    /// UDP port-forward listener ports.
+    public var udpListenerPorts: [UInt16] {
+        udpListeners.compactMap { listenerPort($0.fd) }
+    }
+
+    // MARK: - Dynamic port forwarding
+
+    /// Current port-forward rules (read-only snapshot).
+    public var activePortForwards: [PortForwardEntry] {
+        tcpListeners.map { $0.entry } + udpListeners.map { $0.entry }
+    }
+
+    /// Add a port-forward rule at runtime. Returns `false` if the port is already
+    /// occupied or the listener cannot be created.
+    ///
+    /// When `hostPort` is 0 the OS assigns a free port; the actual port can be
+    /// discovered via `tcpListenerPorts` or `activePortForwards` combined with
+    /// `getsockname`.
+    @discardableResult
+    public mutating func addPortForward(_ pf: PortForwardEntry) -> Bool {
+        // Check: is the requested port already occupied by an existing listener?
+        // For hostPort==0 (auto-assign), never a conflict.
+        if pf.hostPort != 0 {
+            let existingPorts = allListenerPorts()
+            if existingPorts.contains(pf.hostPort) { return false }
         }
+
+        switch pf.protocol {
+        case .tcp:
+            guard let fd = createTCPListener(port: pf.hostPort) else { return false }
+            tcpListeners.append((fd, pf))
+            return true
+        case .udp:
+            guard let fd = createUDPListener(port: pf.hostPort) else { return false }
+            udpListeners.append((fd, pf))
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Remove a port-forward rule by its *actual* bound port.
+    ///
+    /// The listener socket is closed, but established connections accepted
+    /// through it remain active.
+    @discardableResult
+    public mutating func removePortForward(hostPort: UInt16, protocol: IPProtocol) -> Bool {
+        switch `protocol` {
+        case .tcp:
+            guard let idx = tcpListeners.firstIndex(where: { listenerPort($0.fd) == hostPort }) else { return false }
+            close(tcpListeners[idx].fd)
+            tcpListeners.remove(at: idx)
+            return true
+        case .udp:
+            guard let idx = udpListeners.firstIndex(where: { listenerPort($0.fd) == hostPort }) else { return false }
+            close(udpListeners[idx].fd)
+            udpListeners.remove(at: idx)
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Collect all actual bound listener ports for duplicate detection.
+    private func allListenerPorts() -> Set<UInt16> {
+        var ports = Set<UInt16>()
+        for listener in tcpListeners {
+            if let p = listenerPort(listener.fd) { ports.insert(p) }
+        }
+        for listener in udpListeners {
+            if let p = listenerPort(listener.fd) { ports.insert(p) }
+        }
+        return ports
+    }
+
+    /// Return the actual bound port for a listener fd, or nil on error.
+    private func listenerPort(_ fd: Int32) -> UInt16? {
+        var addr = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let ok = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &len)
+            }
+        }
+        guard ok >= 0 else { return nil }
+        return addr.sin_port.bigEndian
     }
 
     // MARK: - Phase 9: UDP processing (VM → external)

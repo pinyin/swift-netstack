@@ -1,10 +1,11 @@
 #!/bin/sh
-# E2E DHCP test init script for SwiftNetStack validation.
-# Runs inside a minimal Linux VM with busybox.
+# SwiftNetStack E2E test suite entry point.
+# Bootstraps the system, then runs each test in e2e/initramfs/tests/.
 
 set -e
 
-# Mount essential filesystems
+# ── Bootstrap ──────────────────────────────────────────────────────
+
 mount -t proc     -o nosuid,noexec,nodev    proc     /proc
 mount -t sysfs    -o nosuid,noexec,nodev    sysfs    /sys
 mount -t devtmpfs -o mode=0755,nosuid       devtmpfs /dev
@@ -13,56 +14,45 @@ mount -t devpts   -o gid=5,mode=620,nosuid  devpts   /dev/pts
 mount -t tmpfs    -o nosuid,nodev           tmpfs    /run
 mount -t tmpfs    -o nosuid,nodev           tmpfs    /tmp
 
-echo "=== SwiftNetStack DHCP E2E Test ==="
+echo "=== SwiftNetStack E2E Test Suite ==="
 echo ""
 
-# Bring up loopback
 ip link set lo up 2>/dev/null || true
-
-# Bring up eth0
-echo "Bringing up eth0..."
 ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null || true
 sleep 1
 
-# Run DHCP client
-echo "Running udhcpc on eth0..."
-# -n: exit if lease not obtained
-# -t 8: max 8 retries
-# -T 2: 2 seconds between retries
-udhcpc -i eth0 -n -t 8 -T 2 2>&1
-UDHCPC_EXIT=$?
+# Initialize shared test state (before sourcing any test scripts)
+TESTS_PASSED=""
+TESTS_FAILED=""
+TEST_COUNT=0
+. /tests/lib.sh
+
+# ── Run tests in dependency order ──
+#
+# dhcp must run first (provides IP, gateway, DNS for other tests).
+# icmp exercises L2+L3+L4 forwarding.
+# arp validates proxy ARP response.
+# dns validates hosts-file DNS resolution.
+# routing validates default and subnet routes.
+
+TESTS="dhcp icmp arp dns routing"
+
+for t in $TESTS; do
+    TEST_SCRIPT="/tests/test-${t}.sh"
+    if [ -f "$TEST_SCRIPT" ]; then
+        . "$TEST_SCRIPT"
+    else
+        echo "[TEST] $t SKIP (not found)"
+    fi
+    echo ""
+done
+
+# ── Summary ──
+
+. /tests/lib.sh
+test_summary
 
 echo ""
-echo "=== DHCP Result ==="
-echo "udhcpc exit code: $UDHCPC_EXIT"
-echo ""
-
-echo "Interface eth0:"
-ip addr show eth0 2>/dev/null || ifconfig eth0 2>/dev/null || true
-echo ""
-
-echo "Routing table:"
-ip route show 2>/dev/null || route -n 2>/dev/null || true
-echo ""
-
-# Test connectivity to gateway
-GATEWAY=$(ip route show 2>/dev/null | grep default | awk '{print $3}')
-if [ -n "$GATEWAY" ]; then
-    echo "Gateway: $GATEWAY"
-    echo "Pinging gateway..."
-    ping -c 3 -W 2 "$GATEWAY" 2>&1 || echo "Ping failed"
-else
-    echo "No default gateway found (DHCP may have failed)"
-fi
-
-echo ""
-if [ "$UDHCPC_EXIT" -eq 0 ]; then
-    echo "PASS: DHCP lease obtained"
-else
-    echo "FAIL: DHCP lease not obtained (udhcpc exit=$UDHCPC_EXIT)"
-fi
-
-echo ""
-echo "=== Test complete, dropping to shell ==="
-echo "(type poweroff -f to exit, or press Ctrl+C)"
+echo "=== Test suite complete, dropping to shell ==="
+echo "(type poweroff -f to exit)"
 exec /bin/sh

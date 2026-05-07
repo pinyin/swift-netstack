@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
-# SwiftNetStack DHCP E2E test runner.
+# SwiftNetStack E2E test runner.
 #
-# Builds initramfs if needed, launches the demo with the kernel and initrd,
-# waits for DHCP lease, and reports pass/fail.
+# Launches a Linux VM with the BDP pipeline and runs comprehensive
+# networking tests (DHCP, ICMP, ARP, DNS, routing).
+#
+# Usage:
+#   ./run.sh                              # all tests (default)
+#   ./run.sh --host test.local:1.2.3.4   # with DNS hostname
+#   ./run.sh --timeout 30                 # custom timeout
 #
 # Prerequisites:
 #   - Swift toolchain (swift build)
-#   - codesign with com.apple.security.virtualization entitlement
-#   - e2e/kernel/Image (built separately or copied from minimal-vfkit-kernel)
-#
-# Usage: ./run.sh [--timeout SECONDS]
+#   - com.apple.security.virtualization entitlement
+#   - e2e/kernel/Image (aarch64 Linux kernel)
+#   - e2e/initramfs/bin/busybox (aarch64 static busybox)
 
-set -eu
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TIMEOUT=25
+INIT="/init"
+HOST_ARGS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --host)
+            HOST_ARGS+=("--host" "$2")
+            shift 2
+            ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -32,12 +42,12 @@ DEMO_BIN="$PROJECT_DIR/.build/debug/SwiftNetStackDemo"
 
 if [ ! -f "$KERNEL" ]; then
     echo "ERROR: kernel not found at $KERNEL"
-    echo "Copy the aarch64 kernel Image to e2e/kernel/Image"
     exit 1
 fi
 
-# Build initramfs if not present or if source is newer
-if [ ! -f "$INITRD" ] || [ "$SCRIPT_DIR/initramfs/init" -nt "$INITRD" ] || [ "$SCRIPT_DIR/initramfs/udhcpc.script" -nt "$INITRD" ]; then
+# Build initramfs if needed
+INIT_SRC="$SCRIPT_DIR/initramfs/init"
+if [ ! -f "$INITRD" ] || [ "$INIT_SRC" -nt "$INITRD" ] || [ "$SCRIPT_DIR/initramfs/build.sh" -nt "$INITRD" ]; then
     echo "Building initramfs..."
     "$SCRIPT_DIR/initramfs/build.sh"
 fi
@@ -53,10 +63,7 @@ fi
 
 # Ensure demo is signed
 if ! codesign -d "$DEMO_BIN" 2>/dev/null | grep -q 'authority'; then
-    echo "Signing demo with ad-hoc signature..."
-    codesign -s - --entitlements /tmp/vm-demo.entitlements -f "$DEMO_BIN" 2>/dev/null || {
-        echo "NOTE: codesign failed, VM may not start"
-    }
+    codesign -s - --entitlements /tmp/vm-demo.entitlements -f "$DEMO_BIN" 2>/dev/null || true
 fi
 
 # ── Run test ──
@@ -65,34 +72,36 @@ TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
 trap 'rm -f "$TMPLOG"' EXIT
 
 echo "========================================="
-echo "SwiftNetStack DHCP E2E Test"
+echo "SwiftNetStack E2E Test Suite"
 echo "========================================="
 echo "Kernel:  $KERNEL"
 echo "Initrd:  $INITRD"
+echo "Init:    $INIT"
 echo "Timeout: ${TIMEOUT}s"
-echo "Log:     $TMPLOG"
+if [ ${#HOST_ARGS[@]} -gt 0 ]; then
+    echo "Hosts:   ${HOST_ARGS[*]}"
+fi
 echo ""
 
 echo "Starting demo..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=/init loglevel=4 panic=10" \
+    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10" \
     --cpus 1 --memory 512 \
+    ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
     >"$TMPLOG" 2>&1 &
 DEMOPID=$!
 
-# Wait for DHCP lease or timeout
-PASS=0
+# Wait for test completion or timeout
 DEADLINE=$(($(date +%s) + TIMEOUT))
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    if grep -q "lease of .* obtained" "$TMPLOG" 2>/dev/null; then
-        PASS=1
-        sleep 1  # let ping finish
+    if grep -q '=== Test suite complete' "$TMPLOG" 2>/dev/null; then
+        sleep 2  # let final tests finish
         break
     fi
     if ! kill -0 "$DEMOPID" 2>/dev/null; then
-        echo "Demo exited early (PID $DEMOPID)"
+        echo "Demo exited early"
         break
     fi
     sleep 1
@@ -106,29 +115,44 @@ cat "$TMPLOG"
 echo "=== End output ==="
 echo ""
 
-# Extract key info
-LEASE=$(grep -o 'lease of [0-9.]* obtained' "$TMPLOG" 2>/dev/null || true)
-PING=$(grep -o '[0-9]* packets transmitted, [0-9]* received' "$TMPLOG" 2>/dev/null || true)
-
-if [ "$PASS" -eq 1 ]; then
-    echo ""
-    echo "========================================="
-    echo "PASS: $LEASE"
-    if [ -n "$PING" ]; then
-        echo "      $PING"
+# Parse test markers
+PASSED=()
+FAILED=()
+while IFS= read -r line; do
+    if echo "$line" | grep -q '\[TEST\] .* PASS'; then
+        name=$(echo "$line" | sed 's/.*\[TEST\] //;s/ PASS.*//')
+        PASSED+=("$name")
+    elif echo "$line" | grep -q '\[TEST\] .* FAIL'; then
+        name=$(echo "$line" | sed 's/.*\[TEST\] //;s/ FAIL.*//')
+        FAILED+=("$name")
     fi
-    echo "========================================="
-    EXIT=0
-else
-    echo ""
-    echo "========================================="
-    echo "FAIL: DHCP lease not obtained within ${TIMEOUT}s"
-    echo "========================================="
-    EXIT=1
-fi
+done < "$TMPLOG"
+
+TOTAL=$((${#PASSED[@]} + ${#FAILED[@]}))
+
+echo ""
+echo "========================================="
+echo "E2E Test Results"
+echo "========================================="
+for t in "${PASSED[@]}"; do
+    echo "  PASS  $t"
+done
+for t in "${FAILED[@]}"; do
+    echo "  FAIL  $t"
+done
+echo "-----------------------------------------"
+echo "  Total: ${#PASSED[@]} passed, ${#FAILED[@]} failed, $TOTAL tests"
+echo "========================================="
 
 # Cleanup
 kill "$DEMOPID" 2>/dev/null || true
 wait "$DEMOPID" 2>/dev/null || true
 
-exit $EXIT
+if [ ${#FAILED[@]} -gt 0 ]; then
+    exit 1
+elif [ "$TOTAL" -eq 0 ]; then
+    echo "WARNING: No test markers found (VM may have failed to boot)"
+    exit 1
+else
+    exit 0
+fi

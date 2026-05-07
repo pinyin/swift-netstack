@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the initramfs for SwiftNetStack DHCP E2E tests.
+# Build the initramfs for SwiftNetStack E2E tests.
 #
 # Requires:
 #   - busybox (aarch64 static) at initramfs/bin/busybox
@@ -20,26 +20,34 @@ mkdir -p "$BUILD_DIR/bin"
 cp "$SCRIPT_DIR/bin/busybox" "$BUILD_DIR/bin/busybox"
 chmod +x "$BUILD_DIR/bin/busybox"
 
-# Create symlinks for busybox applets used by our init script
+# Create symlinks for busybox applets
 BUSYBOX_APPLETS=(
     sh ash cat echo mount umount sleep
     ip ifconfig route ping
-    udhcpc ls mkdir poweroff
-    awk grep head tail
-    chmod cp ln
+    udhcpc nslookup
+    ls mkdir poweroff
+    awk grep head tail sed wc tr
+    chmod cp ln arp
 )
 for applet in "${BUSYBOX_APPLETS[@]}"; do
     ln -sf busybox "$BUILD_DIR/bin/$applet"
 done
 
 # Create essential directories
-mkdir -p "$BUILD_DIR"/{etc,proc,sys,dev,dev/pts,dev/shm,run,tmp,var,root,sbin,usr/share/udhcpc}
+mkdir -p "$BUILD_DIR"/{etc,proc,sys,dev,dev/pts,dev/shm,run,tmp,var,root,sbin,usr/share/udhcpc,tests}
 
-# Copy init and udhcpc script
+# Copy init
 cp "$SCRIPT_DIR/init" "$BUILD_DIR/init"
 chmod +x "$BUILD_DIR/init"
-cp "$SCRIPT_DIR/udhcpc.script" "$BUILD_DIR/usr/share/udhcpc/default.script"
-chmod +x "$BUILD_DIR/usr/share/udhcpc/default.script"
+
+# Copy all test scripts
+for f in "$SCRIPT_DIR/tests/"*; do
+    cp "$f" "$BUILD_DIR/tests/"
+    chmod +x "$BUILD_DIR/tests/$(basename "$f")"
+done
+
+# Install udhcpc callback at the path busybox expects
+ln -sf /tests/udhcpc.script "$BUILD_DIR/usr/share/udhcpc/default.script"
 
 # Create /etc/inittab (minimal)
 cat > "$BUILD_DIR/etc/inittab" <<'EOF'

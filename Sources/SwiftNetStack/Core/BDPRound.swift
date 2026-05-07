@@ -65,6 +65,7 @@ public func bdpRound(
             hostMAC: arpMapping.hostMAC,
             replies: &replies, round: round
         )
+        let replyCount = replies.count
         if !replies.isEmpty {
             transport.writePackets(replies)
             if let pw = pcapWriter {
@@ -73,7 +74,7 @@ public func bdpRound(
         }
         replies.removeAll()
         round.endRound()
-        return 0
+        return replyCount
     }
 
     // ── Phase 2: Parse ALL Ethernet headers ──

@@ -39,7 +39,6 @@ public struct DHCPServer {
                 packet: packet, srcMAC: srcMAC,
                 endpointID: endpointID, pool: &pool, round: round
             )
-            if result == nil { }
         case .request:
             result = handleRequest(
                 packet: packet, srcMAC: srcMAC,

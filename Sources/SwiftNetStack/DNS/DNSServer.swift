@@ -8,7 +8,7 @@ import Darwin
 /// transaction ID and relayed back to the VM.
 public struct DNSServer {
     private let hosts: [String: IPv4Address]
-    private let upstreamFD: Int32?
+    private var upstreamFD: Int32?
     private let upstreamAddr: sockaddr_in?
     private var pendingQueries: [UInt16: PendingQuery] = [:]
     private var nextTxID: UInt16 = 1
@@ -139,71 +139,71 @@ public struct DNSServer {
     ) {
         guard let fd = upstreamFD else { return }
 
-        // Read all available responses
-        var buf = [UInt8](repeating: 0, count: 2048)
+        // Expire stale pending queries first — runs every call regardless of
+        // whether responses arrive, so a quiet upstream won't leak entries.
         let now = UInt64(Darwin.time(nil))
-
-        while true {
-            let n = Darwin.recvfrom(fd, &buf, buf.count, 0, nil, nil)
-            guard n >= 12 else { break }
-
-            // Parse the response
-            let pkt = makePacketBuffer(buf, count: n, round: round)
-            guard let (rxID, question) = DNSPacket.parseResponse(from: pkt) else { continue }
-            guard let pending = pendingQueries.removeValue(forKey: rxID) else { continue }
-
-            // Reconstruct reply using the original transaction ID and deliver to VM
-            let normalised = DNSServer.normaliseHost(question.name)
-            if let ip = hosts[normalised] {
-                if let replyPayload = DNSPacket.buildAReply(
-                    txID: pending.originalTxID, question: pending.question, ip: ip, round: round
-                ) {
-                    if let frame = buildUDPFrame(
-                        hostMAC: hostMAC, dstMAC: pending.srcMAC,
-                        srcIP: pending.dstIP, dstIP: pending.srcIP,
-                        srcPort: pending.dstPort, dstPort: pending.srcPort,
-                        payload: replyPayload, round: round
-                    ) {
-                        replies.append((pending.endpointID, frame))
-                    }
-                }
-            } else if let ip = DNSPacket.extractFirstA(from: pkt) {
-                if let replyPayload = DNSPacket.buildAReply(
-                    txID: pending.originalTxID, question: pending.question, ip: ip, round: round
-                ) {
-                    if let frame = buildUDPFrame(
-                        hostMAC: hostMAC, dstMAC: pending.srcMAC,
-                        srcIP: pending.dstIP, dstIP: pending.srcIP,
-                        srcPort: pending.dstPort, dstPort: pending.srcPort,
-                        payload: replyPayload, round: round
-                    ) {
-                        replies.append((pending.endpointID, frame))
-                    }
-                }
-            } else {
-                // Upstream returned no A record — NXDOMAIN
-                if let replyPayload = DNSPacket.buildNXDOMAIN(
-                    txID: pending.originalTxID, question: pending.question, round: round
-                ) {
-                    if let frame = buildUDPFrame(
-                        hostMAC: hostMAC, dstMAC: pending.srcMAC,
-                        srcIP: pending.dstIP, dstIP: pending.srcIP,
-                        srcPort: pending.dstPort, dstPort: pending.srcPort,
-                        payload: replyPayload, round: round
-                    ) {
-                        replies.append((pending.endpointID, frame))
-                    }
-                }
-            }
-        }
-
-        // Cleanup expired pending queries
         var expired: [UInt16] = []
         for (txID, pq) in pendingQueries where now - pq.timestamp > DNSServer.pendingTimeout {
             expired.append(txID)
         }
         for txID in expired {
             pendingQueries.removeValue(forKey: txID)
+        }
+
+        // Drain all available responses
+        var buf = [UInt8](repeating: 0, count: 4096)
+
+        while true {
+            let n = Darwin.recvfrom(fd, &buf, buf.count, 0, nil, nil)
+            if n < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                if errno == EINTR { continue }
+                // Hard error on the upstream socket — close it so future
+                // lookups fall through to NXDOMAIN.
+                close(fd)
+                upstreamFD = nil
+                return
+            }
+            guard n >= 12 else { break }
+
+            let pkt = makePacketBuffer(buf, count: n, round: round)
+            guard let (rxID, _) = DNSPacket.parseResponse(from: pkt) else { continue }
+            guard let pending = pendingQueries.removeValue(forKey: rxID) else { continue }
+
+            let answerIP = DNSPacket.extractFirstA(from: pkt)
+            deliverReply(
+                txID: pending.originalTxID, question: pending.question,
+                answerIP: answerIP, pending: pending,
+                hostMAC: hostMAC, replies: &replies, round: round
+            )
+        }
+    }
+
+    /// Build and append a reply frame for a pending DNS query.
+    private func deliverReply(
+        txID: UInt16,
+        question: DNSQuestion,
+        answerIP: IPv4Address?,
+        pending: PendingQuery,
+        hostMAC: MACAddress,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)],
+        round: RoundContext
+    ) {
+        let payload: PacketBuffer?
+        if let ip = answerIP {
+            payload = DNSPacket.buildAReply(txID: txID, question: question, ip: ip, round: round)
+        } else {
+            payload = DNSPacket.buildNXDOMAIN(txID: txID, question: question, round: round)
+        }
+        guard let replyPayload = payload else { return }
+
+        if let frame = buildUDPFrame(
+            hostMAC: hostMAC, dstMAC: pending.srcMAC,
+            srcIP: pending.dstIP, dstIP: pending.srcIP,
+            srcPort: pending.dstPort, dstPort: pending.srcPort,
+            payload: replyPayload, round: round
+        ) {
+            replies.append((pending.endpointID, frame))
         }
     }
 
@@ -274,11 +274,6 @@ public struct DNSServer {
 }
 
 // MARK: - Helpers
-
-private func setNonBlocking(_ fd: Int32) {
-    let flags = fcntl(fd, F_GETFL, 0)
-    if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-}
 
 private func makePacketBuffer(_ data: [UInt8], count: Int, round: RoundContext) -> PacketBuffer {
     var pkt = round.allocate(capacity: count, headroom: 0)

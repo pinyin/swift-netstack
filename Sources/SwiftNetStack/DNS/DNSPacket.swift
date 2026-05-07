@@ -14,6 +14,21 @@ public struct DNSQuestion {
 /// uncompressed single questions).
 public enum DNSPacket {
 
+    // MARK: - DNS protocol constants
+
+    private enum Flag {
+        static let qrMask: UInt16       = 0x8000
+        static let opcodeMask: UInt16   = 0x7800
+        static let compression: UInt8   = 0xC0
+        static let query: UInt16        = 0x0100  // RD=1
+        static let reply: UInt16        = 0x8180  // QR=1, RD=1, RCODE=0
+        static let nxdomain: UInt16     = 0x8183  // QR=1, RD=1, RCODE=3
+    }
+
+    private enum RRType  { static let a: UInt16 = 1 }
+    private enum RRClass { static let `in`: UInt16 = 1 }
+    private static let rdLengthIPv4: UInt16 = 4
+
     // MARK: - Parse
 
     /// Parse a DNS query from raw UDP payload bytes.
@@ -28,8 +43,8 @@ public enum DNSPacket {
             let qdcount = readUInt16BE(base, 4)
 
             // QR must be 0 (query); only standard queries (opcode 0) are handled.
-            guard (flags & 0x8000) == 0 else { return nil }       // QR=0
-            guard (flags & 0x7800) == 0 else { return nil }       // OPCODE=0
+            guard (flags & Flag.qrMask) == 0 else { return nil }
+            guard (flags & Flag.opcodeMask) == 0 else { return nil }
             guard qdcount >= 1 else { return nil }
 
             // Parse the first QNAME
@@ -40,8 +55,7 @@ public enum DNSPacket {
             let qtype  = readUInt16BE(base, qOffset)
             let qclass = readUInt16BE(base, qOffset + 2)
 
-            // Only IN (1) class is supported
-            guard qclass == 1 else { return nil }
+            guard qclass == RRClass.in else { return nil }
 
             return (txID, DNSQuestion(name: name, type: qtype, class: qclass))
         }
@@ -71,7 +85,7 @@ public enum DNSPacket {
 
         // Header
         writeUInt16BE(txID, to: ptr)                           // Transaction ID
-        writeUInt16BE(0x8180, to: ptr.advanced(by: 2))         // Flags: QR=1, RD=1, RA=0
+        writeUInt16BE(Flag.reply, to: ptr.advanced(by: 2))     // Flags: QR=1, RD=1
         writeUInt16BE(0, to: ptr.advanced(by: 4))               // QDCOUNT (set below)
         writeUInt16BE(1, to: ptr.advanced(by: 6))               // ANCOUNT = 1
         writeUInt16BE(0, to: ptr.advanced(by: 8))               // NSCOUNT
@@ -87,10 +101,10 @@ public enum DNSPacket {
         // Answer section
         ptr.advanced(by: off).copyMemory(from: qnameLabels, byteCount: qnameLabels.count)
         off += qnameLabels.count
-        writeUInt16BE(1, to: ptr.advanced(by: off)); off += 2     // TYPE=A
-        writeUInt16BE(1, to: ptr.advanced(by: off)); off += 2     // CLASS=IN
+        writeUInt16BE(RRType.a, to: ptr.advanced(by: off)); off += 2
+        writeUInt16BE(RRClass.in, to: ptr.advanced(by: off)); off += 2
         writeUInt32BE(ttl, to: ptr.advanced(by: off)); off += 4   // TTL
-        writeUInt16BE(4, to: ptr.advanced(by: off)); off += 2     // RDLENGTH=4
+        writeUInt16BE(rdLengthIPv4, to: ptr.advanced(by: off)); off += 2
         ip.write(to: ptr.advanced(by: off))                       // RDATA (4 bytes)
 
         // Fix-up QDCOUNT to 1
@@ -113,7 +127,7 @@ public enum DNSPacket {
 
         // Header
         writeUInt16BE(txID, to: ptr)                           // Transaction ID
-        writeUInt16BE(0x8183, to: ptr.advanced(by: 2))         // Flags: QR=1, RD=1, RA=0, RCODE=3
+        writeUInt16BE(Flag.nxdomain, to: ptr.advanced(by: 2))  // Flags: QR=1, RD=1, RCODE=3
         writeUInt16BE(1, to: ptr.advanced(by: 4))               // QDCOUNT
         writeUInt16BE(0, to: ptr.advanced(by: 6))               // ANCOUNT
         writeUInt16BE(0, to: ptr.advanced(by: 8))               // NSCOUNT
@@ -142,7 +156,7 @@ public enum DNSPacket {
         guard let ptr = pkt.appendPointer(count: totalLen) else { return nil }
 
         writeUInt16BE(txID, to: ptr)                           // Transaction ID
-        writeUInt16BE(0x0100, to: ptr.advanced(by: 2))         // Flags: RD=1 (standard query)
+        writeUInt16BE(Flag.query, to: ptr.advanced(by: 2))     // Flags: RD=1
         writeUInt16BE(1, to: ptr.advanced(by: 4))               // QDCOUNT = 1
         writeUInt16BE(0, to: ptr.advanced(by: 6))               // ANCOUNT
         writeUInt16BE(0, to: ptr.advanced(by: 8))               // NSCOUNT
@@ -169,7 +183,7 @@ public enum DNSPacket {
             let qdcount = readUInt16BE(base, 4)
 
             // QR must be 1 (response)
-            guard (flags & 0x8000) != 0 else { return nil }
+            guard (flags & Flag.qrMask) != 0 else { return nil }
             guard qdcount >= 1 else { return nil }
 
             guard let (name, bytesUsed) = parseQName(from: buf, startOffset: 12) else { return nil }
@@ -206,7 +220,7 @@ public enum DNSPacket {
                 // Answer NAME (may use compression pointers)
                 let nameOff = off
                 var nameLen = 0
-                if buf[nameOff] & 0xC0 == 0xC0 {
+                if buf[nameOff] & Flag.compression == Flag.compression {
                     nameLen = 2  // compression pointer
                 } else {
                     guard let (_, consumed) = parseQName(from: buf, startOffset: nameOff) else { return nil }
@@ -219,7 +233,7 @@ public enum DNSPacket {
                 let aclass = readUInt16BE(base, off); off += 2
                 off += 4  // TTL
                 let rdlen  = readUInt16BE(base, off); off += 2
-                if atype == 1, aclass == 1, rdlen == 4, off + 4 <= buf.count {
+                if atype == RRType.a, aclass == RRClass.in, rdlen == rdLengthIPv4, off + 4 <= buf.count {
                     let a = buf[off]
                     let b = buf[off + 1]
                     let c = buf[off + 2]
@@ -247,7 +261,7 @@ public enum DNSPacket {
         while offset < buf.count {
             let len = buf[offset]
             if len == 0 { offset += 1; break }                // root label
-            if len & 0xC0 == 0xC0 { return nil }              // reject compression pointer
+            if len & Flag.compression == Flag.compression { return nil }              // reject compression pointer
             if len > 63 { return nil }                         // invalid label length
             offset += 1
             guard offset + Int(len) <= buf.count else { return nil }

@@ -90,7 +90,7 @@ struct BDPRoundIntegrationTests {
 
         // Build Ethernet/IPv4/UDP/DHCPDISCOVER
         let dhcpDiscover = makeDHCPPacketBytes(op: 1, xid: 42, chaddr: clientMAC, msgType: .discover)
-        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpDiscover)
+        let frame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: dhcpDiscover)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
@@ -122,7 +122,7 @@ struct BDPRoundIntegrationTests {
             (50, ipBytes(requestedIP)),
             (54, ipBytes(gateway)),
         ])
-        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
+        let frame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: dhcpRequest)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
@@ -154,7 +154,7 @@ struct BDPRoundIntegrationTests {
             (50, ipBytes(requestedIP)),
             (54, ipBytes(gateway)),
         ])
-        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpRequest)
+        let frame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: dhcpRequest)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
@@ -182,7 +182,7 @@ struct BDPRoundIntegrationTests {
         var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
         // Round 1: REQUEST (allocate lease)
-        let requestFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 1, chaddr: clientMAC, msgType: .request, extraOptions: [
+        let requestFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 1, chaddr: clientMAC, msgType: .request, extraOptions: [
             (50, ipBytes(requestedIP)),
             (54, ipBytes(gateway)),
         ]))
@@ -193,7 +193,7 @@ struct BDPRoundIntegrationTests {
         #expect(arpMapping.isKnown(requestedIP))
 
         // Round 2: RELEASE
-        let releaseFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: clientMAC, msgType: .release))
+        let releaseFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: clientMAC, msgType: .release))
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: releaseFrame)])
         let round2 = RoundContext()
         bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
@@ -201,7 +201,7 @@ struct BDPRoundIntegrationTests {
         #expect(!arpMapping.isKnown(requestedIP))
 
         // Round 3: DISCOVER should succeed (IP was reclaimed)
-        let discoverFrame = makeDHCPFrame(clientMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
+        let discoverFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
         var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discoverFrame)])
         let round3 = RoundContext()
         bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round3)
@@ -225,7 +225,7 @@ struct BDPRoundIntegrationTests {
         )
 
         // Frame 2: DHCP DISCOVER
-        let dhcpFrame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 77, chaddr: clientMAC, msgType: .discover))
+        let dhcpFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 77, chaddr: clientMAC, msgType: .discover))
 
         var transport: any Transport = InMemoryTransport(inputs: [
             (endpointID: 1, packet: arpFrame),
@@ -248,7 +248,7 @@ struct BDPRoundIntegrationTests {
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
         let clientIP = IPv4Address(100, 64, 1, 50)
 
-        let frame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x1234, seq: 0x0001)
+        let frame = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x1234, seq: 0x0001)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
@@ -304,7 +304,7 @@ struct BDPRoundIntegrationTests {
         let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
 
         let dhcpDiscover = makeDHCPPacketBytes(op: 1, xid: 42, chaddr: clientMAC, msgType: .discover)
-        let frame = makeDHCPFrame(clientMAC: clientMAC, dhcpPayload: dhcpDiscover)
+        let frame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: dhcpDiscover)
 
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
@@ -363,7 +363,7 @@ struct BDPRoundIntegrationTests {
         arpMapping.add(ip: ip2, mac: mac2, endpointID: 2)
 
         // VM A sends ICMP echo to VM B's MAC (not hostMAC)
-        let frame = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: ip2, id: 1, seq: 1)
+        let frame = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:mac1, clientIP: ip1, dstIP: ip2, id: 1, seq: 1)
         let l2Frame = makeEthernetFrame(
             dst: mac2, src: mac1, type: .ipv4,
             payload: extractEtherPayload(frame)
@@ -395,7 +395,7 @@ struct BDPRoundIntegrationTests {
         let clientMAC = MACAddress(0xAA, 0x00, 0x00, 0x00, 0x00, 0x01)
         let clientIP = IPv4Address(100, 64, 1, 50)
 
-        let frame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 1, seq: 1)
+        let frame = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:clientMAC, clientIP: clientIP, dstIP: gateway, id: 1, seq: 1)
         let l2Frame = makeEthernetFrame(
             dst: unknownMAC, src: clientMAC, type: .ipv4,
             payload: extractEtherPayload(frame)
@@ -462,10 +462,10 @@ struct BDPRoundIntegrationTests {
         arpMapping.add(ip: ip2, mac: mac2, endpointID: 2)
 
         // Frame 1: VM A → hostMAC (ICMP echo, local processing)
-        let localFrame = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: gateway, id: 1, seq: 1)
+        let localFrame = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:mac1, clientIP: ip1, dstIP: gateway, id: 1, seq: 1)
 
         // Frame 2: VM A → VM B MAC (forwarded)
-        let forwardContent = makeICMPEchoFrame(clientMAC: mac1, clientIP: ip1, dstIP: ip2, id: 2, seq: 1)
+        let forwardContent = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:mac1, clientIP: ip1, dstIP: ip2, id: 2, seq: 1)
         let forwardFrame = makeEthernetFrame(
             dst: mac2, src: mac1, type: .ipv4,
             payload: extractEtherPayload(forwardContent)
@@ -514,7 +514,7 @@ struct BDPRoundIntegrationTests {
 
         let payload: [UInt8] = [0x70, 0x69, 0x6E, 0x67]
         let frame = makeUDPFrame(
-            clientMAC: clientMAC,
+            dstMAC: hostMAC, clientMAC: clientMAC,
             srcIP: clientIP, dstIP: gateway,
             srcPort: 1234, dstPort: 7,
             payload: payload
@@ -558,7 +558,7 @@ struct BDPRoundIntegrationTests {
 
         let payload: [UInt8] = Array(0..<255)
         let frame = makeUDPFrame(
-            clientMAC: clientMAC,
+            dstMAC: hostMAC, clientMAC: clientMAC,
             srcIP: clientIP, dstIP: gateway,
             srcPort: 9999, dstPort: 7,
             payload: payload
@@ -592,7 +592,7 @@ struct BDPRoundIntegrationTests {
 
         // Send to port 53 (no socket registered)
         let frame = makeUDPFrame(
-            clientMAC: clientMAC,
+            dstMAC: hostMAC, clientMAC: clientMAC,
             srcIP: clientIP, dstIP: gateway,
             srcPort: 1234, dstPort: 53,
             payload: [0xAA, 0xBB]
@@ -616,11 +616,11 @@ struct BDPRoundIntegrationTests {
         let clientIP = IPv4Address(100, 64, 1, 50)
 
         // Frame 1: ICMP echo request
-        let icmpFrame = makeICMPEchoFrame(clientMAC: clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x42, seq: 0x01)
+        let icmpFrame = makeICMPEchoFrame(dstMAC: hostMAC, clientMAC:clientMAC, clientIP: clientIP, dstIP: gateway, id: 0x42, seq: 0x01)
 
         // Frame 2: UDP echo request to port 7
         let udpFrame = makeUDPFrame(
-            clientMAC: clientMAC,
+            dstMAC: hostMAC, clientMAC: clientMAC,
             srcIP: clientIP, dstIP: gateway,
             srcPort: 5555, dstPort: 7,
             payload: [0x48, 0x65, 0x6C, 0x6C, 0x6F]
@@ -651,271 +651,6 @@ struct BDPRoundIntegrationTests {
         #expect(udpReplies == 1, "expected 1 UDP reply")
     }
 
-    // MARK: - Helpers
-
-    /// Unwrap Ethernet → IPv4 → UDP → DHCP and parse the inner DHCP packet.
-    private func extractDHCPFromReply(_ pkt: PacketBuffer) -> DHCPPacket? {
-        guard let eth = EthernetFrame.parse(from: pkt),
-              eth.etherType == .ipv4,
-              let ip = IPv4Header.parse(from: eth.payload),
-              ip.protocol == .udp else { return nil }
-        // Skip UDP header (8 bytes)
-        let udpPayload = ip.payload
-        guard udpPayload.totalLength >= 8 else { return nil }
-        guard let dhcpPayload = udpPayload.slice(from: 8, length: udpPayload.totalLength - 8) else { return nil }
-        return DHCPPacket.parse(from: dhcpPayload)
-    }
-
-    private func makeEthernetFrame(dst: MACAddress, src: MACAddress, type: EtherType, payload: [UInt8]) -> PacketBuffer {
-        var bytes: [UInt8] = []
-        var buf6 = [UInt8](repeating: 0, count: 6)
-        dst.write(to: &buf6); bytes.append(contentsOf: buf6)
-        src.write(to: &buf6); bytes.append(contentsOf: buf6)
-        let etRaw = type.rawValue
-        bytes.append(UInt8(etRaw >> 8))
-        bytes.append(UInt8(etRaw & 0xFF))
-        bytes.append(contentsOf: payload)
-        let s = Storage.allocate(capacity: bytes.count)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
-        return PacketBuffer(storage: s, offset: 0, length: bytes.count)
-    }
-
-    /// Extract the payload after the 14-byte Ethernet header as raw bytes.
-    private func extractEtherPayload(_ pkt: PacketBuffer) -> [UInt8] {
-        guard pkt.totalLength > 14 else { return [] }
-        guard let payload = pkt.slice(from: 14, length: pkt.totalLength - 14) else { return [] }
-        return payload.withUnsafeReadableBytes { Array($0) }
-    }
-
-    private func makeARPPayload(op: ARPOperation, senderMAC: MACAddress, senderIP: IPv4Address, targetMAC: MACAddress, targetIP: IPv4Address) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: 28)
-        bytes[0] = 0x00; bytes[1] = 0x01
-        bytes[2] = 0x08; bytes[3] = 0x00
-        bytes[4] = 6; bytes[5] = 4
-        bytes[6] = UInt8(op.rawValue >> 8)
-        bytes[7] = UInt8(op.rawValue & 0xFF)
-        var buf6 = [UInt8](repeating: 0, count: 6)
-        var buf4 = [UInt8](repeating: 0, count: 4)
-        senderMAC.write(to: &buf6); bytes.replaceSubrange(8..<14, with: buf6)
-        senderIP.write(to: &buf4); bytes.replaceSubrange(14..<18, with: buf4)
-        targetMAC.write(to: &buf6); bytes.replaceSubrange(18..<24, with: buf6)
-        targetIP.write(to: &buf4); bytes.replaceSubrange(24..<28, with: buf4)
-        return bytes
-    }
-
-    private func ipBytes(_ ip: IPv4Address) -> [UInt8] {
-        var buf = [UInt8](repeating: 0, count: 4)
-        ip.write(to: &buf)
-        return buf
-    }
-
-    /// Build a full Ethernet/IPv4/ICMP Echo Request frame.
-    private func makeICMPEchoFrame(clientMAC: MACAddress, clientIP: IPv4Address, dstIP: IPv4Address, id: UInt16, seq: UInt16, payload: [UInt8] = [0x70, 0x69, 0x6E, 0x67]) -> PacketBuffer {
-        let icmpLen = 8 + payload.count
-        let ipTotalLen = 20 + icmpLen
-
-        // ICMP header + payload
-        var icmpBytes: [UInt8] = []
-        icmpBytes.append(8); icmpBytes.append(0)  // type=8 (echo request), code=0
-        icmpBytes.append(0); icmpBytes.append(0)  // checksum placeholder
-        icmpBytes.append(UInt8(id >> 8)); icmpBytes.append(UInt8(id & 0xFF))
-        icmpBytes.append(UInt8(seq >> 8)); icmpBytes.append(UInt8(seq & 0xFF))
-        icmpBytes.append(contentsOf: payload)
-        let icmpCksum = icmpBytes.withUnsafeBytes { internetChecksum($0) }
-        icmpBytes[2] = UInt8(icmpCksum >> 8)
-        icmpBytes[3] = UInt8(icmpCksum & 0xFF)
-
-        // IPv4 header
-        var ipBytes = [UInt8](repeating: 0, count: 20)
-        ipBytes[0] = 0x45
-        ipBytes[2] = UInt8(ipTotalLen >> 8)
-        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
-        ipBytes[8] = 64
-        ipBytes[9] = IPProtocol.icmp.rawValue
-        clientIP.write(to: &ipBytes[12])
-        dstIP.write(to: &ipBytes[16])
-        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
-        ipBytes[10] = UInt8(ipCksum >> 8)
-        ipBytes[11] = UInt8(ipCksum & 0xFF)
-
-        return makeEthernetFrame(
-            dst: hostMAC,
-            src: clientMAC,
-            type: .ipv4,
-            payload: ipBytes + icmpBytes
-        )
-    }
-
-    /// Build a full Ethernet/IPv4/UDP/DHCP frame.
-    private func makeDHCPFrame(clientMAC: MACAddress, dhcpPayload: [UInt8]) -> PacketBuffer {
-        let udpLen = 8 + dhcpPayload.count
-        let ipTotalLen = 20 + udpLen
-
-        // IPv4 header
-        var ipBytes = [UInt8](repeating: 0, count: 20)
-        ipBytes[0] = 0x45
-        ipBytes[2] = UInt8(ipTotalLen >> 8)
-        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
-        ipBytes[8] = 64
-        ipBytes[9] = IPProtocol.udp.rawValue
-        IPv4Address(10, 0, 0, 50).write(to: &ipBytes[12])   // src
-        IPv4Address(100, 64, 1, 1).write(to: &ipBytes[16])   // dst = gateway
-        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
-        ipBytes[10] = UInt8(ipCksum >> 8)
-        ipBytes[11] = UInt8(ipCksum & 0xFF)
-
-        // UDP header: srcPort=68 (client), dstPort=67 (server)
-        var udpBytes = [UInt8](repeating: 0, count: 8)
-        udpBytes[0] = 0x00; udpBytes[1] = 68   // src port 68
-        udpBytes[2] = 0x00; udpBytes[3] = 67   // dst port 67
-        udpBytes[4] = UInt8(udpLen >> 8)
-        udpBytes[5] = UInt8(udpLen & 0xFF)
-        // checksum = 0 (UDP checksum is optional for IPv4)
-
-        return makeEthernetFrame(
-            dst: hostMAC,
-            src: clientMAC,
-            type: .ipv4,
-            payload: ipBytes + udpBytes + dhcpPayload
-        )
-    }
-
-    /// Build a full Ethernet/IPv4/UDP frame with computed checksums.
-    private func makeUDPFrame(
-        clientMAC: MACAddress,
-        srcIP: IPv4Address, dstIP: IPv4Address,
-        srcPort: UInt16, dstPort: UInt16,
-        payload: [UInt8]
-    ) -> PacketBuffer {
-        let udpLen = 8 + payload.count
-        let ipTotalLen = 20 + udpLen
-
-        // IPv4 header
-        var ipBytes = [UInt8](repeating: 0, count: 20)
-        ipBytes[0] = 0x45
-        ipBytes[2] = UInt8(ipTotalLen >> 8)
-        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
-        ipBytes[6] = 0x40; ipBytes[7] = 0x00  // DF flag
-        ipBytes[8] = 64
-        ipBytes[9] = IPProtocol.udp.rawValue
-        srcIP.write(to: &ipBytes[12])
-        dstIP.write(to: &ipBytes[16])
-        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
-        ipBytes[10] = UInt8(ipCksum >> 8)
-        ipBytes[11] = UInt8(ipCksum & 0xFF)
-
-        // UDP header: zero checksum for now, compute later
-        var udpBytes: [UInt8] = []
-        udpBytes.append(UInt8(srcPort >> 8))
-        udpBytes.append(UInt8(srcPort & 0xFF))
-        udpBytes.append(UInt8(dstPort >> 8))
-        udpBytes.append(UInt8(dstPort & 0xFF))
-        udpBytes.append(UInt8(udpLen >> 8))
-        udpBytes.append(UInt8(udpLen & 0xFF))
-        udpBytes.append(0); udpBytes.append(0)  // checksum
-        udpBytes.append(contentsOf: payload)
-
-        // Compute UDP checksum over pseudo-header
-        var ckBuf = [UInt8](repeating: 0, count: 12 + udpLen)
-        var ipOut = [UInt8](repeating: 0, count: 4)
-        srcIP.write(to: &ipOut); ckBuf[0...3] = ipOut[0...3]
-        dstIP.write(to: &ipOut); ckBuf[4...7] = ipOut[0...3]
-        ckBuf[9] = IPProtocol.udp.rawValue
-        ckBuf[10] = UInt8(udpLen >> 8)
-        ckBuf[11] = UInt8(udpLen & 0xFF)
-        for i in 0..<udpLen { ckBuf[12 + i] = udpBytes[i] }
-        let ck = ckBuf.withUnsafeBytes { internetChecksum($0) }
-        let finalCk = ck == 0 ? 0xFFFF : ck
-        udpBytes[6] = UInt8(finalCk >> 8)
-        udpBytes[7] = UInt8(finalCk & 0xFF)
-
-        return makeEthernetFrame(
-            dst: hostMAC,
-            src: clientMAC,
-            type: .ipv4,
-            payload: ipBytes + udpBytes
-        )
-    }
-
-    /// Build a raw DHCP packet (240-byte header + magic + options), suitable for DHCPPacket.parse.
-    private func makeDHCPPacketBytes(op: UInt8, xid: UInt32, chaddr: MACAddress,
-                                      msgType: DHCPMessageType,
-                                      extraOptions: [(UInt8, [UInt8])] = []) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: 243)
-        bytes[0] = op
-        bytes[1] = 1   // htype = Ethernet
-        bytes[2] = 6   // hlen = MAC address length
-        bytes[4] = UInt8((xid >> 24) & 0xFF)
-        bytes[5] = UInt8((xid >> 16) & 0xFF)
-        bytes[6] = UInt8((xid >> 8) & 0xFF)
-        bytes[7] = UInt8(xid & 0xFF)
-        var buf6 = [UInt8](repeating: 0, count: 6)
-        chaddr.write(to: &buf6); bytes.replaceSubrange(28..<34, with: buf6)
-        // Magic cookie
-        bytes[236] = 99; bytes[237] = 130; bytes[238] = 83; bytes[239] = 99
-        // Option 53
-        bytes[240] = 53; bytes[241] = 1; bytes[242] = msgType.rawValue
-
-        var optIdx = 243
-        for (code, value) in extraOptions {
-            if optIdx + 2 + value.count > bytes.count {
-                bytes.append(contentsOf: [UInt8](repeating: 0, count: optIdx + 2 + value.count - bytes.count))
-            }
-            bytes[optIdx] = code
-            bytes[optIdx + 1] = UInt8(value.count)
-            bytes.replaceSubrange((optIdx + 2)..<(optIdx + 2 + value.count), with: value)
-            optIdx += 2 + value.count
-        }
-        if optIdx >= bytes.count { bytes.append(0) }
-        bytes[optIdx] = 255
-        return bytes
-    }
-
-    // MARK: - TCP frame helper
-
-    /// Build a minimal Ethernet/IPv4/TCP SYN frame. The TCP checksum is left as 0
-    /// since our stack never parses TCP — only the IP layer needs to be valid.
-    private func makeTCPSYNFrame(
-        clientMAC: MACAddress,
-        srcIP: IPv4Address, dstIP: IPv4Address,
-        srcPort: UInt16, dstPort: UInt16
-    ) -> PacketBuffer {
-        let tcpLen = 20  // minimal TCP header
-        let ipTotalLen = 20 + tcpLen
-
-        // IPv4 header
-        var ipBytes = [UInt8](repeating: 0, count: 20)
-        ipBytes[0] = 0x45
-        ipBytes[2] = UInt8(ipTotalLen >> 8)
-        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
-        ipBytes[6] = 0x40; ipBytes[7] = 0x00  // DF flag
-        ipBytes[8] = 64
-        ipBytes[9] = IPProtocol.tcp.rawValue
-        srcIP.write(to: &ipBytes[12])
-        dstIP.write(to: &ipBytes[16])
-        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
-        ipBytes[10] = UInt8(ipCksum >> 8)
-        ipBytes[11] = UInt8(ipCksum & 0xFF)
-
-        // TCP header (minimal SYN)
-        var tcpBytes = [UInt8](repeating: 0, count: 20)
-        tcpBytes[0] = UInt8(srcPort >> 8)
-        tcpBytes[1] = UInt8(srcPort & 0xFF)
-        tcpBytes[2] = UInt8(dstPort >> 8)
-        tcpBytes[3] = UInt8(dstPort & 0xFF)
-        tcpBytes[4] = 0x00; tcpBytes[5] = 0x00  // seq=0
-        tcpBytes[6] = 0x00; tcpBytes[7] = 0x00  // seq=0 (cont)
-        tcpBytes[12] = 0x50                      // data offset = 5 (20 bytes)
-        tcpBytes[13] = 0x02                      // flags = SYN
-
-        return makeEthernetFrame(
-            dst: hostMAC,
-            src: clientMAC,
-            type: .ipv4,
-            payload: ipBytes + tcpBytes
-        )
-    }
-
     // MARK: - TCP is now handled by the NAT stack
 
     /// With TCP+NAT support, a TCP SYN no longer generates ICMP Protocol Unreachable.
@@ -928,7 +663,7 @@ struct BDPRoundIntegrationTests {
         let clientIP = IPv4Address(100, 64, 1, 50)
 
         let frame = makeTCPSYNFrame(
-            clientMAC: clientMAC,
+            dstMAC: hostMAC, clientMAC: clientMAC,
             srcIP: clientIP, dstIP: gateway,
             srcPort: 12345, dstPort: 80
         )

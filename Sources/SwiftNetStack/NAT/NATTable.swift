@@ -926,11 +926,6 @@ private func bindOnly(fd: Int32, port: UInt16) -> Int32? {
     return fd
 }
 
-private func setNonBlocking(_ fd: Int32) {
-    let flags = fcntl(fd, F_GETFL, 0)
-    if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-}
-
 private func setNoDelay(_ fd: Int32) {
     var nodelay: Int32 = 1
     _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))

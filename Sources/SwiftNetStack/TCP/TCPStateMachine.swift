@@ -42,6 +42,9 @@ public struct TCPSegmentToSend {
 /// Optional tracing hook called whenever the TCP FSM changes state.
 /// Signature: `(oldState, newState, triggerFlags, appClose) -> Void`.
 /// Set from tests or main to visualise connection lifecycle.
+///
+/// The closure must not throw, block the calling thread, or capture heavy
+/// state — it is invoked synchronously on every TCP state transition.
 public nonisolated(unsafe) var tcpStateTransitionTracer: ((TCPState, TCPState, TCPFlags, Bool) -> Void)?
 
 /// Process an incoming TCP segment through the finite state machine.

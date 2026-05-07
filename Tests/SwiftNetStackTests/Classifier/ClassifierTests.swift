@@ -33,7 +33,7 @@ struct ClassifierTests {
 
     @Test func nonMatchingMACGoesToUnknown() {
         let otherMAC = MACAddress(0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA)
-        let frame = makeEthernetFrame(dst: otherMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), type: .ipv4)
+        let frame = makeEthernetFrame(dst: otherMAC, src: MACAddress(0x12, 0x22, 0x33, 0x44, 0x55, 0x66), type: .ipv4, payload: [])
 
         let result = classifyFrames([frame], hostMAC: hostMAC)
         #expect(result.unknown.count == 1)
@@ -159,20 +159,6 @@ struct ClassifierTests {
     }
 
     // MARK: - Helpers
-
-    private func makeEthernetFrame(dst: MACAddress, src: MACAddress, type: EtherType, payload: [UInt8] = []) -> PacketBuffer {
-        var bytes: [UInt8] = []
-        var buf6 = [UInt8](repeating: 0, count: 6)
-        dst.write(to: &buf6); bytes.append(contentsOf: buf6)
-        src.write(to: &buf6); bytes.append(contentsOf: buf6)
-        let etRaw = type.rawValue
-        bytes.append(UInt8(etRaw >> 8))
-        bytes.append(UInt8(etRaw & 0xFF))
-        bytes.append(contentsOf: payload)
-        let s = Storage.allocate(capacity: bytes.count)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
-        return PacketBuffer(storage: s, offset: 0, length: bytes.count)
-    }
 
     private func validARPPayload() -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: 28)

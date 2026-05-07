@@ -7,3 +7,6 @@ Packages/
 .build-*
 /tmp/
 *.dSYM/
+
+# E2E build artifacts
+e2e/initramfs/initramfs.cpio.gz

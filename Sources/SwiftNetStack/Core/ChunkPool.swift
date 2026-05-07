@@ -31,8 +31,10 @@ public final class ChunkPool {
     /// Amortized O(1): appends N chunks in a single array operation.
     public func batchRelease(_ chunks: [Storage]) {
         #if DEBUG
+        // O(N + M) via Set instead of O(N×M) linear scan.
+        let freeSet = Set(freeList.map { ObjectIdentifier($0) })
         for s in chunks {
-            precondition(!freeList.contains(where: { $0 === s }),
+            precondition(!freeSet.contains(ObjectIdentifier(s)),
                 "ChunkPool.batchRelease: duplicate release detected (Storage \(ObjectIdentifier(s)))")
             s.data.initializeMemory(as: UInt8.self, repeating: 0xCC, count: s.capacity)
         }

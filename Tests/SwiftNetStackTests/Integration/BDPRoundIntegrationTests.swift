@@ -869,4 +869,117 @@ struct BDPRoundIntegrationTests {
         bytes[optIdx] = 255
         return bytes
     }
+
+    // MARK: - TCP frame helper
+
+    /// Build a minimal Ethernet/IPv4/TCP SYN frame. The TCP checksum is left as 0
+    /// since our stack never parses TCP — only the IP layer needs to be valid.
+    private func makeTCPSYNFrame(
+        clientMAC: MACAddress,
+        srcIP: IPv4Address, dstIP: IPv4Address,
+        srcPort: UInt16, dstPort: UInt16
+    ) -> PacketBuffer {
+        let tcpLen = 20  // minimal TCP header
+        let ipTotalLen = 20 + tcpLen
+
+        // IPv4 header
+        var ipBytes = [UInt8](repeating: 0, count: 20)
+        ipBytes[0] = 0x45
+        ipBytes[2] = UInt8(ipTotalLen >> 8)
+        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
+        ipBytes[6] = 0x40; ipBytes[7] = 0x00  // DF flag
+        ipBytes[8] = 64
+        ipBytes[9] = IPProtocol.tcp.rawValue
+        srcIP.write(to: &ipBytes[12])
+        dstIP.write(to: &ipBytes[16])
+        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
+        ipBytes[10] = UInt8(ipCksum >> 8)
+        ipBytes[11] = UInt8(ipCksum & 0xFF)
+
+        // TCP header (minimal SYN)
+        var tcpBytes = [UInt8](repeating: 0, count: 20)
+        tcpBytes[0] = UInt8(srcPort >> 8)
+        tcpBytes[1] = UInt8(srcPort & 0xFF)
+        tcpBytes[2] = UInt8(dstPort >> 8)
+        tcpBytes[3] = UInt8(dstPort & 0xFF)
+        tcpBytes[4] = 0x00; tcpBytes[5] = 0x00  // seq=0
+        tcpBytes[6] = 0x00; tcpBytes[7] = 0x00  // seq=0 (cont)
+        tcpBytes[12] = 0x50                      // data offset = 5 (20 bytes)
+        tcpBytes[13] = 0x02                      // flags = SYN
+
+        return makeEthernetFrame(
+            dst: hostMAC,
+            src: clientMAC,
+            type: .ipv4,
+            payload: ipBytes + tcpBytes
+        )
+    }
+
+    // MARK: - ISSUE-5: TCP silent drop → ICMP Protocol Unreachable
+
+    /// Reproduces audit finding ISSUE-5: `bdpRound` Phase 6 `default: break`
+    /// silently drops TCP packets without sending ICMP Destination Unreachable
+    /// (Protocol Unreachable, Type 3 Code 2). The client waits forever for a
+    /// SYN-ACK that will never come.
+    ///
+    /// Fix: unreachable protocols are tracked in `unreachableParsed` and Phase 7.x
+    /// generates ICMP Protocol Unreachable replies.
+    @Test func tcpSYNGeneratesICMPProtocolUnreachable() {
+        let ep = makeEndpoint()
+        let clientMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+        let clientIP = IPv4Address(100, 64, 1, 50)
+
+        let frame = makeTCPSYNFrame(
+            clientMAC: clientMAC,
+            srcIP: clientIP, dstIP: gateway,
+            srcPort: 12345, dstPort: 80
+        )
+
+        var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
+        var arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: [ep])
+        var dhcpServer = DHCPServer(endpoints: [ep])
+        let round = RoundContext(); var udpTable = UDPSocketTable(); var reasm = IPFragmentReassembler()
+
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer,
+                 routingTable: RoutingTable(), udpSocketTable: &udpTable,
+                 ipFragmentReassembler: &reasm, round: round)
+
+        let outputs = (transport as! InMemoryTransport).outputs
+        #expect(outputs.count == 1,
+            "ISSUE-5 FAIL: expected 1 ICMP Protocol Unreachable reply, got \(outputs.count) — TCP SYN is still silently dropped")
+        guard outputs.count == 1 else { return }
+
+        let reply = outputs[0].packet
+        #expect(outputs[0].endpointID == 1)
+
+        // Parse the reply
+        guard let eth = EthernetFrame.parse(from: reply) else {
+            Issue.record("reply is not valid Ethernet")
+            return
+        }
+        #expect(eth.dstMAC == clientMAC)
+        #expect(eth.srcMAC == hostMAC)
+        #expect(eth.etherType == .ipv4)
+
+        guard let ip = IPv4Header.parse(from: eth.payload) else {
+            Issue.record("reply does not contain valid IPv4")
+            return
+        }
+        #expect(ip.srcAddr == gateway)
+        #expect(ip.dstAddr == clientIP)
+        #expect(ip.protocol == .icmp)
+        #expect(ip.verifyChecksum())
+
+        guard let icmp = ICMPHeader.parse(from: ip.payload) else {
+            Issue.record("reply does not contain valid ICMP")
+            return
+        }
+        #expect(icmp.type == 3, "ICMP type should be 3 (Destination Unreachable), got \(icmp.type)")
+        #expect(icmp.code == 2, "ICMP code should be 2 (Protocol Unreachable), got \(icmp.code)")
+
+        // Verify ICMP payload contains the original IP header: check that the
+        // payload starts with 0x45 (IPv4 version+IHL) and contains TCP protocol (6)
+        #expect(icmp.payload.totalLength >= 28,
+            "ICMP payload should contain original IP header (20 bytes) + 8 bytes of original data")
+    }
 }

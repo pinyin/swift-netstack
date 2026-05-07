@@ -78,10 +78,12 @@ public struct PollingTransport: Transport {
         var fds: [Int32] = []
         var pollfds: [pollfd] = []
 
+        // O(E + P) via Set instead of O(E × P) linear scan per endpoint.
+        let pendingEndpointIDs = Set(pendingWrites.map { $0.endpointID })
         for (fd, ep) in endpointsByFD {
             fds.append(fd)
             var events = Int16(POLLIN)
-            if pendingWrites.contains(where: { $0.endpointID == ep.id }) {
+            if pendingEndpointIDs.contains(ep.id) {
                 events |= Int16(POLLOUT)
             }
             pollfds.append(pollfd(fd: fd, events: events, revents: 0))

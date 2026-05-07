@@ -80,6 +80,35 @@ public struct UDPHeader {
 
 // MARK: - UDP pseudo-header checksum (RFC 768)
 
+/// Compute the UDP checksum from a contiguous UDP header+payload in memory.
+///
+/// Low-level helper used by both parse-time (`udpChecksum`) and build-time
+/// (`buildUDPFrame`, `buildDHCPFrame`) paths. The caller must ensure `udpData`
+/// points to `udpLen` bytes of contiguous UDP header + payload.
+///
+/// Returns 0xFFFF instead of 0 to distinguish "computed zero" from "unused"
+/// (RFC 768 §1).
+func computeUDPChecksum(
+    pseudoSrcAddr: IPv4Address,
+    pseudoDstAddr: IPv4Address,
+    udpData: UnsafeRawPointer,
+    udpLen: Int
+) -> UInt16 {
+    // pseudo-header: srcIP(4) + dstIP(4) + zero(1) + protocol(1) + udpLength(2) = 12
+    var buf = [UInt8](repeating: 0, count: 12 + udpLen)
+    var ipOut = [UInt8](repeating: 0, count: 4)
+    pseudoSrcAddr.write(to: &ipOut); buf[0...3] = ipOut[0...3]
+    pseudoDstAddr.write(to: &ipOut); buf[4...7] = ipOut[0...3]
+    buf[9] = IPProtocol.udp.rawValue
+    buf[10] = UInt8(udpLen >> 8)
+    buf[11] = UInt8(udpLen & 0xFF)
+    buf.withUnsafeMutableBytes { dst in
+        dst.baseAddress!.advanced(by: 12).copyMemory(from: udpData, byteCount: udpLen)
+    }
+    let ck = buf.withUnsafeBytes { internetChecksum($0) }
+    return ck == 0 ? 0xFFFF : ck
+}
+
 /// Compute the UDP checksum over pseudo-header + UDP header + payload.
 /// Returns nil if the payload cannot be made contiguous.
 /// Returns 0xFFFF instead of 0 to distinguish "computed zero" from "unused" (RFC 768 §1).
@@ -93,21 +122,12 @@ public func udpChecksum(
     guard pkt.pullUp(udpPayload.totalLength) else { return nil }
 
     return pkt.withUnsafeReadableBytes { udpBuf in
-        // pseudo-header: srcIP(4) + dstIP(4) + zero(1) + protocol(1) + udpLength(2) = 12
-        var buf = [UInt8](repeating: 0, count: 12 + udpBuf.count)
-        var ipOut = [UInt8](repeating: 0, count: 4)
-        pseudoSrcAddr.write(to: &ipOut); buf[0...3] = ipOut[0...3]
-        pseudoDstAddr.write(to: &ipOut); buf[4...7] = ipOut[0...3]
-        buf[9] = IPProtocol.udp.rawValue
-        buf[10] = UInt8(udpLen >> 8)
-        buf[11] = UInt8(udpLen & 0xFF)
-        // Copy UDP header + payload (checksum field already zeroed by caller if building)
-        buf.withUnsafeMutableBytes { dst in
-            let dstBase = dst.baseAddress!.advanced(by: 12)
-            dstBase.copyMemory(from: udpBuf.baseAddress!, byteCount: udpBuf.count)
-        }
-        let ck = buf.withUnsafeBytes { internetChecksum($0) }
-        return ck == 0 ? 0xFFFF : ck
+        computeUDPChecksum(
+            pseudoSrcAddr: pseudoSrcAddr,
+            pseudoDstAddr: pseudoDstAddr,
+            udpData: udpBuf.baseAddress!,
+            udpLen: Int(udpLen)
+        )
     }
 }
 
@@ -141,22 +161,12 @@ public func buildUDPFrame(
     writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
 
     // IPv4 header (20 bytes) at offset 14
-    let ipPtr = ptr.advanced(by: 14)
-    ipPtr.storeBytes(of: UInt8(0x45), as: UInt8.self)            // version=4, IHL=5
-    writeUInt16BE(UInt16(ipTotalLen), to: ipPtr.advanced(by: 2)) // total length
-    writeUInt16BE(0x4000, to: ipPtr.advanced(by: 6))             // flags=DF, offset=0
-    ipPtr.advanced(by: 8).storeBytes(of: UInt8(64), as: UInt8.self) // TTL
-    ipPtr.advanced(by: 9).storeBytes(of: IPProtocol.udp.rawValue, as: UInt8.self)
-    writeUInt16BE(0, to: ipPtr.advanced(by: 10))                 // zero checksum
-    srcIP.write(to: ipPtr.advanced(by: 12))                      // src IP
-    dstIP.write(to: ipPtr.advanced(by: 16))                      // dst IP
-
-    // IP header checksum
-    let ipCksum = internetChecksum(UnsafeRawBufferPointer(start: ipPtr, count: 20))
-    writeUInt16BE(ipCksum, to: ipPtr.advanced(by: 10))
+    let ipPtr = ptr.advanced(by: ethHeaderLen)
+    writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
+                    srcIP: srcIP, dstIP: dstIP)
 
     // UDP header (8 bytes) at offset 34
-    let udpPtr = ipPtr.advanced(by: 20)
+    let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
     writeUInt16BE(srcPort, to: udpPtr)
     writeUInt16BE(dstPort, to: udpPtr.advanced(by: 2))
     writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
@@ -164,25 +174,15 @@ public func buildUDPFrame(
 
     // UDP payload
     payload.withUnsafeReadableBytes { payloadBuf in
-        udpPtr.advanced(by: 8).copyMemory(from: payloadBuf.baseAddress!, byteCount: payloadBuf.count)
+        udpPtr.advanced(by: udpHeaderLen).copyMemory(from: payloadBuf.baseAddress!, byteCount: payloadBuf.count)
     }
 
-    // UDP pseudo-header checksum: RFC 768 pseudo-header + UDP header + payload.
-    // The UDP header+payload is already laid out contiguously at udpPtr.
-    // Build a combined buffer for checksum computation.
-    var ckBuf = [UInt8](repeating: 0, count: 12 + udpTotalLen)
-    var ipOut = [UInt8](repeating: 0, count: 4)
-    srcIP.write(to: &ipOut); ckBuf[0...3] = ipOut[0...3]
-    dstIP.write(to: &ipOut); ckBuf[4...7] = ipOut[0...3]
-    ckBuf[9] = IPProtocol.udp.rawValue
-    ckBuf[10] = UInt8(udpTotalLen >> 8)
-    ckBuf[11] = UInt8(udpTotalLen & 0xFF)
-    // Copy UDP header + payload (bytes 34..<34+udpTotalLen)
-    for i in 0..<udpTotalLen {
-        ckBuf[12 + i] = udpPtr.advanced(by: i).load(as: UInt8.self)
-    }
-    let ck = ckBuf.withUnsafeBytes { internetChecksum($0) }
-    writeUInt16BE(ck == 0 ? 0xFFFF : ck, to: udpPtr.advanced(by: 6))
+    // UDP pseudo-header checksum (RFC 768)
+    let ck = computeUDPChecksum(
+        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
+        udpData: udpPtr, udpLen: udpTotalLen
+    )
+    writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
 
     return frame
 }

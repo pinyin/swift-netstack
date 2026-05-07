@@ -184,7 +184,8 @@ func debugValidateDHCPPacket(_ dhcp: DHCPPacket) {
 func debugValidateTransportParse(
     icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)],
     udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)],
-    dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)]
+    dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)],
+    unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)]
 ) {
     for (_, _, ip, _) in icmpParsed {
         precondition(ip.protocol == .icmp,
@@ -197,6 +198,10 @@ func debugValidateTransportParse(
     for (_, _, ip, _) in dhcpParsed {
         precondition(ip.protocol == .udp,
             "Transport parse: ip.protocol must be .udp for DHCP entries, got \(ip.protocol)")
+    }
+    for (_, _, ip) in unreachableParsed {
+        precondition(ip.protocol != .icmp && ip.protocol != .udp,
+            "Transport parse: unreachable protocol must not be .icmp or .udp, got \(ip.protocol)")
     }
 }
 
@@ -457,7 +462,7 @@ private func extractDHCPFromReplyFrame(_ pkt: PacketBuffer) -> DHCPPacket? {
             pseudoDstAddr: ip.dstAddr
           ),
           udp.srcPort == 67, udp.dstPort == 68 else { return nil }
-    return extractDHCP(from: udp.payload)
+    return DHCPPacket.parse(from: udp.payload)
 }
 
 func debugValidateDHCPPhase(

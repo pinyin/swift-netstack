@@ -9,6 +9,14 @@ struct DHCPServerTests {
         VMEndpoint(id: id, fd: Int32(id + 100), subnet: subnet, gateway: gateway, mtu: 1500)
     }
 
+    // Helper: extract DHCP payload from a full Ethernet frame (Ethernet + IPv4 + UDP + DHCP).
+    private func parseDHCPFromFrame(_ frame: PacketBuffer) -> DHCPPacket? {
+        guard let eth = EthernetFrame.parse(from: frame) else { return nil }
+        guard let ip = IPv4Header.parse(from: eth.payload) else { return nil }
+        guard let udp = UDPHeader.parse(from: ip.payload, pseudoSrcAddr: ip.srcAddr, pseudoDstAddr: ip.dstAddr) else { return nil }
+        return DHCPPacket.parse(from: udp.payload)
+    }
+
     // MARK: - DISCOVER → OFFER
 
     @Test func discoverGeneratesOffer() {
@@ -22,14 +30,14 @@ struct DHCPServerTests {
         let round = RoundContext()
 
         let discover = DHCPPacket(op: 1, xid: 42, chaddr: clientMAC, messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        let result = dhcp.process(packet: discover, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        let result = dhcp.process(packet: discover, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
 
         #expect(result != nil)
         guard let (reply, endpointID) = result else { return }
         #expect(endpointID == 1)
 
-        // Parse the reply back
-        guard let parsed = DHCPPacket.parse(from: reply) else {
+        // Parse the Ethernet frame back to DHCP
+        guard let parsed = parseDHCPFromFrame(reply) else {
             Issue.record("failed to parse DHCP reply")
             return
         }
@@ -51,11 +59,11 @@ struct DHCPServerTests {
 
         // First DISCOVER consumes the only available IP
         let d1 = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: d1, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01), endpointID: 1, arpMapping: &arp, round: round) != nil)
+        #expect(dhcp.process(packet: d1, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01), endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) != nil)
 
         // Second DISCOVER has no pool left
         let d2 = DHCPPacket(op: 1, xid: 2, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: d2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02), endpointID: 1, arpMapping: &arp, round: round) == nil)
+        #expect(dhcp.process(packet: d2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02), endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) == nil)
     }
 
     // MARK: - REQUEST → ACK
@@ -73,14 +81,14 @@ struct DHCPServerTests {
 
         let request = DHCPPacket(op: 1, xid: 99, chaddr: clientMAC, messageType: .request,
                                   requestedIP: requestedIP, serverIdentifier: gateway)
-        let result = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        let result = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
 
         #expect(result != nil)
         guard let (reply, endpointID) = result else { return }
         #expect(endpointID == 1)
 
-        guard let parsed = DHCPPacket.parse(from: reply) else {
-            Issue.record("failed to parse DHCP reply")
+        guard let parsed = parseDHCPFromFrame(reply) else {
+            Issue.record("failed to parse DHCP ACK")
             return
         }
         #expect(parsed.messageType == .ack)
@@ -103,7 +111,7 @@ struct DHCPServerTests {
 
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
                                   requestedIP: requestedIP, serverIdentifier: gateway)
-        _ = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        _ = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
 
         #expect(arp.isKnown(requestedIP))
         #expect(arp.lookup(ip: requestedIP) == clientMAC)
@@ -123,7 +131,7 @@ struct DHCPServerTests {
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
                                   requestedIP: IPv4Address(100, 64, 1, 50),
                                   serverIdentifier: wrongServer)
-        #expect(dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round) == nil)
+        #expect(dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) == nil)
     }
 
     @Test func requestWithoutRequestedIPReturnsNil() {
@@ -138,7 +146,7 @@ struct DHCPServerTests {
 
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
                                   requestedIP: nil, serverIdentifier: gateway)
-        #expect(dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round) == nil)
+        #expect(dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) == nil)
     }
 
     // MARK: - RELEASE
@@ -157,13 +165,13 @@ struct DHCPServerTests {
         // First, get a lease via REQUEST
         let request = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
                                   requestedIP: requestedIP, serverIdentifier: gateway)
-        _ = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        _ = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(arp.isKnown(requestedIP))
 
         // Now release it
         let release = DHCPPacket(op: 1, xid: 2, chaddr: clientMAC, messageType: .release,
                                   requestedIP: nil, serverIdentifier: nil)
-        let result = dhcp.process(packet: release, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        let result = dhcp.process(packet: release, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(result == nil)  // RELEASE has no response
 
         // ARP entry should be removed
@@ -171,7 +179,7 @@ struct DHCPServerTests {
 
         // Should be able to DISCOVER again (IP was reclaimed)
         let discover = DHCPPacket(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), endpointID: 1, arpMapping: &arp, round: round) != nil)
+        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) != nil)
     }
 
     // MARK: - AUDIT #2: RELEASE uses MAC lookup instead of ciaddr
@@ -202,12 +210,12 @@ struct DHCPServerTests {
         // MAC_A leases two IPs (same MAC, different IPs — legal per RFC 2131)
         let req1 = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC, messageType: .request,
                                requestedIP: ip1, serverIdentifier: gateway)
-        let r1 = dhcp.process(packet: req1, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        let r1 = dhcp.process(packet: req1, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(r1 != nil, "first REQUEST should get ACK")
 
         let req2 = DHCPPacket(op: 1, xid: 2, chaddr: clientMAC, messageType: .request,
                                requestedIP: ip2, serverIdentifier: gateway)
-        let r2 = dhcp.process(packet: req2, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+        let r2 = dhcp.process(packet: req2, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(r2 != nil, "second REQUEST should get ACK (same MAC, different IP)")
 
         #expect(arp.isKnown(ip1) && arp.isKnown(ip2), "both IPs should be leased before RELEASE")
@@ -216,7 +224,7 @@ struct DHCPServerTests {
         // and uses ipForMAC(srcMAC) which returns an arbitrary first match from leases dict.
         _ = dhcp.process(packet: DHCPPacket(op: 1, xid: 3, chaddr: clientMAC, messageType: .release,
                                              requestedIP: nil, serverIdentifier: nil),
-                         srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round)
+                         srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
 
         // AUDIT #2: Only ONE IP is released — handleRelease calls ipForMAC once.
         // The RELEASE packet has no ciaddr field in DHCPPacket, so there's no way
@@ -240,7 +248,7 @@ struct DHCPServerTests {
         let round = RoundContext()
 
         let discover = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpointID: 999, arpMapping: &arp, round: round) == nil)
+        #expect(dhcp.process(packet: discover, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpointID: 999, hostMAC: hostMAC, arpMapping: &arp, round: round) == nil)
     }
 
     @Test func unknownMessageTypeReturnsNil() {
@@ -254,7 +262,7 @@ struct DHCPServerTests {
 
         // DECLINE has no handler
         let decline = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), messageType: .decline, requestedIP: nil, serverIdentifier: nil)
-        #expect(dhcp.process(packet: decline, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpointID: 1, arpMapping: &arp, round: round) == nil)
+        #expect(dhcp.process(packet: decline, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round) == nil)
     }
 
     // MARK: - Pending offer expiration (CRITICAL: IP pool leak fix)
@@ -274,14 +282,14 @@ struct DHCPServerTests {
         let d1 = DHCPPacket(op: 1, xid: 1, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01),
                             messageType: .discover, requestedIP: nil, serverIdentifier: nil)
         let result1 = dhcp.process(packet: d1, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01),
-                                   endpointID: 1, arpMapping: &arp, round: round)
+                                   endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(result1 != nil)
 
         // Second DISCOVER should also succeed — the first offer expired and IP was reclaimed
         let d2 = DHCPPacket(op: 1, xid: 2, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
                             messageType: .discover, requestedIP: nil, serverIdentifier: nil)
         let result2 = dhcp.process(packet: d2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
-                                   endpointID: 1, arpMapping: &arp, round: round)
+                                   endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(result2 != nil, "Second DISCOVER should succeed after pending offer expired — pool leak regression")
     }
 
@@ -301,21 +309,21 @@ struct DHCPServerTests {
         let discover = DHCPPacket(op: 1, xid: 1, chaddr: clientMAC,
                                    messageType: .discover, requestedIP: nil, serverIdentifier: nil)
         let offerResult = dhcp.process(packet: discover, srcMAC: clientMAC,
-                                        endpointID: 1, arpMapping: &arp, round: round)
+                                        endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(offerResult != nil)
 
         // REQUEST → ACK (IP confirmed, removed from pending)
         let request = DHCPPacket(op: 1, xid: 2, chaddr: clientMAC, messageType: .request,
                                   requestedIP: requestedIP, serverIdentifier: gateway)
         let ackResult = dhcp.process(packet: request, srcMAC: clientMAC,
-                                      endpointID: 1, arpMapping: &arp, round: round)
+                                      endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(ackResult != nil)
 
         // Now another DISCOVER should fail — the IP is legitimately leased, not pending
         let discover2 = DHCPPacket(op: 1, xid: 3, chaddr: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
                                     messageType: .discover, requestedIP: nil, serverIdentifier: nil)
         let exhaustedResult = dhcp.process(packet: discover2, srcMAC: MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02),
-                                           endpointID: 1, arpMapping: &arp, round: round)
+                                           endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(exhaustedResult == nil, "Pool should be exhausted after confirmed lease, not pending offer")
     }
 
@@ -346,7 +354,7 @@ struct DHCPServerTests {
         let discover = DHCPPacket(op: 1, xid: 1, chaddr: macA,
                                   messageType: .discover, requestedIP: nil, serverIdentifier: nil)
         let offerResult = dhcp.process(packet: discover, srcMAC: macA, endpointID: 1,
-                                        arpMapping: &arp, round: round)
+                                        hostMAC: hostMAC, arpMapping: &arp, round: round)
         #expect(offerResult != nil, "DISCOVER from MAC_A should get OFFER")
 
         // Step 2: MAC_B REQUEST for same IP — should be REJECTED (IP is offered to MAC_A).
@@ -354,7 +362,7 @@ struct DHCPServerTests {
         let request = DHCPPacket(op: 1, xid: 2, chaddr: macB, messageType: .request,
                                   requestedIP: targetIP, serverIdentifier: gateway)
         let ackResult = dhcp.process(packet: request, srcMAC: macB, endpointID: 1,
-                                      arpMapping: &arp, round: round)
+                                      hostMAC: hostMAC, arpMapping: &arp, round: round)
 
         #expect(ackResult == nil,
             "AUDIT #1 FAIL: MAC_B stole IP \(targetIP) that was offered to MAC_A — pendingOffer MAC not verified")
@@ -372,8 +380,8 @@ struct DHCPServerTests {
 
         // Step 1: DISCOVER
         let discover = DHCPPacket(op: 1, xid: 42, chaddr: clientMAC, messageType: .discover, requestedIP: nil, serverIdentifier: nil)
-        guard let (offerPkt, _) = dhcp.process(packet: discover, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round),
-              let offer = DHCPPacket.parse(from: offerPkt) else {
+        guard let (offerPkt, _) = dhcp.process(packet: discover, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round),
+              let offer = parseDHCPFromFrame(offerPkt) else {
             Issue.record("DISCOVER failed")
             return
         }
@@ -383,12 +391,56 @@ struct DHCPServerTests {
         let requestedIP = IPv4Address(100, 64, 1, 2)  // first available
         let request = DHCPPacket(op: 1, xid: 42, chaddr: clientMAC, messageType: .request,
                                   requestedIP: requestedIP, serverIdentifier: gateway)
-        guard let (ackPkt, _) = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, arpMapping: &arp, round: round),
-              let ack = DHCPPacket.parse(from: ackPkt) else {
+        guard let (ackPkt, _) = dhcp.process(packet: request, srcMAC: clientMAC, endpointID: 1, hostMAC: hostMAC, arpMapping: &arp, round: round),
+              let ack = parseDHCPFromFrame(ackPkt) else {
             Issue.record("REQUEST failed")
             return
         }
         #expect(ack.messageType == .ack)
         #expect(arp.isKnown(requestedIP))
+    }
+
+    // MARK: - ISSUE-3: DHCP lease expiry
+
+    /// Reproduces audit finding ISSUE-3: `DHCPPool.leases` stores IP→MAC mappings
+    /// with no deadline. A confirmed lease (ACK'd) never expires — only an explicit
+    /// RELEASE reclaims the IP. If a client crashes without sending RELEASE, the IP
+    /// is permanently leaked from the pool.
+    ///
+    /// Fix: leases now track `(mac, deadline)` and `reapExpiredLeases()` is called
+    /// before every allocation. With `leaseTime: 0`, a confirmed lease expires
+    /// immediately and the IP is available for the next DISCOVER.
+    @Test func confirmedLeaseExpiresAfterLeaseTime() {
+        // /30 subnet: only .2 available. leaseTime: 0 = instant expiry.
+        let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 30)
+        let gateway = IPv4Address(100, 64, 1, 1)
+        let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
+        let macA = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01)
+        let macB = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02)
+        let targetIP = IPv4Address(100, 64, 1, 2)
+
+        var dhcp = DHCPServer(endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)],
+                              offerTimeout: 60, leaseTime: 0)
+        var arp = ARPMapping(hostMAC: hostMAC, endpoints: [makeEndpoint(id: 1, subnet: subnet, gateway: gateway)])
+        let round = RoundContext()
+
+        // Step 1: MAC_A gets a confirmed lease via REQUEST.
+        let request = DHCPPacket(op: 1, xid: 1, chaddr: macA, messageType: .request,
+                                  requestedIP: targetIP, serverIdentifier: gateway)
+        let ackResult = dhcp.process(packet: request, srcMAC: macA, endpointID: 1,
+                                      hostMAC: hostMAC, arpMapping: &arp, round: round)
+        #expect(ackResult != nil, "REQUEST from MAC_A should get ACK")
+        #expect(arp.isKnown(targetIP), "target IP should be leased to MAC_A")
+
+        // Step 2: MAC_B DISCOVER — should succeed because MAC_A's lease expired
+        // (leaseTime=0 means the lease deadline was set to now() and
+        // reapExpiredLeases() reclaims it in the next allocation).
+        let discover = DHCPPacket(op: 1, xid: 2, chaddr: macB,
+                                  messageType: .discover, requestedIP: nil, serverIdentifier: nil)
+        let offerResult = dhcp.process(packet: discover, srcMAC: macB, endpointID: 1,
+                                        hostMAC: hostMAC, arpMapping: &arp, round: round)
+
+        #expect(offerResult != nil,
+            "ISSUE-3 FAIL: confirmed lease for \(targetIP) did not expire — IP permanently leaked, MAC_B DISCOVER returned nil")
     }
 }

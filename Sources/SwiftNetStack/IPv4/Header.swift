@@ -46,6 +46,10 @@ public struct IPv4Header {
 
             let headerLen = Int(ihl) * 4
             guard pkt.totalLength >= headerLen else { return nil }
+            // IP options (IHL > 5) are parsed for header size and checksum validation
+            // but not exposed to upper layers. Strict Source Route, Record Route, and
+            // Timestamp options are silently ignored — acceptable for a prototype that
+            // does not forward packets between interfaces.
 
             let totalLength = (UInt16(buf[2]) << 8) | UInt16(buf[3])
             let identification = (UInt16(buf[4]) << 8) | UInt16(buf[5])

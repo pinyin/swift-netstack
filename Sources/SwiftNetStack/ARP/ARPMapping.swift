@@ -15,21 +15,20 @@ public struct ARPEntry {
 
 /// IP → MAC mapping table, populated by DHCP lease allocation.
 ///
-/// Unsorted array storage. Lookup uses linear scan — with N ≤ thousands
-/// the constant factor is small, and SIMD vectorization (UInt32 .== target
-/// across 16 entries at a time) can be applied later without API changes.
+/// Dictionary-backed O(1) lookup by IP address. MAC→endpoint reverse lookup
+/// iterates values (O(N)) since it's a rare path used only for L2 forwarding.
 ///
 /// Proxy ARP: all intra-subnet ARP requests receive a reply with hostMAC,
 /// forcing L2 traffic through the gateway.
 public struct ARPMapping {
     public let hostMAC: MACAddress
-    private var entries: [ARPEntry] = []
+    private var entries: [UInt32: ARPEntry] = [:]
 
     /// Build from VMEndpoint list. Gateway IPs are registered with hostMAC.
     public init(hostMAC: MACAddress, endpoints: [VMEndpoint]) {
         self.hostMAC = hostMAC
         for ep in endpoints {
-            entries.append(ARPEntry(ip: ep.gateway, mac: hostMAC, endpointID: ep.id))
+            entries[ep.gateway.addr] = ARPEntry(ip: ep.gateway, mac: hostMAC, endpointID: ep.id)
         }
     }
 
@@ -37,16 +36,12 @@ public struct ARPMapping {
 
     /// Look up the MAC for an IP. Returns nil if unknown.
     public func lookup(ip: IPv4Address) -> MACAddress? {
-        let target = ip.addr
-        for entry in entries {
-            if entry.ip.addr == target { return entry.mac }
-        }
-        return nil
+        entries[ip.addr]?.mac
     }
 
     /// Look up the endpoint ID for a MAC address. Returns nil if unknown.
     public func lookupEndpoint(mac: MACAddress) -> Int? {
-        for entry in entries where entry.mac == mac {
+        for entry in entries.values where entry.mac == mac {
             return entry.endpointID
         }
         return nil
@@ -54,26 +49,19 @@ public struct ARPMapping {
 
     /// Whether this IP is known (gateway or DHCP-leased container).
     public func isKnown(_ ip: IPv4Address) -> Bool {
-        lookup(ip: ip) != nil
+        entries[ip.addr] != nil
     }
 
     // MARK: - Mutation
 
     /// Add or update an entry. Called by DHCP server on lease allocation.
     public mutating func add(ip: IPv4Address, mac: MACAddress, endpointID: Int) {
-        if let idx = entries.firstIndex(where: { $0.ip.addr == ip.addr }) {
-            entries[idx] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID)
-        } else {
-            entries.append(ARPEntry(ip: ip, mac: mac, endpointID: endpointID))
-        }
+        entries[ip.addr] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID)
     }
 
-    /// Remove an entry. O(1) swap-remove. Called by DHCP server on lease release.
+    /// Remove an entry. Called by DHCP server on lease release.
     public mutating func remove(ip: IPv4Address) {
-        if let idx = entries.firstIndex(where: { $0.ip.addr == ip.addr }) {
-            entries.swapAt(idx, entries.count - 1)
-            entries.removeLast()
-        }
+        entries.removeValue(forKey: ip.addr)
     }
 
     // MARK: - Proxy ARP

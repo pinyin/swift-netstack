@@ -10,26 +10,27 @@ import Darwin
 public struct DHCPServer {
     private var pools: [Int: DHCPPool]   // endpointID → pool
 
-    public init(endpoints: [VMEndpoint], offerTimeout: UInt64 = 60) {
+    public init(endpoints: [VMEndpoint], offerTimeout: UInt64 = 60, leaseTime: UInt32 = 3600) {
         var pools: [Int: DHCPPool] = [:]
         for ep in endpoints {
-            pools[ep.id] = DHCPPool(subnet: ep.subnet, gateway: ep.gateway, offerTimeout: offerTimeout)
+            pools[ep.id] = DHCPPool(subnet: ep.subnet, gateway: ep.gateway, offerTimeout: offerTimeout, leaseTime: leaseTime)
         }
         self.pools = pools
     }
 
     /// Process a DHCP packet. Returns nil if no response is needed,
-    /// or (response frame, target endpointID) to write back.
+    /// or a fully-built Ethernet frame (Ethernet + IPv4 + UDP + DHCP) to write back.
     public mutating func process(
         packet: DHCPPacket,
         srcMAC: MACAddress,
         endpointID: Int,
+        hostMAC: MACAddress,
         arpMapping: inout ARPMapping,
         round: RoundContext
     ) -> (PacketBuffer, endpointID: Int)? {
         guard var pool = pools[endpointID] else { return nil }
 
-        let result: PacketBuffer?
+        let result: (dhcpPayload: PacketBuffer, yiaddr: IPv4Address)?
         switch packet.messageType {
         case .discover:
             result = handleDiscover(
@@ -52,7 +53,14 @@ public struct DHCPServer {
         }
 
         pools[endpointID] = pool
-        if let result = result { return (result, endpointID) }
+        if let (dhcpPayload, yiaddr) = result,
+           let frame = buildDHCPFrame(
+               hostMAC: hostMAC, clientMAC: srcMAC,
+               gatewayIP: pool.gateway, yiaddr: yiaddr,
+               dhcpPayload: dhcpPayload, round: round
+           ) {
+            return (frame, endpointID)
+        }
         return nil
     }
 
@@ -61,21 +69,18 @@ public struct DHCPServer {
     private mutating func handleDiscover(
         packet: DHCPPacket, srcMAC: MACAddress,
         endpointID: Int, pool: inout DHCPPool, round: RoundContext
-    ) -> PacketBuffer? {
-        // Reclaim expired pending offers before allocating.
-        // RFC 2131 §4.4.1: servers SHOULD reuse addresses from clients that
-        // fail to complete the handshake within a reasonable time.
-        pool.reapExpiredOffers()
+    ) -> (PacketBuffer, IPv4Address)? {
         guard let offeredIP = pool.allocate(clientMAC: srcMAC) else { return nil }
 
-        return buildDHCPReply(
+        guard let pkt = buildDHCPReply(
             messageType: .offer,
             xid: packet.xid,
             chaddr: srcMAC,
             yiaddr: offeredIP,
             pool: pool,
             round: round
-        )
+        ) else { return nil }
+        return (pkt, offeredIP)
     }
 
     // MARK: - REQUEST
@@ -84,7 +89,7 @@ public struct DHCPServer {
         packet: DHCPPacket, srcMAC: MACAddress,
         endpointID: Int, pool: inout DHCPPool,
         arpMapping: inout ARPMapping, round: RoundContext
-    ) -> PacketBuffer? {
+    ) -> (PacketBuffer, IPv4Address)? {
         // Determine the requested IP: use option 50 if present, else ciaddr
         let requestedIP: IPv4Address
         if let opt50 = packet.requestedIP, opt50 != .zero {
@@ -116,14 +121,15 @@ public struct DHCPServer {
         pool.removePendingOffer(requestedIP)
         arpMapping.add(ip: requestedIP, mac: srcMAC, endpointID: endpointID)
 
-        return buildDHCPReply(
+        guard let pkt = buildDHCPReply(
             messageType: .ack,
             xid: packet.xid,
             chaddr: srcMAC,
             yiaddr: requestedIP,
             pool: pool,
             round: round
-        )
+        ) else { return nil }
+        return (pkt, requestedIP)
     }
 
     // MARK: - RELEASE
@@ -151,7 +157,7 @@ public struct DHCPServer {
     // MARK: - Packet construction
 
     /// Build raw DHCP payload (BOOTREPLY + magic cookie + options) only.
-    /// Caller is responsible for wrapping in Ethernet/IPv4/UDP headers.
+    /// The caller (`process()`) wraps the payload in Ethernet/IPv4/UDP headers.
     private func buildDHCPReply(
         messageType: DHCPMessageType,
         xid: UInt32,
@@ -216,8 +222,8 @@ public struct DHCPServer {
     private func writeOption(_ code: UInt8, value: [UInt8], ptr: UnsafeMutableRawPointer, offset: inout Int) {
         ptr.advanced(by: offset).storeBytes(of: code, as: UInt8.self)
         ptr.advanced(by: offset + 1).storeBytes(of: UInt8(value.count), as: UInt8.self)
-        for (i, b) in value.enumerated() {
-            ptr.advanced(by: offset + 2 + i).storeBytes(of: b, as: UInt8.self)
+        value.withUnsafeBufferPointer { buf in
+            ptr.advanced(by: offset + 2).copyMemory(from: buf.baseAddress!, byteCount: value.count)
         }
         offset += 2 + value.count
     }
@@ -240,6 +246,61 @@ public struct DHCPServer {
         [UInt8((mask >> 24) & 0xFF), UInt8((mask >> 16) & 0xFF),
          UInt8((mask >> 8) & 0xFF),  UInt8(mask & 0xFF)]
     }
+
+    // MARK: - Frame construction
+
+    /// Wrap a raw DHCP payload in Ethernet/IPv4/UDP headers.
+    ///
+    /// Constructs a complete L2 frame: Ethernet (14) + IPv4 (20) + UDP (8) + DHCP payload.
+    /// Uses `writeIPv4Header` for the IPv4 header and computes a valid UDP pseudo-header
+    /// checksum per RFC 768.
+    private func buildDHCPFrame(
+        hostMAC: MACAddress,
+        clientMAC: MACAddress,
+        gatewayIP: IPv4Address,
+        yiaddr: IPv4Address,
+        dhcpPayload: PacketBuffer,
+        round: RoundContext
+    ) -> PacketBuffer? {
+        let dhcpLen = dhcpPayload.totalLength
+        let udpLen = udpHeaderLen + dhcpLen
+        let ipTotalLen = ipv4HeaderLen + udpLen
+        let frameLen = ethHeaderLen + ipTotalLen
+
+        var pkt = round.allocate(capacity: frameLen, headroom: 0)
+        guard let ptr = pkt.appendPointer(count: frameLen) else { return nil }
+
+        // ── Ethernet header ──
+        clientMAC.write(to: ptr)                                   // dst = client
+        hostMAC.write(to: ptr.advanced(by: 6))                     // src = host
+        writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+        // ── IPv4 header (offset 14) ──
+        let ipPtr = ptr.advanced(by: ethHeaderLen)
+        writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
+                        srcIP: gatewayIP, dstIP: yiaddr)
+
+        // ── UDP header (offset 34) ──
+        let udpPtr = ptr.advanced(by: ethHeaderLen + ipv4HeaderLen)
+        writeUInt16BE(67, to: udpPtr)                              // src port = 67
+        writeUInt16BE(68, to: udpPtr.advanced(by: 2))              // dst port = 68
+        writeUInt16BE(UInt16(udpLen), to: udpPtr.advanced(by: 4))
+        writeUInt16BE(0, to: udpPtr.advanced(by: 6))               // checksum placeholder
+
+        // ── DHCP payload (offset 42) ──
+        dhcpPayload.withUnsafeReadableBytes { buf in
+            udpPtr.advanced(by: udpHeaderLen).copyMemory(from: buf.baseAddress!, byteCount: dhcpLen)
+        }
+
+        // ── UDP checksum (RFC 768) ──
+        let udpCksum = computeUDPChecksum(
+            pseudoSrcAddr: gatewayIP, pseudoDstAddr: yiaddr,
+            udpData: udpPtr, udpLen: udpLen
+        )
+        writeUInt16BE(udpCksum, to: udpPtr.advanced(by: 6))
+
+        return pkt
+    }
 }
 
 // MARK: - DHCPPool
@@ -247,30 +308,30 @@ public struct DHCPServer {
 private struct DHCPPool {
     let subnet: IPv4Subnet
     let gateway: IPv4Address
-    let leaseTime: UInt32 = 3600   // 1 hour
+    let leaseTime: UInt32          // seconds before confirmed lease expires
     let offerTimeout: UInt64       // seconds before unconfirmed OFFER expires
 
     private var available: Set<UInt32>
-    private var leases: [UInt32: MACAddress] = [:]  // ip.addr → mac
-    /// IPs allocated by DISCOVER but not yet confirmed by REQUEST.
-    /// Each entry records the (address, clientMAC, deadline as seconds-since-epoch).
-    private var pendingOffers: [(addr: UInt32, mac: MACAddress, deadline: UInt64)] = []
+    /// Confirmed leases: ip.addr → (clientMAC, deadline as seconds-since-epoch).
+    private var leases: [UInt32: (mac: MACAddress, deadline: UInt64)] = [:]
+    /// Reverse index for O(1) MAC→IP lookup. Maintained alongside `leases`.
+    private var macToIP: [MACAddress: UInt32] = [:]
+    /// Pending offers: ip.addr → (clientMAC, deadline). Dictionary for O(1) lookup.
+    private var pendingOffers: [UInt32: (mac: MACAddress, deadline: UInt64)] = [:]
 
-    init(subnet: IPv4Subnet, gateway: IPv4Address, offerTimeout: UInt64 = 60) {
+    init(subnet: IPv4Subnet, gateway: IPv4Address, offerTimeout: UInt64 = 60, leaseTime: UInt32 = 3600) {
         self.subnet = subnet
         self.gateway = gateway
         self.offerTimeout = offerTimeout
+        self.leaseTime = leaseTime
 
         // Available: all IPs in subnet except network, gateway, and broadcast
         let netAddr = subnet.network.addr
         let bcAddr = subnet.broadcast.addr
         let gwAddr = gateway.addr
-        // Reject degenerate subnets that would cause arithmetic overflow below.
-        // 255.255.255.255 is the limited broadcast address, never a valid network.
         precondition(netAddr != 0xFFFFFFFF,
             "DHCP subnet network address 255.255.255.255 is invalid")
         var ips: Set<UInt32> = []
-        // Clamp pool to reasonable size (skip extremes for sanity)
         let start = max(netAddr + 1, gwAddr + 1)
         let end = bcAddr
         if start < end {
@@ -288,20 +349,32 @@ private struct DHCPPool {
         UInt64(Darwin.time(nil))
     }
 
-    // MARK: - Offer expiration
+    // MARK: - Expiration
 
     /// Reclaim expired pending offers, returning their IPs to the available pool.
     mutating func reapExpiredOffers() {
         let currentTime = Self.now()
         var reclaimed: [UInt32] = []
-        pendingOffers.removeAll { offer in
-            if offer.deadline <= currentTime {
-                reclaimed.append(offer.addr)
-                return true
-            }
-            return false
+        for (addr, entry) in pendingOffers {
+            if entry.deadline <= currentTime { reclaimed.append(addr) }
         }
         for addr in reclaimed {
+            pendingOffers.removeValue(forKey: addr)
+            available.insert(addr)
+        }
+    }
+
+    /// Reclaim expired confirmed leases, returning their IPs to the available pool.
+    mutating func reapExpiredLeases() {
+        let currentTime = Self.now()
+        var reclaimed: [UInt32] = []
+        for (addr, entry) in leases {
+            if entry.deadline <= currentTime { reclaimed.append(addr) }
+        }
+        for addr in reclaimed {
+            if let entry = leases.removeValue(forKey: addr) {
+                macToIP.removeValue(forKey: entry.mac)
+            }
             available.insert(addr)
         }
     }
@@ -309,20 +382,16 @@ private struct DHCPPool {
     // MARK: - Pool operations
 
     /// Allocate a free IP for a DISCOVER. Records a pending offer with expiration.
-    /// Returns nil if pool exhausted.
     mutating func allocate(clientMAC: MACAddress) -> IPv4Address? {
-        // Reap expired offers before every allocation attempt
         reapExpiredOffers()
+        reapExpiredLeases()
 
         guard let addr = available.popFirst() else { return nil }
 
         let deadline = Self.now() + offerTimeout
-        pendingOffers.append((addr: addr, mac: clientMAC, deadline: deadline))
+        pendingOffers[addr] = (mac: clientMAC, deadline: deadline)
 
         #if DEBUG
-        // Pool integrity: the sum of available + leased + pending must be
-        // invariant (total pool size minus reserved addresses).
-        // This catches both leaks and double-allocations.
         debugCheckPoolIntegrity()
         #endif
 
@@ -332,12 +401,14 @@ private struct DHCPPool {
     /// Confirm a lease (REQUEST → ACK). Moves IP from available to leases.
     mutating func confirm(_ ip: IPv4Address, mac: MACAddress) {
         available.remove(ip.addr)
-        leases[ip.addr] = mac
+        let deadline = Self.now() + UInt64(leaseTime)
+        leases[ip.addr] = (mac: mac, deadline: deadline)
+        macToIP[mac] = ip.addr
     }
 
     /// Remove an IP from pending offers (called on REQUEST or RELEASE).
     mutating func removePendingOffer(_ ip: IPv4Address) {
-        pendingOffers.removeAll { $0.addr == ip.addr }
+        pendingOffers.removeValue(forKey: ip.addr)
 
         #if DEBUG
         debugCheckPoolIntegrity()
@@ -346,40 +417,32 @@ private struct DHCPPool {
 
     /// Release an IP back to the pool.
     mutating func release(_ ip: IPv4Address) {
-        leases.removeValue(forKey: ip.addr)
+        if let entry = leases.removeValue(forKey: ip.addr) {
+            macToIP.removeValue(forKey: entry.mac)
+        }
         available.insert(ip.addr)
     }
 
-    /// Get the IP leased to a given MAC, if any.
+    /// Get the IP leased to a given MAC, if any. O(1) via reverse index.
     func ipForMAC(_ mac: MACAddress) -> IPv4Address? {
-        for (addr, m) in leases where m == mac {
-            return IPv4Address(addr: addr)
-        }
-        return nil
+        macToIP[mac].map { IPv4Address(addr: $0) }
     }
 
-    /// Get the MAC that holds a lease for the given IP, if any.
+    /// Get the MAC that holds a lease for the given IP, if any. O(1).
     func macForIP(_ ip: IPv4Address) -> MACAddress? {
-        return leases[ip.addr]
+        leases[ip.addr]?.mac
     }
 
-    /// Get the MAC for which the given IP has a pending (unconfirmed) offer, if any.
+    /// Get the MAC for which the given IP has a pending (unconfirmed) offer, if any. O(1).
     func pendingOfferMAC(for ip: IPv4Address) -> MACAddress? {
-        for offer in pendingOffers where offer.addr == ip.addr {
-            return offer.mac
-        }
-        return nil
+        pendingOffers[ip.addr]?.mac
     }
 
     // MARK: - DEBUG integrity check
 
     #if DEBUG
     private func debugCheckPoolIntegrity() {
-        // Pool size invariant: the total pool is all addresses from
-        // (max(netAddr+1, gwAddr+1)) to broadcast, clamped to 65536.
-        // available + leased + pending should sum to the initial pool size.
         let totalTracked = available.count + leases.count + pendingOffers.count
-        // There's no regression in release: compute the expected total
         let netAddr = subnet.network.addr
         let bcAddr = subnet.broadcast.addr
         let gwAddr = gateway.addr
@@ -392,6 +455,3 @@ private struct DHCPPool {
     }
     #endif
 }
-
-// MARK: - Helpers
-

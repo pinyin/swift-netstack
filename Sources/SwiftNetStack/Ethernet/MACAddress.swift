@@ -1,5 +1,5 @@
 /// 6-octet MAC address.
-public struct MACAddress: Equatable, CustomStringConvertible {
+public struct MACAddress: Equatable, Hashable, CustomStringConvertible {
     public var octets: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
 
     public init(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8, _ e: UInt8, _ f: UInt8) {
@@ -23,6 +23,13 @@ public struct MACAddress: Equatable, CustomStringConvertible {
         && lhs.octets.3 == rhs.octets.3
         && lhs.octets.4 == rhs.octets.4
         && lhs.octets.5 == rhs.octets.5
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        let combined = (UInt64(octets.0) << 40) | (UInt64(octets.1) << 32)
+                     | (UInt64(octets.2) << 24) | (UInt64(octets.3) << 16)
+                     | (UInt64(octets.4) << 8)  |  UInt64(octets.5)
+        hasher.combine(combined)
     }
 
     public var description: String {

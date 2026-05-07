@@ -16,12 +16,13 @@
 ///   Phase 3:  MAC filter + EtherType dispatch (branch logic only)
 ///   Phase 4:  Parse ALL IPv4 headers         (IPv4Header.parse, ~25 insns)
 ///   Phase 5:  Parse ALL ARP frames           (ARPFrame.parse, ~20 insns)
-///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + UDPHeader.parse + extractDHCP)
-///   Phase 7:  Process ALL ICMP               (buildICMPEchoReply)
-///   Phase 7.5:Process ALL UDP sockets         (UDPSocket.handleDatagram → buildUDPFrame)
-///   Phase 8:  Process ALL DHCP               (DHCPServer.process + buildDHCPFrame)
-///   Phase 9:  Process ALL ARP                (processARPRequest)
-///   Phase 10: Batch write + endRound         (syscall + reclaim)
+///   Phase 6:  Parse ALL transport headers   (ICMPHeader.parse + UDPHeader.parse + DHCPPacket.parse)
+///   Phase 7:  Process ALL ICMP Echo           (buildICMPEchoReply)
+///   Phase 8:  Process ALL ICMP Unreachable    (buildICMPProtocolUnreachable for TCP etc.)
+///   Phase 9:  Process ALL UDP sockets         (UDPSocket.handleDatagram → buildUDPFrame)
+///   Phase 10: Process ALL DHCP               (DHCPServer.process)
+///   Phase 11: Process ALL ARP                (processARPRequest)
+///   Phase 12: Batch write + endRound         (syscall + reclaim)
 ///
 /// Zero-copy throughout: every .parse returns a view (slice) over the original
 /// PacketBuffer. Intermediate arrays hold small value types (MAC, IP, headers)
@@ -128,16 +129,17 @@ public func bdpRound(
 #if DEBUG
     // Contract: Every ARP-parsed entry has operation == .request or .reply.
     // ARPFrame.parse validates operation via ARPOperation(rawValue:) — invalid
-    // opcodes (e.g., 0 or 42) cause parse to return nil before reaching Phase 9.
+    // opcodes (e.g., 0 or 42) cause parse to return nil before reaching Phase 11.
     // This contract catches any remaining edge cases that survive parsing.
     debugValidateARPParse(arpParsed)
 #endif
 
     // ── Phase 6: Parse ALL transport headers ──
-    // I-cache: ICMPHeader.parse + UDPHeader.parse + extractDHCP — no reply construction
+    // I-cache: ICMPHeader.parse + UDPHeader.parse + DHCPPacket.parse — no reply construction
     var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
     var udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
     var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
+    var unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
     for (ep, eth, ip) in ipv4Parsed {
         switch ip.protocol {
         case .icmp:
@@ -158,7 +160,7 @@ public func bdpRound(
             // server and emits OFFER/ACK packets, they are captured here instead of
             // leaking into udpParsed and potentially hitting an unrelated UDP socket.
             if udp.dstPort == 67 || udp.srcPort == 67 {
-                if let dhcp = extractDHCP(from: udp.payload) {
+                if let dhcp = DHCPPacket.parse(from: udp.payload) {
                     dhcpParsed.append((ep, eth, ip, dhcp))
                 }
                 // If the DHCP port filter matched but the payload isn't valid DHCP:
@@ -169,7 +171,9 @@ public func bdpRound(
                 udpParsed.append((ep, eth, ip, udp))
             }
         default:
-            break
+            // Unsupported transport protocol (e.g., TCP=6). Track for ICMP
+            // Protocol Unreachable reply (RFC 792 Type 3 Code 2).
+            unreachableParsed.append((ep, eth, ip))
         }
     }
 #if DEBUG
@@ -177,12 +181,12 @@ public func bdpRound(
     // protocol, dhcpParsed contains only DHCP packets (from UDP port 67). The switch
     // in Phase 6 dispatches by ip.protocol — a mismatch here means the wrong case arm
     // matched or ICMPHeader/UDPHeader/DHCPPacket.parse returned nil for a valid packet.
-    debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed)
+    debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed, unreachableParsed: unreachableParsed)
 #endif
 
     var replies: [(endpointID: Int, packet: PacketBuffer)] = []
 
-    // ── Phase 7: Process ALL ICMP ──
+    // ── Phase 7: Process ALL ICMP Echo ──
 #if DEBUG
     // L2 snapshot: capture request array and reply count before the phase.
     // After the phase, each new reply is validated against its matching request
@@ -212,7 +216,23 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 7.5: Process ALL UDP sockets ──
+    // ── Phase 8: Process ALL ICMP Protocol Unreachable ──
+    // Generate ICMP Destination Unreachable (Protocol Unreachable, Type 3 Code 2)
+    // for packets with unsupported transport protocols (e.g., TCP).
+    for (ep, eth, ip) in unreachableParsed {
+        if let reply = buildICMPProtocolUnreachable(
+            hostMAC: arpMapping.hostMAC,
+            clientMAC: eth.srcMAC,
+            gatewayIP: ip.dstAddr,
+            clientIP: ip.srcAddr,
+            rawIPPacket: eth.payload,
+            round: round
+        ) {
+            replies.append((ep, reply))
+        }
+    }
+
+    // ── Phase 9: Process ALL UDP sockets ──
 #if DEBUG
     // L2 snapshot: capture udpParsed and reply count before the phase.
     let udpSnapshot = udpParsed
@@ -242,38 +262,24 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 8: Process ALL DHCP ──
+    // ── Phase 10: Process ALL DHCP ──
 #if DEBUG
     // L2 snapshot: DHCP replies are matched to requests via xid (RFC 2131 §2).
     let dhcpSnapshot = dhcpParsed
     let replyCountPreDHCP = replies.count
 #endif
-    // I-cache: DHCPServer.process + buildDHCPFrame — no parsing
-    for (ep, eth, ip, dhcp) in dhcpParsed {
+    // I-cache: DHCPServer.process — no parsing
+    for (ep, eth, _, dhcp) in dhcpParsed {
         // Only process BOOTREQUEST (op=1). DHCP replies (op=2) in the inbound
         // path are either misconfigured guest servers or routing errors — neither
         // belongs in the server pipeline.
         guard dhcp.op == 1 else { continue }
-        if let (rawReply, targetEp) = dhcpServer.process(
+        if let (frame, targetEp) = dhcpServer.process(
             packet: dhcp, srcMAC: eth.srcMAC,
-            endpointID: ep, arpMapping: &arpMapping, round: round
+            endpointID: ep, hostMAC: arpMapping.hostMAC,
+            arpMapping: &arpMapping, round: round
         ) {
-            // Extract yiaddr from raw DHCP reply (offset 16, 4 bytes)
-            guard rawReply.totalLength >= 20 else { continue }
-            let yiaddr = rawReply.withUnsafeReadableBytes { buf in
-                IPv4Address(buf[16], buf[17], buf[18], buf[19])
-            }
-
-            if let frame = buildDHCPFrame(
-                hostMAC: arpMapping.hostMAC,
-                clientMAC: eth.srcMAC,
-                gatewayIP: ip.dstAddr,
-                yiaddr: yiaddr,
-                dhcpPayload: rawReply,
-                round: round
-            ) {
-                replies.append((targetEp, frame))
-            }
+            replies.append((targetEp, frame))
         }
     }
 #if DEBUG
@@ -287,7 +293,7 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 9: Process ALL ARP ──
+    // ── Phase 11: Process ALL ARP ──
 #if DEBUG
     // L2 snapshot: ARP replies are matched to requests via (targetIP, senderIP).
     let arpSnapshot = arpParsed
@@ -310,7 +316,7 @@ public func bdpRound(
     )
 #endif
 
-    // ── Phase 10: Batch write + endRound ──
+    // ── Phase 12: Batch write + endRound ──
 #if DEBUG
     // L3: Phase flow integrity. After all processing phases, every reply and
     // forwarded frame must have a valid endpoint ID and ≥14 bytes. Protocol-level
@@ -338,6 +344,7 @@ public func bdpRound(
     icmpParsed.removeAll()
     udpParsed.removeAll()
     dhcpParsed.removeAll()
+    unreachableParsed.removeAll()
     forwardPkts.removeAll()
     replies.removeAll()
 
@@ -345,79 +352,3 @@ public func bdpRound(
     return forwardCount + replyCount
 }
 
-/// Extract a DHCP packet from a UDP payload (after the 8-byte UDP header).
-/// The caller is responsible for UDP header parsing and port filtering.
-func extractDHCP(from dhcpPayload: PacketBuffer) -> DHCPPacket? {
-    return DHCPPacket.parse(from: dhcpPayload)
-}
-
-/// Wrap a raw DHCP payload in Ethernet/IPv4/UDP headers.
-private func buildDHCPFrame(
-    hostMAC: MACAddress,
-    clientMAC: MACAddress,
-    gatewayIP: IPv4Address,
-    yiaddr: IPv4Address,
-    dhcpPayload: PacketBuffer,
-    round: RoundContext
-) -> PacketBuffer? {
-    let dhcpLen = dhcpPayload.totalLength
-    let udpLen = 8 + dhcpLen
-    let ipTotalLen = 20 + udpLen
-    let frameLen = 14 + ipTotalLen
-
-    var pkt = round.allocate(capacity: frameLen, headroom: 0)
-    guard let ptr = pkt.appendPointer(count: frameLen) else { return nil }
-    ptr.initializeMemory(as: UInt8.self, repeating: 0, count: frameLen)
-
-    // ── Ethernet header ──
-    clientMAC.write(to: ptr)                                   // dst = client
-    hostMAC.write(to: ptr.advanced(by: 6))                     // src = host
-    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
-
-    // ── IPv4 header (offset 14) ──
-    let ipOff = 14
-    ptr.advanced(by: ipOff).storeBytes(of: UInt8(0x45), as: UInt8.self)
-    ptr.advanced(by: ipOff + 2).storeBytes(of: UInt8(ipTotalLen >> 8), as: UInt8.self)
-    ptr.advanced(by: ipOff + 3).storeBytes(of: UInt8(ipTotalLen & 0xFF), as: UInt8.self)
-    ptr.advanced(by: ipOff + 8).storeBytes(of: UInt8(64), as: UInt8.self)  // TTL
-    ptr.advanced(by: ipOff + 9).storeBytes(of: IPProtocol.udp.rawValue, as: UInt8.self)
-    gatewayIP.write(to: ptr.advanced(by: ipOff + 12))          // src IP
-    yiaddr.write(to: ptr.advanced(by: ipOff + 16))             // dst IP
-    let ipCksum = UnsafeRawBufferPointer(start: ptr.advanced(by: ipOff), count: 20)
-        .withUnsafeBytes { internetChecksum($0) }
-    ptr.advanced(by: ipOff + 10).storeBytes(of: UInt8(ipCksum >> 8), as: UInt8.self)
-    ptr.advanced(by: ipOff + 11).storeBytes(of: UInt8(ipCksum & 0xFF), as: UInt8.self)
-
-    // ── UDP header (offset 34) ──
-    let udpOff = 34
-    ptr.advanced(by: udpOff).storeBytes(of: UInt8(0x00), as: UInt8.self)
-    ptr.advanced(by: udpOff + 1).storeBytes(of: UInt8(67), as: UInt8.self)  // src port = 67
-    ptr.advanced(by: udpOff + 2).storeBytes(of: UInt8(0x00), as: UInt8.self)
-    ptr.advanced(by: udpOff + 3).storeBytes(of: UInt8(68), as: UInt8.self)  // dst port = 68
-    ptr.advanced(by: udpOff + 4).storeBytes(of: UInt8(udpLen >> 8), as: UInt8.self)
-    ptr.advanced(by: udpOff + 5).storeBytes(of: UInt8(udpLen & 0xFF), as: UInt8.self)
-
-    // ── DHCP payload (offset 42) ──
-    let dhcpOff = 42
-    dhcpPayload.withUnsafeReadableBytes { buf in
-        ptr.advanced(by: dhcpOff).copyMemory(from: buf.baseAddress!, byteCount: dhcpLen)
-    }
-
-    // ── UDP checksum (RFC 768 pseudo-header + UDP header + payload) ──
-    let ckBufLen = 12 + udpLen
-    var ckBuf = [UInt8](repeating: 0, count: ckBufLen)
-    var ipOut = [UInt8](repeating: 0, count: 4)
-    gatewayIP.write(to: &ipOut); ckBuf[0...3] = ipOut[0...3]
-    yiaddr.write(to: &ipOut); ckBuf[4...7] = ipOut[0...3]
-    ckBuf[9] = IPProtocol.udp.rawValue
-    ckBuf[10] = UInt8(udpLen >> 8)
-    ckBuf[11] = UInt8(udpLen & 0xFF)
-    let udpPtr = ptr.advanced(by: udpOff)
-    ckBuf.withUnsafeMutableBytes { (ckPtr: UnsafeMutableRawBufferPointer) in
-        ckPtr.baseAddress!.advanced(by: 12).copyMemory(from: udpPtr, byteCount: udpLen)
-    }
-    let udpCksum = ckBuf.withUnsafeBytes { internetChecksum($0) }
-    writeUInt16BE(udpCksum == 0 ? 0xFFFF : udpCksum, to: ptr.advanced(by: udpOff + 6))
-
-    return pkt
-}

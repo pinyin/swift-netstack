@@ -150,11 +150,11 @@ public struct IPFragmentReassembler {
     /// RFC 791: last-received fragment wins for overlapping bytes.
     private func applyFragment(data: [UInt8], offset: Int, to buffer: inout ReassemblyBuffer) {
         guard let totalLen = buffer.totalPayloadLength else { return }
-        for i in 0..<data.count {
-            let pos = offset + i
-            guard pos < totalLen else { break }
-            buffer.payload?[pos] = data[i]
-            buffer.covered?[pos] = true
+        let copyLen = min(data.count, totalLen - offset)
+        guard copyLen > 0 else { return }
+        buffer.payload?.replaceSubrange(offset..<(offset + copyLen), with: data[0..<copyLen])
+        for i in offset..<(offset + copyLen) {
+            buffer.covered?[i] = true
         }
     }
 

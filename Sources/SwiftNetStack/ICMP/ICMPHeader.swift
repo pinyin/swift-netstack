@@ -77,26 +77,13 @@ public func buildICMPEchoReply(
     hostMAC.write(to: ptr.advanced(by: 6))                     // src = us
     writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
 
-    // IPv4 header (20 bytes)
-    let ipPtr = ptr.advanced(by: 14)
-    ipPtr.storeBytes(of: UInt8(0x45), as: UInt8.self)         // version=4, IHL=5
-    ipPtr.advanced(by: 1).storeBytes(of: UInt8(0), as: UInt8.self) // DSCP+ECN
-    writeUInt16BE(UInt16(ipTotalLen), to: ipPtr.advanced(by: 2))    // total length
-    writeUInt16BE(0, to: ipPtr.advanced(by: 4))               // identification
-    writeUInt16BE(0x4000, to: ipPtr.advanced(by: 6))          // flags=DF, offset=0
-    ipPtr.advanced(by: 8).storeBytes(of: UInt8(64), as: UInt8.self) // TTL
-    ipPtr.advanced(by: 9).storeBytes(of: IPProtocol.icmp.rawValue, as: UInt8.self)
-    // Zero checksum field before computing — chunk may contain stale bytes
-    writeUInt16BE(0, to: ipPtr.advanced(by: 10))
-    ip.dstAddr.write(to: ipPtr.advanced(by: 12))              // src = original dst
-    ip.srcAddr.write(to: ipPtr.advanced(by: 16))              // dst = original src
-
-    // IP header checksum (RFC 791, over the 20-byte header)
-    let ipChecksum = internetChecksum(UnsafeRawBufferPointer(start: ipPtr, count: 20))
-    writeUInt16BE(ipChecksum, to: ipPtr.advanced(by: 10))
+    // IPv4 header (20 bytes) at offset 14
+    let ipPtr = ptr.advanced(by: ethHeaderLen)
+    writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .icmp,
+                    srcIP: ip.dstAddr, dstIP: ip.srcAddr)
 
     // ICMP header (8 bytes)
-    let icmpPtr = ipPtr.advanced(by: 20)
+    let icmpPtr = ipPtr.advanced(by: ipv4HeaderLen)
     icmpPtr.storeBytes(of: UInt8(0), as: UInt8.self)          // type = echo reply
     icmpPtr.advanced(by: 1).storeBytes(of: UInt8(0), as: UInt8.self) // code = 0
     // Zero checksum field before computing — chunk may contain stale bytes
@@ -110,6 +97,64 @@ public func buildICMPEchoReply(
     }
 
     // ICMP checksum (RFC 792, over ICMP header + payload)
+    let icmpChecksum = internetChecksum(UnsafeRawBufferPointer(start: icmpPtr, count: icmpTotalLen))
+    writeUInt16BE(icmpChecksum, to: icmpPtr.advanced(by: 2))
+
+    return reply
+}
+
+/// Build an ICMP Destination Unreachable (Protocol Unreachable, Type 3 Code 2) frame
+/// in response to an IPv4 packet with an unsupported transport protocol (e.g., TCP).
+///
+/// RFC 792: the ICMP payload contains the original IP header + first 8 bytes of the
+/// original IP payload. This helps the sender identify which packet triggered the error.
+///
+/// `rawIPPacket`: the full original IPv4 datagram (eth.payload, starting at byte 0 of IP header).
+public func buildICMPProtocolUnreachable(
+    hostMAC: MACAddress,
+    clientMAC: MACAddress,
+    gatewayIP: IPv4Address,
+    clientIP: IPv4Address,
+    rawIPPacket: PacketBuffer,
+    round: RoundContext
+) -> PacketBuffer? {
+    // Extract first 20 bytes (IP header) + 8 bytes (transport header) from original
+    var rawIPPacket = rawIPPacket
+    let payloadExtractLen = min(28, rawIPPacket.totalLength)
+    guard rawIPPacket.pullUp(payloadExtractLen) else { return nil }
+
+    let icmpPayloadLen = 20 + min(8, max(0, rawIPPacket.totalLength - 20))
+    let icmpTotalLen = 8 + icmpPayloadLen
+    let ipTotalLen = 20 + icmpTotalLen
+    let frameLen = 14 + ipTotalLen
+
+    var reply = round.allocate(capacity: frameLen, headroom: 0)
+    guard let ptr = reply.appendPointer(count: frameLen) else { return nil }
+
+    // Ethernet header (14 bytes)
+    clientMAC.write(to: ptr)
+    hostMAC.write(to: ptr.advanced(by: 6))
+    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+    // IPv4 header (20 bytes) at offset 14
+    let ipPtr = ptr.advanced(by: ethHeaderLen)
+    writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .icmp,
+                    srcIP: gatewayIP, dstIP: clientIP)
+
+    // ICMP header (8 bytes): Type 3, Code 2
+    let icmpPtr = ipPtr.advanced(by: ipv4HeaderLen)
+    icmpPtr.storeBytes(of: UInt8(3), as: UInt8.self)          // type = Destination Unreachable
+    icmpPtr.advanced(by: 1).storeBytes(of: UInt8(2), as: UInt8.self) // code = Protocol Unreachable
+    writeUInt16BE(0, to: icmpPtr.advanced(by: 2))             // checksum placeholder
+    writeUInt32BE(0, to: icmpPtr.advanced(by: 4))             // unused (must be zero)
+
+    // ICMP payload: original IP header + first 8 bytes of original transport data
+    rawIPPacket.withUnsafeReadableBytes { buf in
+        let copyLen = min(payloadExtractLen, buf.count)
+        icmpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: copyLen)
+    }
+
+    // ICMP checksum
     let icmpChecksum = internetChecksum(UnsafeRawBufferPointer(start: icmpPtr, count: icmpTotalLen))
     writeUInt16BE(icmpChecksum, to: icmpPtr.advanced(by: 2))
 

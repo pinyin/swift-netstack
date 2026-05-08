@@ -26,7 +26,7 @@ struct ChaosTests {
         var dns = dnsServer
 
         bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer,
-                 dnsServer: &dns, routingTable: RoutingTable(), socketRegistry: &registry,
+                 dnsServer: &dns, socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
         return (transport as! InMemoryTransport).outputs
     }

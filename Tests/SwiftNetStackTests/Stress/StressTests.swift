@@ -1,5 +1,6 @@
 import Testing
 import Darwin
+import Foundation
 @testable import SwiftNetStack
 
 @Suite(.serialized)
@@ -8,6 +9,8 @@ struct StressTests {
     let hostMAC = MACAddress(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)
     let subnet = IPv4Subnet(network: IPv4Address(100, 64, 1, 0), prefixLength: 24)
     let gateway = IPv4Address(100, 64, 1, 1)
+    let vmMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
+    let vmIP = IPv4Address(100, 64, 1, 50)
 
     private func makeEndpoint(id: Int = 1) -> VMEndpoint {
         VMEndpoint(id: id, fd: Int32(id + 100), subnet: subnet, gateway: gateway, mtu: 1500)
@@ -25,7 +28,7 @@ struct StressTests {
         var dns = dnsServer
 
         bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer,
-                 dnsServer: &dns, routingTable: RoutingTable(), socketRegistry: &registry,
+                 dnsServer: &dns, socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
         return (transport as! InMemoryTransport).outputs
     }
@@ -483,5 +486,138 @@ struct StressTests {
         }
 
         #expect(totalReplies == 50)
+    }
+
+    // MARK: - E2E socketpair TCP
+
+    /// End-to-end TCP handshake + data transfer through socketpair +
+    /// DeliberationLoop + PollingTransport. Each runOneRound call is
+    /// preceded by a write to guestFD so the blocking poll always has
+    /// data to read. Phase 11 (pollSockets) handles external→VM data
+    /// within the same round.
+    @Test func tcpDataTransferE2E() {
+        guard let echo = TCPEchoServer.make() else {
+            Issue.record("failed to start echo server"); return
+        }
+
+        var fds: [Int32] = [-1, -1]
+        let rc = socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
+        guard rc == 0 else {
+            Issue.record("socketpair failed: \(errno)"); return
+        }
+        let hostFD = fds[0], guestFD = fds[1]
+        defer { close(hostFD); close(guestFD) }
+
+        let ep = VMEndpoint(id: 1, fd: hostFD, subnet: subnet, gateway: gateway)
+        var loop = DeliberationLoop(endpoints: [ep], hostMAC: hostMAC)
+        var transport: any Transport = PollingTransport(endpoints: [ep])
+
+        let dstIP = IPv4Address(127, 0, 0, 1)
+        let srcPort: UInt16 = 22350
+
+        // Helper: write bytes to guestFD
+        func w(_ bytes: [UInt8]) {
+            guard Darwin.write(guestFD, bytes, bytes.count) > 0 else {
+                Issue.record("write failed")
+                return
+            }
+        }
+
+        // Helper: read available bytes from guestFD with short poll
+        func r() -> [UInt8] {
+            var pfd = pollfd(fd: guestFD, events: Int16(POLLIN), revents: 0)
+            guard Darwin.poll(&pfd, 1, 50) > 0,
+                  pfd.revents & Int16(POLLIN) != 0 else { return [] }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = Darwin.read(guestFD, &buf, 4096)
+            return n > 0 ? Array(buf[0..<n]) : []
+        }
+
+        // ── SYN ──
+        w(makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
+                       srcIP: vmIP, dstIP: dstIP,
+                       srcPort: srcPort, dstPort: echo.port,
+                       seq: 0, ack: 0, flags: .syn)
+            .withUnsafeReadableBytes { Array($0) })
+
+        let replyCount1 = loop.runOneRound(transport: &transport)
+        #expect(replyCount1 >= 1, "expected SYN+ACK, got \(replyCount1)")
+
+        let synAckRaw = r()
+        guard !synAckRaw.isEmpty,
+              let synAckEth = EthernetFrame.parse(from: packetFrom(synAckRaw)),
+              let synAckIP = IPv4Header.parse(from: synAckEth.payload),
+              let synAckTCP = TCPHeader.parse(from: synAckIP.payload,
+                                              pseudoSrcAddr: synAckIP.srcAddr,
+                                              pseudoDstAddr: synAckIP.dstAddr),
+              synAckTCP.flags.isSynAck
+        else { Issue.record("no SYN+ACK, got \(synAckRaw.count) bytes"); return }
+        let natISN = synAckTCP.sequenceNumber
+
+        // ── ACK (complete handshake) ──
+        w(makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
+                       srcIP: vmIP, dstIP: dstIP,
+                       srcPort: srcPort, dstPort: echo.port,
+                       seq: 1, ack: natISN &+ 1, flags: .ack)
+            .withUnsafeReadableBytes { Array($0) })
+        _ = loop.runOneRound(transport: &transport)
+
+        // ── Data (PSH+ACK with payload) ──
+        let vmData: [UInt8] = (0..<256).map { UInt8($0 & 0xFF) }
+        w(makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
+                       srcIP: vmIP, dstIP: dstIP,
+                       srcPort: srcPort, dstPort: echo.port,
+                       seq: 1, ack: natISN &+ 1,
+                       flags: [.ack, .psh], payload: vmData)
+            .withUnsafeReadableBytes { Array($0) })
+        _ = loop.runOneRound(transport: &transport)
+
+        // Drain echo reply. Because PollingTransport blocks on poll()
+        // waiting for VM frames, we may need multiple rounds for Phase 11
+        // (pollSockets) to pick up the async echo. Each round is triggered
+        // by writing a harmless ARP request as a "keepalive" frame.
+        var echoed: [UInt8] = []
+        var attempts = 0
+        while echoed.count < vmData.count, attempts < 30 {
+            attempts += 1
+
+            // Drain any data already on guestFD
+            var raw = r()
+            while !raw.isEmpty {
+                if let eth = EthernetFrame.parse(from: packetFrom(raw)),
+                   let ip = IPv4Header.parse(from: eth.payload),
+                   let tcp = TCPHeader.parse(from: ip.payload,
+                                             pseudoSrcAddr: ip.srcAddr,
+                                             pseudoDstAddr: ip.dstAddr) {
+                    let payload = tcp.payload.withUnsafeReadableBytes { Array($0) }
+                    if !payload.isEmpty { echoed.append(contentsOf: payload) }
+                }
+                raw = r()
+            }
+            if echoed.count >= vmData.count { break }
+
+            // Trigger another round: write a dummy ARP request so poll()
+            // wakes up, giving Phase 11 another chance to read TCP socket data.
+            w(makeEthernetFrameBytes(
+                dst: .broadcast, src: vmMAC, type: .arp,
+                payload: makeARPPayload(op: .request, senderMAC: vmMAC,
+                                        senderIP: vmIP, targetMAC: .zero,
+                                        targetIP: gateway)))
+            _ = loop.runOneRound(transport: &transport)
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        #expect(echoed == vmData, "echoed \(echoed.count) bytes, expected \(vmData.count)")
+
+        // ── FIN ──
+        w(makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
+                       srcIP: vmIP, dstIP: dstIP,
+                       srcPort: srcPort, dstPort: echo.port,
+                       seq: 1 &+ UInt32(vmData.count),
+                       ack: natISN &+ 1 &+ UInt32(echoed.count),
+                       flags: [.ack, .fin])
+            .withUnsafeReadableBytes { Array($0) })
+        _ = loop.runOneRound(transport: &transport)
+
+        echo.waitDone()
     }
 }

@@ -1,12 +1,39 @@
 #!/usr/bin/env python3
-"""TCP and UDP echo servers for SwiftNetStack NAT e2e tests.
+"""TCP, UDP echo and HTTP servers for SwiftNetStack NAT e2e tests.
 
-Usage: python3 echo_servers.py <tcp_port> <udp_port>
+Usage: python3 echo_servers.py <tcp_port> <udp_port> <http_port>
 """
 
 import socket
 import sys
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+class EchoHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler that returns a fixed test page."""
+
+    def do_GET(self) -> None:
+        body = (
+            b"<html><body>\n"
+            b"<h1>SwiftNetStack E2E HTTP Test</h1>\n"
+            b"<p>endpoint-ok</p>\n"
+            b"</body></html>\n"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # suppress stderr logging
+
+
+def http_server(port: int) -> None:
+    srv = HTTPServer(("0.0.0.0", port), EchoHandler)
+    print(f"HTTP server listening on 0.0.0.0:{port}", flush=True)
+    srv.serve_forever()
 
 
 def tcp_echo(port: int) -> None:
@@ -44,14 +71,16 @@ def udp_echo(port: int) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port>", file=sys.stderr)
+    if len(sys.argv) != 4:
+        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port>", file=sys.stderr)
         sys.exit(1)
     tcp_port = int(sys.argv[1])
     udp_port = int(sys.argv[2])
+    http_port = int(sys.argv[3])
 
     threading.Thread(target=tcp_echo, args=(tcp_port,), daemon=True).start()
     threading.Thread(target=udp_echo, args=(udp_port,), daemon=True).start()
+    threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
 
     try:
         threading.Event().wait()

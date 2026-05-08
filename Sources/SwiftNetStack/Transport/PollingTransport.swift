@@ -53,22 +53,18 @@ private func configureNetworkFD(_ fd: Int32) {
 public struct PollingTransport: Transport {
     private var endpointsByFD: [Int32: VMEndpoint]
     private var fdByEndpointID: [Int: Int32]
-    private var mtuByFD: [Int32: Int]
     private var pendingWrites: [(endpointID: Int, packet: PacketBuffer)] = []
 
     public init(endpoints: [VMEndpoint]) {
         var byFD: [Int32: VMEndpoint] = [:]
         var fdByEP: [Int: Int32] = [:]
-        var mtu: [Int32: Int] = [:]
         for ep in endpoints {
             byFD[ep.fd] = ep
             fdByEP[ep.id] = ep.fd
-            mtu[ep.fd] = ep.mtu
             configureNetworkFD(ep.fd)
         }
         self.endpointsByFD = byFD
         self.fdByEndpointID = fdByEP
-        self.mtuByFD = mtu
     }
 
     // MARK: - Read
@@ -101,7 +97,6 @@ public struct PollingTransport: Transport {
             if let ep = endpointsByFD.removeValue(forKey: fd) {
                 fdByEndpointID.removeValue(forKey: ep.id)
             }
-            mtuByFD.removeValue(forKey: fd)
         }
 
         // ── Retry pending writes on writable fds ──

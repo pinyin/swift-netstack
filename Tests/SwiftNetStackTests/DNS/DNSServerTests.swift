@@ -365,7 +365,7 @@ struct DNSServerTests {
         let routingTable = RoutingTable()
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable()
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: routingTable, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 1, "expected 1 DNS reply, got \(outputs.count)")

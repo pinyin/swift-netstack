@@ -253,37 +253,42 @@ func debugValidateICMPPhase(
     for (replyEp, replyPkt) in replies {
         // ── Re-parse the reply independently ──
         guard let eth = EthernetFrame.parse(from: replyPkt) else {
-            preconditionFailure("ICMP L2: reply has invalid Ethernet")
+            fputs("ICMP L2: reply has invalid Ethernet\n", stderr); continue
         }
         guard eth.etherType == .ipv4 else {
-            preconditionFailure("ICMP L2: reply EtherType is not IPv4")
+            fputs("ICMP L2: reply EtherType is not IPv4\n", stderr); continue
         }
         guard let ip = IPv4Header.parse(from: eth.payload) else {
-            preconditionFailure("ICMP L2: reply has invalid IPv4 header")
+            fputs("ICMP L2: reply has invalid IPv4 header\n", stderr); continue
         }
         guard ip.protocol == .icmp else {
-            preconditionFailure("ICMP L2: reply IP protocol is not ICMP")
+            fputs("ICMP L2: reply IP protocol is not ICMP\n", stderr); continue
         }
         guard let icmp = ICMPHeader.parse(from: ip.payload) else {
-            preconditionFailure("ICMP L2: reply has invalid ICMP header")
+            fputs("ICMP L2: reply has invalid ICMP header\n", stderr); continue
         }
 
         // ── Validate L1: ICMP echo reply structural constraints ──
-        precondition(icmp.type == 0,
-            "RFC 792: ICMP reply type must be Echo Reply(0), got \(icmp.type)")
-        precondition(icmp.code == 0,
-            "RFC 792: ICMP Echo Reply code must be 0, got \(icmp.code)")
+        guard icmp.type == 0 else {
+            fputs("RFC 792: ICMP reply type must be Echo Reply(0), got \(icmp.type)\n", stderr); continue
+        }
+        guard icmp.code == 0 else {
+            fputs("RFC 792: ICMP Echo Reply code must be 0, got \(icmp.code)\n", stderr); continue
+        }
         // RFC 791 §3.1: IP header checksum — catches stale bytes (C2)
-        precondition(ip.verifyChecksum(),
-            "RFC 791 §3.1: ICMP reply IP checksum INVALID — stale bytes in pool chunk?")
+        guard ip.verifyChecksum() else {
+            fputs("RFC 791 §3.1: ICMP reply IP checksum INVALID — stale bytes in pool chunk?\n", stderr); continue
+        }
         // RFC 792: ICMP checksum over header + payload
         let icmpLen = 8 + icmp.payload.totalLength
         let icmpRaw = ip.payload.withUnsafeReadableBytes { $0 }
-        precondition(icmpRaw.count >= icmpLen,
-            "RFC 792: ICMP reply payload too short (\(icmpRaw.count) < \(icmpLen))")
+        guard icmpRaw.count >= icmpLen else {
+            fputs("RFC 792: ICMP reply payload too short (\(icmpRaw.count) < \(icmpLen))\n", stderr); continue
+        }
         let computed = internetChecksum(UnsafeRawBufferPointer(start: icmpRaw.baseAddress!, count: icmpLen))
-        precondition(computed == 0,
-            "RFC 792: ICMP reply checksum INVALID — stale bytes in pool chunk?")
+        guard computed == 0 else {
+            fputs("RFC 792: ICMP reply checksum INVALID — stale bytes in pool chunk?\n", stderr); continue
+        }
 
         // ── Match reply to request via (identifier, sequenceNumber, srcIP) ──
         let match = requests.first { req in
@@ -293,23 +298,26 @@ func debugValidateICMPPhase(
             && req.ip.srcAddr == ip.dstAddr
         }
         guard let req = match else {
-            preconditionFailure(
-                "RFC 792: ICMP reply (id=\(icmp.identifier), seq=\(icmp.sequenceNumber)) has no matching echo request")
+            fputs("RFC 792: ICMP reply (id=\(icmp.identifier), seq=\(icmp.sequenceNumber)) has no matching echo request\n", stderr); continue
         }
 
         // ── Validate correspondence ──
         // RFC 792: Reply dstMAC == request srcMAC
-        precondition(eth.dstMAC == req.eth.srcMAC,
-            "RFC 792: ICMP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        guard eth.dstMAC == req.eth.srcMAC else {
+            fputs("RFC 792: ICMP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)\n", stderr); continue
+        }
         // RFC 792: Reply srcMAC == host MAC
-        precondition(eth.srcMAC == hostMAC,
-            "RFC 792: ICMP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        guard eth.srcMAC == hostMAC else {
+            fputs("RFC 792: ICMP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
         // RFC 792: Reply srcIP == request dstIP (swap)
-        precondition(ip.srcAddr == req.ip.dstAddr,
-            "RFC 792: ICMP reply srcIP \(ip.srcAddr) ≠ request dstIP \(req.ip.dstAddr)")
+        guard ip.srcAddr == req.ip.dstAddr else {
+            fputs("RFC 792: ICMP reply srcIP \(ip.srcAddr) ≠ request dstIP \(req.ip.dstAddr)\n", stderr); continue
+        }
         // RFC 792: Reply dstIP == request srcIP (swap)
-        precondition(ip.dstAddr == req.ip.srcAddr,
-            "RFC 792: ICMP reply dstIP \(ip.dstAddr) ≠ request srcIP \(req.ip.srcAddr)")
+        guard ip.dstAddr == req.ip.srcAddr else {
+            fputs("RFC 792: ICMP reply dstIP \(ip.dstAddr) ≠ request srcIP \(req.ip.srcAddr)\n", stderr); continue
+        }
         // RFC 792: Reply payload == request payload (echo)
         let payloadMatch = icmp.payload.withUnsafeReadableBytes { replyBuf in
             req.icmp.payload.withUnsafeReadableBytes { reqBuf in
@@ -318,14 +326,17 @@ func debugValidateICMPPhase(
                     || memcmp(replyBuf.baseAddress!, reqBuf.baseAddress!, replyBuf.count) == 0)
             }
         }
-        precondition(payloadMatch,
-            "RFC 792: ICMP echo reply payload does not match request payload")
+        guard payloadMatch else {
+            fputs("RFC 792: ICMP echo reply payload does not match request payload\n", stderr); continue
+        }
         // RFC 791: TTL should be plausible (our replies use TTL=64)
-        precondition(ip.ttl >= 1 && ip.ttl <= 255,
-            "RFC 791 §3.1: ICMP reply TTL \(ip.ttl) out of range [1, 255]")
+        guard ip.ttl >= 1 && ip.ttl <= 255 else {
+            fputs("RFC 791 §3.1: ICMP reply TTL \(ip.ttl) out of range [1, 255]\n", stderr); continue
+        }
         // Endpoint consistency
-        precondition(replyEp == req.ep,
-            "ICMP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+        guard replyEp == req.ep else {
+            fputs("ICMP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)\n", stderr); continue
+        }
     }
 }
 
@@ -339,30 +350,32 @@ func debugValidateUDPPhase(
     for (replyEp, replyPkt) in replies {
         // ── Re-parse the reply independently ──
         guard let eth = EthernetFrame.parse(from: replyPkt) else {
-            preconditionFailure("UDP L2: reply has invalid Ethernet")
+            fputs("UDP L2: reply has invalid Ethernet\n", stderr); continue
         }
         guard eth.etherType == .ipv4 else {
-            preconditionFailure("UDP L2: reply EtherType is not IPv4")
+            fputs("UDP L2: reply EtherType is not IPv4\n", stderr); continue
         }
         guard let ip = IPv4Header.parse(from: eth.payload) else {
-            preconditionFailure("UDP L2: reply has invalid IPv4 header")
+            fputs("UDP L2: reply has invalid IPv4 header\n", stderr); continue
         }
         guard ip.protocol == .udp else {
-            preconditionFailure("UDP L2: reply IP protocol is not UDP")
+            fputs("UDP L2: reply IP protocol is not UDP\n", stderr); continue
         }
         guard let udp = UDPHeader.parse(
             from: ip.payload,
             pseudoSrcAddr: ip.srcAddr,
             pseudoDstAddr: ip.dstAddr
         ) else {
-            preconditionFailure("UDP L2: reply has invalid UDP header")
+            fputs("UDP L2: reply has invalid UDP header\n", stderr); continue
         }
 
         // ── Validate L1: IP and UDP checksums ──
-        precondition(ip.verifyChecksum(),
-            "RFC 791 §3.1: UDP reply IP checksum INVALID — stale bytes in pool chunk?")
-        precondition(udp.verifyChecksum(),
-            "RFC 768: UDP reply checksum INVALID")
+        guard ip.verifyChecksum() else {
+            fputs("RFC 791 §3.1: UDP reply IP checksum INVALID — stale bytes in pool chunk?\n", stderr); continue
+        }
+        guard udp.verifyChecksum() else {
+            fputs("RFC 768: UDP reply checksum INVALID\n", stderr); continue
+        }
 
         // ── Match reply to request via (srcPort↔dstPort, srcIP↔dstIP) ──
         let match = requests.first { req in
@@ -372,20 +385,22 @@ func debugValidateUDPPhase(
             && ip.dstAddr == req.ip.srcAddr
         }
         guard let req = match else {
-            preconditionFailure(
-                "RFC 768: UDP reply (srcPort=\(udp.srcPort), dstPort=\(udp.dstPort)) has no matching request")
+            fputs("RFC 768: UDP reply (srcPort=\(udp.srcPort), dstPort=\(udp.dstPort)) has no matching request\n", stderr); continue
         }
 
         // ── Validate correspondence ──
         // Reply dstMAC == request srcMAC
-        precondition(eth.dstMAC == req.eth.srcMAC,
-            "UDP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        guard eth.dstMAC == req.eth.srcMAC else {
+            fputs("UDP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)\n", stderr); continue
+        }
         // Reply srcMAC == host MAC
-        precondition(eth.srcMAC == hostMAC,
-            "UDP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        guard eth.srcMAC == hostMAC else {
+            fputs("UDP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
         // Endpoint consistency
-        precondition(replyEp == req.ep,
-            "UDP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+        guard replyEp == req.ep else {
+            fputs("UDP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)\n", stderr); continue
+        }
     }
 }
 
@@ -399,18 +414,19 @@ func debugValidateARPPhase(
     for (replyEp, replyPkt) in replies {
         // ── Re-parse the reply independently ──
         guard let eth = EthernetFrame.parse(from: replyPkt) else {
-            preconditionFailure("ARP L2: reply has invalid Ethernet")
+            fputs("ARP L2: reply has invalid Ethernet\n", stderr); continue
         }
         guard eth.etherType == .arp else {
-            preconditionFailure("ARP L2: reply EtherType is not ARP")
+            fputs("ARP L2: reply EtherType is not ARP\n", stderr); continue
         }
         guard let arp = ARPFrame.parse(from: eth.payload) else {
-            preconditionFailure("ARP L2: reply has invalid ARP frame")
+            fputs("ARP L2: reply has invalid ARP frame\n", stderr); continue
         }
 
         // ── Validate L1: ARP reply structural constraints ──
-        precondition(arp.operation == .reply,
-            "RFC 826: ARP reply operation must be reply(2), got \(arp.operation)")
+        guard arp.operation == .reply else {
+            fputs("RFC 826: ARP reply operation must be reply(2), got \(arp.operation)\n", stderr); continue
+        }
         debugValidateARPFrame(arp)
 
         // ── Match reply to request via (targetIP, senderIP) ──
@@ -422,32 +438,38 @@ func debugValidateARPPhase(
             && arp.senderIP == req.arp.targetIP
         }
         guard let req = match else {
-            preconditionFailure(
-                "RFC 826: ARP reply (senderIP=\(arp.senderIP), targetIP=\(arp.targetIP)) has no matching request")
+            fputs("RFC 826: ARP reply (senderIP=\(arp.senderIP), targetIP=\(arp.targetIP)) has no matching request\n", stderr); continue
         }
 
         // ── Validate correspondence ──
         // RFC 826: Reply dstMAC == request srcMAC
-        precondition(eth.dstMAC == req.eth.srcMAC,
-            "RFC 826: ARP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        guard eth.dstMAC == req.eth.srcMAC else {
+            fputs("RFC 826: ARP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)\n", stderr); continue
+        }
         // RFC 826: Reply srcMAC == hostMAC (proxy ARP)
-        precondition(eth.srcMAC == hostMAC,
-            "RFC 826: ARP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        guard eth.srcMAC == hostMAC else {
+            fputs("RFC 826: ARP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
         // RFC 826: senderMAC == hostMAC (proxy ARP identity)
-        precondition(arp.senderMAC == hostMAC,
-            "RFC 826: ARP reply senderMAC \(arp.senderMAC) ≠ hostMAC \(hostMAC)")
+        guard arp.senderMAC == hostMAC else {
+            fputs("RFC 826: ARP reply senderMAC \(arp.senderMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
         // RFC 826: targetMAC == request senderMAC (answering the requester)
-        precondition(arp.targetMAC == req.arp.senderMAC,
-            "RFC 826: ARP reply targetMAC \(arp.targetMAC) ≠ request senderMAC \(req.arp.senderMAC)")
+        guard arp.targetMAC == req.arp.senderMAC else {
+            fputs("RFC 826: ARP reply targetMAC \(arp.targetMAC) ≠ request senderMAC \(req.arp.senderMAC)\n", stderr); continue
+        }
         // RFC 826: senderIP == request targetIP (the IP being resolved)
-        precondition(arp.senderIP == req.arp.targetIP,
-            "RFC 826: ARP reply senderIP \(arp.senderIP) ≠ request targetIP \(req.arp.targetIP)")
+        guard arp.senderIP == req.arp.targetIP else {
+            fputs("RFC 826: ARP reply senderIP \(arp.senderIP) ≠ request targetIP \(req.arp.targetIP)\n", stderr); continue
+        }
         // RFC 826: targetIP == request senderIP (the requester's IP)
-        precondition(arp.targetIP == req.arp.senderIP,
-            "RFC 826: ARP reply targetIP \(arp.targetIP) ≠ request senderIP \(req.arp.senderIP)")
+        guard arp.targetIP == req.arp.senderIP else {
+            fputs("RFC 826: ARP reply targetIP \(arp.targetIP) ≠ request senderIP \(req.arp.senderIP)\n", stderr); continue
+        }
         // Endpoint consistency
-        precondition(replyEp == req.ep,
-            "ARP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+        guard replyEp == req.ep else {
+            fputs("ARP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)\n", stderr); continue
+        }
     }
 }
 
@@ -477,49 +499,53 @@ func debugValidateDHCPPhase(
     for (replyEp, replyPkt) in replies {
         // ── Re-parse the reply independently ──
         guard let eth = EthernetFrame.parse(from: replyPkt) else {
-            preconditionFailure("DHCP L2: reply has invalid Ethernet")
+            fputs("DHCP L2: reply has invalid Ethernet\n", stderr); continue
         }
         guard eth.etherType == .ipv4 else {
-            preconditionFailure("DHCP L2: reply EtherType is not IPv4")
+            fputs("DHCP L2: reply EtherType is not IPv4\n", stderr); continue
         }
         guard let ip = IPv4Header.parse(from: eth.payload) else {
-            preconditionFailure("DHCP L2: reply has invalid IPv4 header")
+            fputs("DHCP L2: reply has invalid IPv4 header\n", stderr); continue
         }
         guard ip.protocol == .udp else {
-            preconditionFailure("DHCP L2: reply IP protocol is not UDP")
+            fputs("DHCP L2: reply IP protocol is not UDP\n", stderr); continue
         }
         guard let dhcp = extractDHCPFromReplyFrame(replyPkt) else {
-            preconditionFailure("DHCP L2: reply has invalid DHCP packet")
+            fputs("DHCP L2: reply has invalid DHCP packet\n", stderr); continue
         }
 
         // ── Validate L1: DHCP reply constraints ──
-        precondition(dhcp.op == 2,
-            "RFC 2131 §2: DHCP reply op must be BOOTREPLY(2), got \(dhcp.op)")
+        guard dhcp.op == 2 else {
+            fputs("RFC 2131 §2: DHCP reply op must be BOOTREPLY(2), got \(dhcp.op)\n", stderr); continue
+        }
         debugValidateDHCPPacket(dhcp)
 
         // ── Validate L1: IP header checksum ──
-        precondition(ip.verifyChecksum(),
-            "RFC 791 §3.1: DHCP reply IP checksum INVALID — stale bytes in pool chunk?")
+        guard ip.verifyChecksum() else {
+            fputs("RFC 791 §3.1: DHCP reply IP checksum INVALID — stale bytes in pool chunk?\n", stderr); continue
+        }
 
         // ── Match reply to request via xid (transaction ID) ──
         let match = requests.first { req in
             req.dhcp.xid == dhcp.xid
         }
         guard let req = match else {
-            preconditionFailure(
-                "RFC 2131 §2: DHCP reply (xid=\(dhcp.xid)) has no matching request")
+            fputs("RFC 2131 §2: DHCP reply (xid=\(dhcp.xid)) has no matching request\n", stderr); continue
         }
 
         // ── Validate correspondence ──
         // RFC 2131: Reply dstMAC == request srcMAC (chaddr)
-        precondition(eth.dstMAC == req.eth.srcMAC,
-            "RFC 2131: DHCP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
+        guard eth.dstMAC == req.eth.srcMAC else {
+            fputs("RFC 2131: DHCP reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)\n", stderr); continue
+        }
         // RFC 2131: Reply srcMAC == hostMAC
-        precondition(eth.srcMAC == hostMAC,
-            "RFC 2131: DHCP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
+        guard eth.srcMAC == hostMAC else {
+            fputs("RFC 2131: DHCP reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
         // RFC 2131 §2: chaddr must match
-        precondition(dhcp.chaddr == req.dhcp.chaddr,
-            "RFC 2131 §2: DHCP reply chaddr \(dhcp.chaddr) ≠ request chaddr \(req.dhcp.chaddr)")
+        guard dhcp.chaddr == req.dhcp.chaddr else {
+            fputs("RFC 2131 §2: DHCP reply chaddr \(dhcp.chaddr) ≠ request chaddr \(req.dhcp.chaddr)\n", stderr); continue
+        }
         // RFC 2131 §4.3.1: Correct response type
         switch (req.dhcp.messageType, dhcp.messageType) {
         case (.discover, .offer):
@@ -531,16 +557,17 @@ func debugValidateDHCPPhase(
         case (.request, .nak):
             break  // REQUEST → NAK (rejected)
         default:
-            preconditionFailure(
-                "RFC 2131 §4.3.1: invalid DHCP message transition \(req.dhcp.messageType) → \(dhcp.messageType)")
+            fputs("RFC 2131 §4.3.1: invalid DHCP message transition \(req.dhcp.messageType) → \(dhcp.messageType)\n", stderr); continue
         }
         // DHCP reply srcIP must be non-zero (gateway IP). Cannot compare to
         // request dstIP because DISCOVER broadcasts to 255.255.255.255.
-        precondition(ip.srcAddr != .zero,
-            "RFC 2131: DHCP reply srcIP must not be 0.0.0.0")
+        guard ip.srcAddr != .zero else {
+            fputs("RFC 2131: DHCP reply srcIP must not be 0.0.0.0\n", stderr); continue
+        }
         // Endpoint consistency
-        precondition(replyEp == req.ep,
-            "DHCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+        guard replyEp == req.ep else {
+            fputs("DHCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)\n", stderr); continue
+        }
     }
 }
 
@@ -584,28 +611,29 @@ func debugValidateTCPPhase(
 ) {
     for (replyEp, replyPkt) in replies {
         guard let eth = EthernetFrame.parse(from: replyPkt) else {
-            preconditionFailure("TCP L2: reply has invalid Ethernet")
+            fputs("TCP L2: reply has invalid Ethernet\n", stderr); continue
         }
         guard eth.etherType == .ipv4 else {
-            preconditionFailure("TCP L2: reply EtherType is not IPv4")
+            fputs("TCP L2: reply EtherType is not IPv4\n", stderr); continue
         }
         guard let ip = IPv4Header.parse(from: eth.payload), ip.verifyChecksum() else {
-            preconditionFailure("TCP L2: reply has invalid IPv4 header")
+            fputs("TCP L2: reply has invalid IPv4 header\n", stderr); continue
         }
         guard ip.protocol == .tcp else {
-            preconditionFailure("TCP L2: reply IP protocol is not TCP")
+            fputs("TCP L2: reply IP protocol is not TCP\n", stderr); continue
         }
         guard let tcp = TCPHeader.parse(
             from: ip.payload,
             pseudoSrcAddr: ip.srcAddr,
             pseudoDstAddr: ip.dstAddr
         ) else {
-            preconditionFailure("TCP L2: reply has invalid TCP header")
+            fputs("TCP L2: reply has invalid TCP header\n", stderr); continue
         }
 
         // L1: structural constraints
-        precondition(tcp.dataOffset >= 5 && tcp.dataOffset <= 15,
-            "RFC 793: TCP dataOffset must be in [5,15], got \(tcp.dataOffset)")
+        guard tcp.dataOffset >= 5 && tcp.dataOffset <= 15 else {
+            fputs("RFC 793: TCP dataOffset must be in [5,15], got \(tcp.dataOffset)\n", stderr); continue
+        }
 
         // L2: correspondence — reply src = request dst, reply dst = request src
         let match = requests.first { req in
@@ -616,16 +644,18 @@ func debugValidateTCPPhase(
             && ip.dstAddr == req.ip.srcAddr
         }
         guard let req = match else {
-            preconditionFailure(
-                "RFC 793: TCP reply (srcPort=\(tcp.srcPort), dstPort=\(tcp.dstPort)) has no matching request")
+            fputs("RFC 793: TCP reply (srcPort=\(tcp.srcPort), dstPort=\(tcp.dstPort)) has no matching request\n", stderr); continue
         }
 
-        precondition(eth.dstMAC == req.eth.srcMAC,
-            "TCP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)")
-        precondition(eth.srcMAC == hostMAC,
-            "TCP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)")
-        precondition(replyEp == req.ep,
-            "TCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)")
+        guard eth.dstMAC == req.eth.srcMAC else {
+            fputs("TCP L2: reply dstMAC \(eth.dstMAC) ≠ request srcMAC \(req.eth.srcMAC)\n", stderr); continue
+        }
+        guard eth.srcMAC == hostMAC else {
+            fputs("TCP L2: reply srcMAC \(eth.srcMAC) ≠ hostMAC \(hostMAC)\n", stderr); continue
+        }
+        guard replyEp == req.ep else {
+            fputs("TCP L2: reply endpoint \(replyEp) ≠ request endpoint \(req.ep)\n", stderr); continue
+        }
     }
 }
 

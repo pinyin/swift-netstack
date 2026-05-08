@@ -34,7 +34,7 @@ struct BDPRoundIntegrationTests {
         let routingTable = RoutingTable()
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: routingTable, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -77,7 +77,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -97,7 +97,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -129,7 +129,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -162,7 +162,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
         #expect(!arpMapping.isKnown(requestedIP))
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect(arpMapping.isKnown(requestedIP))
         #expect(arpMapping.lookup(ip: requestedIP) == clientMAC)
@@ -188,7 +188,7 @@ struct BDPRoundIntegrationTests {
         ]))
         var transport1: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: requestFrame)])
         let round1 = RoundContext()
-        bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round1)
+        bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round1)
 
         #expect(arpMapping.isKnown(requestedIP))
 
@@ -196,7 +196,7 @@ struct BDPRoundIntegrationTests {
         let releaseFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:clientMAC, dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 2, chaddr: clientMAC, msgType: .release))
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: releaseFrame)])
         let round2 = RoundContext()
-        bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
+        bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
 
         #expect(!arpMapping.isKnown(requestedIP))
 
@@ -204,7 +204,7 @@ struct BDPRoundIntegrationTests {
         let discoverFrame = makeDHCPFrame(dstMAC: hostMAC, clientMAC:MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), dhcpPayload: makeDHCPPacketBytes(op: 1, xid: 3, chaddr: MACAddress(0xBA, 0xCC, 0xDD, 0xEE, 0xFF, 0x00), msgType: .discover))
         var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: discoverFrame)])
         let round3 = RoundContext()
-        bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round3)
+        bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round3)
 
         #expect(!(transport3 as! InMemoryTransport).outputs.isEmpty)
     }
@@ -235,7 +235,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         // Should get 2 replies: ARP reply + DHCP OFFER
         #expect((transport as! InMemoryTransport).outputs.count == 2)
@@ -255,7 +255,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -312,7 +312,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
         bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
@@ -373,7 +373,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 1)
@@ -406,7 +406,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep1])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -432,7 +432,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -478,7 +478,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [ep1, ep2])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 2)
@@ -500,7 +500,7 @@ struct BDPRoundIntegrationTests {
         var dhcpServer = DHCPServer(endpoints: [makeEndpoint()])
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -526,7 +526,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
         registry.register(port: 7, handler: UDPEchoSocket())
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.count == 1)
         guard (transport as! InMemoryTransport).outputs.count == 1 else { return }
@@ -570,7 +570,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
         registry.register(port: 7, handler: UDPEchoSocket())
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         guard (transport as! InMemoryTransport).outputs.count == 1,
               let eth = EthernetFrame.parse(from: (transport as! InMemoryTransport).outputs[0].packet),
@@ -605,7 +605,7 @@ struct BDPRoundIntegrationTests {
         // Register echo on port 7 only — port 53 has no socket
         registry.register(port: 7, handler: UDPEchoSocket())
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         #expect((transport as! InMemoryTransport).outputs.isEmpty)
     }
@@ -635,7 +635,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
         registry.register(port: 7, handler: UDPEchoSocket())
 
-        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, routingTable: RoutingTable(), socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
+        bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer, socketRegistry: &registry, ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs
         #expect(outputs.count == 2)
@@ -674,7 +674,7 @@ struct BDPRoundIntegrationTests {
         let round = RoundContext(); var registry = SocketRegistry(); var reasm = IPFragmentReassembler(); var natTable = NATTable(); var dnsServer = DNSServer(hosts: [:])
 
         bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         let outputs = (transport as! InMemoryTransport).outputs

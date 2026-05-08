@@ -59,80 +59,6 @@ struct NATTableTests {
         return (fd, port)
     }
 
-    // MARK: - TCP frame builders
-
-    /// Build an Ethernet/IPv4/TCP frame with a valid TCP checksum.
-    private func makeTCPFrame(
-        srcIP: IPv4Address, dstIP: IPv4Address,
-        srcPort: UInt16, dstPort: UInt16,
-        seq: UInt32, ack: UInt32,
-        flags: TCPFlags, window: UInt16 = 65535,
-        payload: [UInt8] = []
-    ) -> PacketBuffer {
-        let tcpLen = 20 + payload.count
-        let ipTotalLen = 20 + tcpLen
-
-        // IPv4 header
-        var ipBytes = [UInt8](repeating: 0, count: 20)
-        ipBytes[0] = 0x45
-        ipBytes[2] = UInt8(ipTotalLen >> 8)
-        ipBytes[3] = UInt8(ipTotalLen & 0xFF)
-        ipBytes[6] = 0x40; ipBytes[7] = 0x00
-        ipBytes[8] = 64
-        ipBytes[9] = IPProtocol.tcp.rawValue
-        srcIP.write(to: &ipBytes[12])
-        dstIP.write(to: &ipBytes[16])
-        let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
-        ipBytes[10] = UInt8(ipCksum >> 8)
-        ipBytes[11] = UInt8(ipCksum & 0xFF)
-
-        // TCP header
-        var tcpBytes = [UInt8](repeating: 0, count: tcpLen)
-        tcpBytes[0] = UInt8(srcPort >> 8); tcpBytes[1] = UInt8(srcPort & 0xFF)
-        tcpBytes[2] = UInt8(dstPort >> 8); tcpBytes[3] = UInt8(dstPort & 0xFF)
-        tcpBytes[4] = UInt8((seq >> 24) & 0xFF)
-        tcpBytes[5] = UInt8((seq >> 16) & 0xFF)
-        tcpBytes[6] = UInt8((seq >> 8) & 0xFF)
-        tcpBytes[7] = UInt8(seq & 0xFF)
-        tcpBytes[8] = UInt8((ack >> 24) & 0xFF)
-        tcpBytes[9] = UInt8((ack >> 16) & 0xFF)
-        tcpBytes[10] = UInt8((ack >> 8) & 0xFF)
-        tcpBytes[11] = UInt8(ack & 0xFF)
-        tcpBytes[12] = 0x50
-        tcpBytes[13] = flags.rawValue
-        tcpBytes[14] = UInt8(window >> 8); tcpBytes[15] = UInt8(window & 0xFF)
-        // checksum at [16..<18], computed below
-        if !payload.isEmpty {
-            for i in 0..<payload.count { tcpBytes[20 + i] = payload[i] }
-        }
-
-        // TCP checksum over pseudo-header + TCP segment
-        let ck = computeTCPChecksum(
-            pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
-            tcpData: &tcpBytes, tcpLen: tcpLen
-        )
-        tcpBytes[16] = UInt8(ck >> 8)
-        tcpBytes[17] = UInt8(ck & 0xFF)
-
-        return makeEthernetFrame(dst: hostMAC, src: vmMAC, type: .ipv4,
-                                  payload: ipBytes + tcpBytes)
-    }
-
-    private func makeEthernetFrame(dst: MACAddress, src: MACAddress, type: EtherType,
-                                     payload: [UInt8]) -> PacketBuffer {
-        var bytes: [UInt8] = []
-        var buf6 = [UInt8](repeating: 0, count: 6)
-        dst.write(to: &buf6); bytes.append(contentsOf: buf6)
-        src.write(to: &buf6); bytes.append(contentsOf: buf6)
-        let etRaw = type.rawValue
-        bytes.append(UInt8(etRaw >> 8))
-        bytes.append(UInt8(etRaw & 0xFF))
-        bytes.append(contentsOf: payload)
-        let s = Storage.allocate(capacity: bytes.count)
-        bytes.withUnsafeBytes { s.data.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
-        return PacketBuffer(storage: s, offset: 0, length: bytes.count)
-    }
-
     /// Extract TCP flags from a reply frame.
     private func extractTCPFlags(from frame: PacketBuffer) -> TCPFlags? {
         guard let eth = EthernetFrame.parse(from: frame),
@@ -265,7 +191,7 @@ struct NATTableTests {
         let dstIP = IPv4Address(127, 0, 0, 1)
 
         // ── Round 1: VM sends SYN ──
-        let synFrame = makeTCPFrame(
+        let synFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: server.port,
             seq: 0, ack: 0, flags: .syn
@@ -274,7 +200,7 @@ struct NATTableTests {
         var transport1: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: synFrame)])
         let round1 = RoundContext()
         bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round1)
 
         let round1Out = (transport1 as! InMemoryTransport).outputs
@@ -305,7 +231,7 @@ struct NATTableTests {
                 "transparent proxy: reply srcIP should be original dstIP (127.0.0.1)")
 
         // ── Round 2: VM sends ACK to complete handshake ──
-        let ackFrame = makeTCPFrame(
+        let ackFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: server.port,
             seq: 1, ack: natISN &+ 1, flags: .ack
@@ -314,14 +240,14 @@ struct NATTableTests {
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: ackFrame)])
         let round2 = RoundContext()
         bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
 
         #expect(natTable.tcpCount == 1, "NAT should have 1 active TCP entry")
 
         // ── Round 3: VM sends data ──
         let vmData: [UInt8] = [0x48, 0x65, 0x6C, 0x6C, 0x6F]  // "Hello"
-        let dataFrame = makeTCPFrame(
+        let dataFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: server.port,
             seq: 1, ack: natISN &+ 1, flags: [.ack, .psh],
@@ -331,7 +257,7 @@ struct NATTableTests {
         var transport3: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: dataFrame)])
         let round3 = RoundContext()
         bdpRound(transport: &transport3, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round3)
 
         // ── Let pollSockets pick up the echo ──
@@ -341,7 +267,7 @@ struct NATTableTests {
             var transport: any Transport = InMemoryTransport(inputs: [])
             let round = RoundContext()
             bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                     routingTable: RoutingTable(), socketRegistry: &registry,
+                     socketRegistry: &registry,
                      ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
             let outputs = (transport as! InMemoryTransport).outputs
@@ -357,7 +283,7 @@ struct NATTableTests {
         #expect(echoed == vmData, "echoed data should match sent data, got \(String(describing: echoed))")
 
         // ── Cleanup: VM sends FIN ──
-        let finFrame = makeTCPFrame(
+        let finFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: server.port,
             seq: 1 &+ UInt32(vmData.count), ack: natISN &+ 1 &+ UInt32(vmData.count),
@@ -367,7 +293,7 @@ struct NATTableTests {
         var transport5: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: finFrame)])
         let round5 = RoundContext()
         bdpRound(transport: &transport5, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round5)
 
         // Echo data may arrive via Phase 11 pollSockets in step 4 or step 5
@@ -403,7 +329,7 @@ struct NATTableTests {
                 var transport: any Transport = InMemoryTransport(inputs: [])
                 let round = RoundContext()
                 bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                         routingTable: RoutingTable(), socketRegistry: &registry,
+                         socketRegistry: &registry,
                          ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
                 let outputs = (transport as! InMemoryTransport).outputs
                 for out in outputs {
@@ -430,7 +356,7 @@ struct NATTableTests {
 
         // VM ACKs the NAT's FIN (NAT sent FIN in Phase 11 of round 5
         // when it detected the echo server's close).
-        let finalAckFrame = makeTCPFrame(
+        let finalAckFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: server.port,
             seq: 1 &+ UInt32(vmData.count) &+ 1,
@@ -441,7 +367,7 @@ struct NATTableTests {
         var transport6: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: finalAckFrame)])
         let round6 = RoundContext()
         bdpRound(transport: &transport6, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round6)
 
         // Run a few more poll rounds to let NAT finish cleanup
@@ -449,7 +375,7 @@ struct NATTableTests {
             var transport: any Transport = InMemoryTransport(inputs: [])
             let round = RoundContext()
             bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                     routingTable: RoutingTable(), socketRegistry: &registry,
+                     socketRegistry: &registry,
                      ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
             if natTable.tcpCount == 0 { break }
             usleep(10000)
@@ -511,7 +437,7 @@ struct NATTableTests {
         var transport: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: frame)])
         let round = RoundContext()
         bdpRound(transport: &transport, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round)
 
         // NAT should have created an entry
@@ -543,7 +469,7 @@ struct NATTableTests {
         var transport2: any Transport = InMemoryTransport(inputs: [])
         let round2 = RoundContext()
         bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
 
         let round2Out = (transport2 as! InMemoryTransport).outputs
@@ -741,7 +667,7 @@ struct NATTableTests {
         let natISN = synTCP.sequenceNumber
 
         // ── Round 2: VM responds with SYN+ACK ──
-        let synAckFrame = makeTCPFrame(
+        let synAckFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: synIP.srcAddr,
             srcPort: 8080, dstPort: synTCP.srcPort,
             seq: 5000, ack: natISN &+ 1, flags: [.syn, .ack]
@@ -750,7 +676,7 @@ struct NATTableTests {
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: synAckFrame)])
         let round2 = RoundContext()
         bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
 
         let round2Out = (transport2 as! InMemoryTransport).outputs
@@ -805,7 +731,7 @@ struct NATTableTests {
 
         // ── Round 3: VM ACKs the data ──
         let dataAckNum = dataSeq &+ UInt32(sendData.count)
-        let vmAckFrame = makeTCPFrame(
+        let vmAckFrame = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: synIP.srcAddr,
             srcPort: 8080, dstPort: synTCP.srcPort,
             seq: 5000 &+ 1, ack: dataAckNum, flags: .ack
@@ -814,7 +740,7 @@ struct NATTableTests {
         var transport4: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: vmAckFrame)])
         let round4 = RoundContext()
         bdpRound(transport: &transport4, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round4)
 
         // ── Signal client to close ──
@@ -858,7 +784,7 @@ struct NATTableTests {
             else { return }
 
             // VM ACKs the external FIN
-            let vmFinAck = makeTCPFrame(
+            let vmFinAck = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
                 srcIP: vmIP, dstIP: synIP.srcAddr,
                 srcPort: 8080, dstPort: synTCP.srcPort,
                 seq: 5001, ack: finTCP.sequenceNumber &+ 1, flags: .ack
@@ -867,11 +793,11 @@ struct NATTableTests {
             var transport6: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: vmFinAck)])
             let round6 = RoundContext()
             bdpRound(transport: &transport6, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                     routingTable: RoutingTable(), socketRegistry: &registry,
+                     socketRegistry: &registry,
                      ipFragmentReassembler: &reasm, natTable: &natTable, round: round6)
 
             // VM sends its own FIN
-            let vmFin = makeTCPFrame(
+            let vmFin = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
                 srcIP: vmIP, dstIP: synIP.srcAddr,
                 srcPort: 8080, dstPort: synTCP.srcPort,
                 seq: 5001, ack: finTCP.sequenceNumber &+ 1, flags: [.fin, .ack]
@@ -880,7 +806,7 @@ struct NATTableTests {
             var transport7: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: vmFin)])
             let round7 = RoundContext()
             bdpRound(transport: &transport7, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                     routingTable: RoutingTable(), socketRegistry: &registry,
+                     socketRegistry: &registry,
                      ipFragmentReassembler: &reasm, natTable: &natTable, round: round7)
 
             // ── Cleanup poll rounds ──
@@ -999,7 +925,7 @@ struct NATTableTests {
         var natTable = NATTable()
 
         // Round 1: First outbound SYN
-        let syn1 = makeTCPFrame(
+        let syn1 = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: IPv4Address(127, 0, 0, 1),
             srcPort: 50001, dstPort: s1.port,
             seq: 1000, ack: 0, flags: .syn
@@ -1007,7 +933,7 @@ struct NATTableTests {
         var transport1: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: syn1)])
         let round1 = RoundContext()
         bdpRound(transport: &transport1, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round1)
         let out1 = (transport1 as! InMemoryTransport).outputs
         #expect(out1.contains { extractTCPFlags(from: $0.packet)?.contains(.syn) == true && extractTCPFlags(from: $0.packet)?.contains(.ack) == true },
@@ -1015,7 +941,7 @@ struct NATTableTests {
         #expect(natTable.tcpCount == 1, "expected 1 TCP entry, got \(natTable.tcpCount)")
 
         // Round 2: Second outbound SYN (different srcPort, different echo server)
-        let syn2 = makeTCPFrame(
+        let syn2 = makeTCPFrame(dstMAC: hostMAC, srcMAC: vmMAC,
             srcIP: vmIP, dstIP: IPv4Address(127, 0, 0, 1),
             srcPort: 50002, dstPort: s2.port,
             seq: 2000, ack: 0, flags: .syn
@@ -1023,7 +949,7 @@ struct NATTableTests {
         var transport2: any Transport = InMemoryTransport(inputs: [(endpointID: 1, packet: syn2)])
         let round2 = RoundContext()
         bdpRound(transport: &transport2, arpMapping: &arpMapping, dhcpServer: &dhcpServer, dnsServer: &dnsServer,
-                 routingTable: RoutingTable(), socketRegistry: &registry,
+                 socketRegistry: &registry,
                  ipFragmentReassembler: &reasm, natTable: &natTable, round: round2)
         let out2 = (transport2 as! InMemoryTransport).outputs
         #expect(out2.contains { extractTCPFlags(from: $0.packet)?.contains(.syn) == true && extractTCPFlags(from: $0.packet)?.contains(.ack) == true },

@@ -6,7 +6,6 @@ import Darwin
 /// the fd→key reverse lookup trivial and match the TCP pattern — every NAT entry
 /// (TCP or UDP) maps one fd to one key.
 struct UDPNATMapping {
-    let id: UInt64
     let key: NATKey
     let fd: Int32
     let createdAt: UInt64
@@ -15,8 +14,7 @@ struct UDPNATMapping {
     let endpointID: Int
     let isInbound: Bool
 
-    init(id: UInt64, key: NATKey, fd: Int32, vmMAC: MACAddress, endpointID: Int, isInbound: Bool) {
-        self.id = id
+    init(key: NATKey, fd: Int32, vmMAC: MACAddress, endpointID: Int, isInbound: Bool) {
         self.key = key
         self.fd = fd
         self.createdAt = UInt64(Darwin.time(nil))

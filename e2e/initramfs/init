@@ -14,6 +14,13 @@ mount -t devpts   -o gid=5,mode=620,nosuid  devpts   /dev/pts
 mount -t tmpfs    -o nosuid,nodev           tmpfs    /run
 mount -t tmpfs    -o nosuid,nodev           tmpfs    /tmp
 
+# /etc on initramfs may be read-only; mount a writable tmpfs and restore essentials.
+# Needed so udhcpc can write /etc/resolv.conf.
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /etc
+echo "root:x:0:" > /etc/group
+echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+echo "127.0.0.1 localhost" > /etc/hosts
+
 echo "=== SwiftNetStack E2E Test Suite ==="
 echo ""
 
@@ -35,7 +42,7 @@ TEST_COUNT=0
 # dns validates hosts-file DNS resolution.
 # routing validates default and subnet routes.
 
-TESTS="dhcp icmp arp dns routing nat-udp nat-tcp"
+TESTS="dhcp icmp arp dns routing nat-udp nat-tcp nat-tcp-large nat-tcp-binary nat-tcp-concurrent nat-udp-large nat-internet"
 
 for t in $TESTS; do
     TEST_SCRIPT="/tests/test-${t}.sh"

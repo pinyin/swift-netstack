@@ -29,7 +29,7 @@ bound|renew)
     fi
 
     if [ -n "$dns" ]; then
-        echo -n > /etc/resolv.conf
+        > /etc/resolv.conf
         for ns in $dns; do
             echo "nameserver $ns" >> /etc/resolv.conf
         done

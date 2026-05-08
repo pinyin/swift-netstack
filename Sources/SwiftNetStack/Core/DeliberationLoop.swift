@@ -65,7 +65,6 @@ public struct DeliberationLoop {
             arpMapping: &arpMapping,
             dhcpServer: &dhcpServer,
             dnsServer: &dnsServer,
-            routingTable: routingTable,
             socketRegistry: &socketRegistry,
             ipFragmentReassembler: &ipFragmentReassembler,
             natTable: &natTable,

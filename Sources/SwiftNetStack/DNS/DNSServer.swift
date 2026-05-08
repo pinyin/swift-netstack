@@ -16,7 +16,8 @@ public struct DNSServer {
 
     /// Create a DNS server with the given hosts-file mappings and optional upstream.
     /// - Parameter hosts: hostname-to-IP mappings (keys are normalised at init).
-    /// - Parameter upstream: upstream DNS server address, or nil for hosts-only mode.
+    /// - Parameter upstream: upstream DNS server address. When nil, the first
+    ///   nameserver from /etc/resolv.conf is used automatically.
     public init(hosts: [String: IPv4Address], upstream: IPv4Address? = nil) {
         var normalised: [String: IPv4Address] = [:]
         for (name, ip) in hosts {
@@ -25,7 +26,9 @@ public struct DNSServer {
         }
         self.hosts = normalised
 
-        if let upstream = upstream {
+        let effectiveUpstream = upstream ?? DNSServer.detectSystemDNS()
+
+        if let upstreamAddr = effectiveUpstream {
             let fd = socket(AF_INET, SOCK_DGRAM, 0)
             if fd >= 0 {
                 setNonBlocking(fd)
@@ -45,7 +48,7 @@ public struct DNSServer {
                     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
                     addr.sin_family = sa_family_t(AF_INET)
                     addr.sin_port = UInt16(53).bigEndian
-                    withUnsafeMutableBytes(of: &addr.sin_addr) { upstream.write(to: $0.baseAddress!) }
+                    withUnsafeMutableBytes(of: &addr.sin_addr) { upstreamAddr.write(to: $0.baseAddress!) }
                     self.upstreamAddr = addr
                 } else {
                     close(fd)
@@ -60,6 +63,32 @@ public struct DNSServer {
             self.upstreamFD = nil
             self.upstreamAddr = nil
         }
+    }
+
+    /// Read /etc/resolv.conf and return the first nameserver as an IPv4Address.
+    private static func detectSystemDNS() -> IPv4Address? {
+        guard let content = try? String(contentsOfFile: "/etc/resolv.conf", encoding: .utf8) else {
+            return nil
+        }
+        for line in content.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("nameserver") else { continue }
+            let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 2 else { continue }
+            let ipStr = String(parts[1])
+            guard let ip = parseIPv4String(ipStr) else { continue }
+            return ip
+        }
+        return nil
+    }
+
+    /// Parse "a.b.c.d" into an IPv4Address, or nil.
+    private static func parseIPv4String(_ s: String) -> IPv4Address? {
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4,
+              let a = UInt8(parts[0]), let b = UInt8(parts[1]),
+              let c = UInt8(parts[2]), let d = UInt8(parts[3]) else { return nil }
+        return IPv4Address(a, b, c, d)
     }
 
     /// The upstream socket fd, if configured. Exposed for BDP loop polling.

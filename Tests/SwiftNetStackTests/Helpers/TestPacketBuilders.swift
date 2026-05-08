@@ -233,6 +233,59 @@ func makeTCPSYNFrame(dstMAC: MACAddress, clientMAC: MACAddress,
     return makeEthernetFrame(dst: dstMAC, src: clientMAC, type: .ipv4, payload: ipHdr + tcpHdr)
 }
 
+// MARK: - General TCP frame (any flags/seq/ack/payload)
+
+/// Build a full Ethernet/IPv4/TCP frame with arbitrary sequence numbers,
+/// flags, and payload. TCP checksum is computed via the pseudo-header.
+func makeTCPFrame(dstMAC: MACAddress, srcMAC: MACAddress,
+                   srcIP: IPv4Address, dstIP: IPv4Address,
+                   srcPort: UInt16, dstPort: UInt16,
+                   seq: UInt32, ack: UInt32,
+                   flags: TCPFlags, window: UInt16 = 65535,
+                   payload: [UInt8] = []) -> PacketBuffer {
+    let tcpLen = 20 + payload.count
+    let ipTotalLen = 20 + tcpLen
+
+    var ipBytes = [UInt8](repeating: 0, count: 20)
+    ipBytes[0] = 0x45
+    ipBytes[2] = UInt8(ipTotalLen >> 8)
+    ipBytes[3] = UInt8(ipTotalLen & 0xFF)
+    ipBytes[6] = 0x40; ipBytes[7] = 0x00
+    ipBytes[8] = 64
+    ipBytes[9] = IPProtocol.tcp.rawValue
+    srcIP.write(to: &ipBytes[12])
+    dstIP.write(to: &ipBytes[16])
+    let ipCksum = ipBytes.withUnsafeBytes { internetChecksum($0) }
+    ipBytes[10] = UInt8(ipCksum >> 8)
+    ipBytes[11] = UInt8(ipCksum & 0xFF)
+
+    var tcpBytes = [UInt8](repeating: 0, count: tcpLen)
+    tcpBytes[0] = UInt8(srcPort >> 8); tcpBytes[1] = UInt8(srcPort & 0xFF)
+    tcpBytes[2] = UInt8(dstPort >> 8); tcpBytes[3] = UInt8(dstPort & 0xFF)
+    tcpBytes[4] = UInt8((seq >> 24) & 0xFF)
+    tcpBytes[5] = UInt8((seq >> 16) & 0xFF)
+    tcpBytes[6] = UInt8((seq >> 8) & 0xFF)
+    tcpBytes[7] = UInt8(seq & 0xFF)
+    tcpBytes[8] = UInt8((ack >> 24) & 0xFF)
+    tcpBytes[9] = UInt8((ack >> 16) & 0xFF)
+    tcpBytes[10] = UInt8((ack >> 8) & 0xFF)
+    tcpBytes[11] = UInt8(ack & 0xFF)
+    tcpBytes[12] = 0x50  // data offset = 5 (20 bytes)
+    tcpBytes[13] = flags.rawValue
+    tcpBytes[14] = UInt8(window >> 8); tcpBytes[15] = UInt8(window & 0xFF)
+    for i in 0..<payload.count { tcpBytes[20 + i] = payload[i] }
+
+    let ck = computeTCPChecksum(
+        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
+        tcpData: &tcpBytes, tcpLen: tcpLen
+    )
+    tcpBytes[16] = UInt8(ck >> 8)
+    tcpBytes[17] = UInt8(ck & 0xFF)
+
+    return makeEthernetFrame(dst: dstMAC, src: srcMAC, type: .ipv4,
+                              payload: ipBytes + tcpBytes)
+}
+
 // MARK: - Parse helpers
 
 func parseDHCPFromBytes(_ bytes: [UInt8]) -> DHCPPacket? {

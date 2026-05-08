@@ -28,6 +28,8 @@ BUSYBOX_APPLETS=(
     ls mkdir poweroff
     awk grep head tail sed wc tr cut
     chmod cp ln arp
+    wget sha256sum md5sum base64 hexdump
+    printf xargs split expr
 )
 for applet in "${BUSYBOX_APPLETS[@]}"; do
     ln -sf busybox "$BUILD_DIR/bin/$applet"

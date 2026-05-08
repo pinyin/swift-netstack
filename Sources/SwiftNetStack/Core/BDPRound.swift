@@ -38,7 +38,6 @@ public func bdpRound(
     arpMapping: inout ARPMapping,
     dhcpServer: inout DHCPServer,
     dnsServer: inout DNSServer,
-    routingTable: RoutingTable,
     socketRegistry: inout SocketRegistry,
     ipFragmentReassembler: inout IPFragmentReassembler,
     natTable: inout NATTable,

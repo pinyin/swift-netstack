@@ -260,6 +260,7 @@ struct Args {
     var subnet = "100.64.1.0/24"
     var gateway = "100.64.1.1"
     var hosts: [(String, String)] = []
+    var upstreamDNS = ""
 }
 
 func parseArgs() -> Args? {
@@ -278,6 +279,7 @@ func parseArgs() -> Args? {
         case "--mac":         args.mac = argv[i + 1]; i += 2
         case "--subnet":      args.subnet = argv[i + 1]; i += 2
         case "--gateway":     args.gateway = argv[i + 1]; i += 2
+        case "--dns":        args.upstreamDNS = argv[i + 1]; i += 2
         case "--host":
             let parts = argv[i + 1].split(separator: ":", maxSplits: 1)
             if parts.count == 2 {
@@ -319,6 +321,7 @@ func runBDPLoop(
     endpoint: VMEndpoint,
     hostMAC: MACAddress,
     hosts: [String: IPv4Address],
+    upstreamDNS: IPv4Address?,
     shutdownFD: Int32,
     shutdownFlag: ShutdownFlag,
     stats: FrameStats
@@ -334,7 +337,8 @@ func runBDPLoop(
     var loop = DeliberationLoop(
         endpoints: [endpoint],
         hostMAC: hostMAC,
-        hosts: hosts
+        hosts: hosts,
+        upstreamDNS: upstreamDNS
     )
 
     var roundCount: UInt64 = 0
@@ -361,11 +365,11 @@ let usage = """
       Linux boot:
         SwiftNetStackDemo --kernel <path> --initrd <path> [--cmdline \"...\"] \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
-                          [--subnet CIDR] [--gateway IP] [--host name:IP]
+                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP]
       EFI boot:
         SwiftNetStackDemo --disk <path> --efi-store <path> \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
-                          [--subnet CIDR] [--gateway IP] [--host name:IP]
+                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP]
 
     Boots a Linux VM with VZFileHandleNetworkDevice networking backed by the
     SwiftNetStack BDP pipeline (ARP, DHCP, DNS, NAT, TCP).
@@ -426,6 +430,10 @@ let endpoint = VMEndpoint(id: 1, fd: bridgeFd, subnet: subnet, gateway: gatewayI
 let _endpoint = endpoint
 let _hostMAC = hostMAC
 let _hosts = hosts
+let _upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
+if !args.upstreamDNS.isEmpty && _upstreamDNS == nil {
+    log("WARNING: invalid upstream DNS address: \(args.upstreamDNS), DNS forwarding disabled")
+}
 let _shutdownRead = shutdownRead
 let _shutdownFlag = shutdownFlag
 let _stats = stats
@@ -436,6 +444,7 @@ bdpQueue.async {
         endpoint: _endpoint,
         hostMAC: _hostMAC,
         hosts: _hosts,
+        upstreamDNS: _upstreamDNS,
         shutdownFD: _shutdownRead,
         shutdownFlag: _shutdownFlag,
         stats: _stats

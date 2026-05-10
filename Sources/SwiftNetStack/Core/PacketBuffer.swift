@@ -310,25 +310,6 @@ public struct PacketBuffer {
         }
     }
 
-    /// Write all views to a file descriptor using a single sendmsg syscall.
-    /// Returns the total bytes written or -1 on error.
-    @discardableResult
-    public func sendmsg(to fd: Int32, flags: Int32 = 0) -> Int {
-        var iov = iovecs()
-        guard !iov.isEmpty else { return 0 }
-        return iov.withUnsafeMutableBufferPointer { iovPtr in
-            var msg = msghdr(
-                msg_name: nil,
-                msg_namelen: 0,
-                msg_iov: iovPtr.baseAddress,
-                msg_iovlen: Int32(iovPtr.count),
-                msg_control: nil,
-                msg_controllen: 0,
-                msg_flags: 0
-            )
-            return Darwin.sendmsg(fd, &msg, flags)
-        }
-    }
 
     // MARK: - Internal helpers
 

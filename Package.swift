@@ -19,10 +19,5 @@ let package = Package(
                 .linkedFramework("Virtualization")
             ]
         ),
-        .testTarget(
-            name: "SwiftNetStackTests",
-            dependencies: ["SwiftNetStack"],
-            path: "Tests/SwiftNetStackTests"
-        ),
     ]
 )

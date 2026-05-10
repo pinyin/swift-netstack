@@ -41,3 +41,23 @@ public enum IPProtocol: UInt8 {
     case tcp  = 6
     case udp  = 17
 }
+
+// MARK: - String parsing
+
+/// Parse an IPv4 address from dotted-decimal notation (e.g. "100.64.1.1").
+public func parseIPv4(_ s: String) -> IPv4Address? {
+    let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4,
+          let a = UInt8(parts[0]), let b = UInt8(parts[1]),
+          let c = UInt8(parts[2]), let d = UInt8(parts[3]) else { return nil }
+    return IPv4Address(a, b, c, d)
+}
+
+/// Parse a CIDR subnet (e.g. "100.64.1.0/24") into (network, prefixLength).
+public func parseSubnet(_ s: String) -> (IPv4Address, Int)? {
+    let parts = s.split(separator: "/")
+    guard parts.count == 2,
+          let ip = parseIPv4(String(parts[0])),
+          let prefix = Int(parts[1]) else { return nil }
+    return (ip, prefix)
+}

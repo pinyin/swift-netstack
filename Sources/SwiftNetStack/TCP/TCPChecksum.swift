@@ -11,15 +11,17 @@ func computeTCPChecksum(
     tcpData: UnsafeRawPointer,
     tcpLen: Int
 ) -> UInt16 {
-    var buf = [UInt8](repeating: 0, count: 12 + tcpLen)
-    var ipOut = [UInt8](repeating: 0, count: 4)
-    pseudoSrcAddr.write(to: &ipOut); buf[0...3] = ipOut[0...3]
-    pseudoDstAddr.write(to: &ipOut); buf[4...7] = ipOut[0...3]
-    buf[9] = IPProtocol.tcp.rawValue
-    buf[10] = UInt8(tcpLen >> 8)
-    buf[11] = UInt8(tcpLen & 0xFF)
-    buf.withUnsafeMutableBytes { dst in
-        dst.baseAddress!.advanced(by: 12).copyMemory(from: tcpData, byteCount: tcpLen)
+    // Stack-allocated pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + len(2) = 12 bytes
+    var pseudo: [UInt8] = [
+        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue, UInt8(tcpLen >> 8), UInt8(tcpLen & 0xFF),
+    ]
+    pseudoSrcAddr.write(to: &pseudo)
+    pseudo.withUnsafeMutableBytes { buf in
+        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
     }
-    return buf.withUnsafeBytes { internetChecksum($0) }
+
+    // Compute checksum in two passes: pseudo-header then TCP segment
+    var sum = pseudoSum(pseudo)
+    sum = checksumAdd(sum, tcpData, tcpLen)
+    return finalizeChecksum(sum)
 }

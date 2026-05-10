@@ -14,7 +14,7 @@ public struct TCPHeader {
     public let pseudoDstAddr: IPv4Address
     private let _checksumValid: Bool
 
-    private init(
+    init(
         srcPort: UInt16, dstPort: UInt16,
         sequenceNumber: UInt32, acknowledgmentNumber: UInt32,
         dataOffset: UInt8, flags: TCPFlags,

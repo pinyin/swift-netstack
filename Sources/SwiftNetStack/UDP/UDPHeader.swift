@@ -105,18 +105,19 @@ func computeUDPChecksum(
     udpData: UnsafeRawPointer,
     udpLen: Int
 ) -> UInt16 {
-    // pseudo-header: srcIP(4) + dstIP(4) + zero(1) + protocol(1) + udpLength(2) = 12
-    var buf = [UInt8](repeating: 0, count: 12 + udpLen)
-    var ipOut = [UInt8](repeating: 0, count: 4)
-    pseudoSrcAddr.write(to: &ipOut); buf[0...3] = ipOut[0...3]
-    pseudoDstAddr.write(to: &ipOut); buf[4...7] = ipOut[0...3]
-    buf[9] = IPProtocol.udp.rawValue
-    buf[10] = UInt8(udpLen >> 8)
-    buf[11] = UInt8(udpLen & 0xFF)
-    buf.withUnsafeMutableBytes { dst in
-        dst.baseAddress!.advanced(by: 12).copyMemory(from: udpData, byteCount: udpLen)
+    // Stack-allocated pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + len(2) = 12 bytes
+    var pseudo: [UInt8] = [
+        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.udp.rawValue, UInt8(udpLen >> 8), UInt8(udpLen & 0xFF),
+    ]
+    pseudoSrcAddr.write(to: &pseudo)
+    pseudo.withUnsafeMutableBytes { buf in
+        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
     }
-    let ck = buf.withUnsafeBytes { internetChecksum($0) }
+
+    // Compute checksum in two passes: pseudo-header then UDP segment
+    var sum = pseudoSum(pseudo)
+    sum = checksumAdd(sum, udpData, udpLen)
+    let ck = finalizeChecksum(sum)
     return ck == 0 ? 0xFFFF : ck
 }
 

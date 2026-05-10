@@ -71,7 +71,7 @@ func tcpProcess(
     return result
 }
 
-private func _tcpProcessImpl(
+func _tcpProcessImpl(
     state: TCPState,
     segment: TCPHeader,
     snd: inout SendSequence,
@@ -123,27 +123,15 @@ private func _tcpProcessImpl(
             if segment.flags.isSyn {
                 rcv.nxt = segment.sequenceNumber &+ 1
             }
-            return (.established, [], nil)
-        }
-        return (.synReceived, [], nil)
-
-    case .established:
-        // Update peer window
-        snd.wnd = segment.window
-
-        // Check for data
-        let dataLen = segment.payload.totalLength
-        let segSeq = segment.sequenceNumber
-
-        if dataLen > 0 {
-            // Only accept in-order data
-            if segSeq == rcv.nxt {
-                // Extract payload
-                let data: [UInt8]? = dataLen > 0 ? segment.payload.withUnsafeReadableBytes {
+            // The handshake-completing ACK may carry data and/or FIN
+            // (e.g. HTTP GET piggybacked on the third handshake segment).
+            // Handle these so data isn't silently dropped.
+            let dataLen = segment.payload.totalLength
+            if dataLen > 0 {
+                let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
                     Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
-                } : nil
+                }
                 rcv.nxt = rcv.nxt &+ UInt32(dataLen)
-                // Send ACK for the data we just accepted
                 let ackSeg = TCPSegmentToSend(
                     flags: .ack,
                     seq: snd.nxt,
@@ -151,7 +139,6 @@ private func _tcpProcessImpl(
                     window: 65535,
                     payload: nil
                 )
-                // Check FIN after data
                 if segment.flags.isFin {
                     rcv.nxt = rcv.nxt &+ 1
                     let finAck = TCPSegmentToSend(
@@ -165,7 +152,33 @@ private func _tcpProcessImpl(
                 }
                 return (.established, [ackSeg], data)
             }
-            // Out of order — just ACK what we have
+            if segment.flags.isFin {
+                rcv.nxt = rcv.nxt &+ 1
+                let ackSeg = TCPSegmentToSend(
+                    flags: .ack,
+                    seq: snd.nxt,
+                    ack: rcv.nxt,
+                    window: 65535,
+                    payload: nil
+                )
+                return (.closeWait, [ackSeg], nil)
+            }
+            return (.established, [], nil)
+        }
+        return (.synReceived, [], nil)
+
+    case .established:
+        // Update peer window
+        snd.wnd = segment.window
+
+        // Check for data
+        let dataLen = segment.payload.totalLength
+
+        if dataLen > 0 {
+            let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
+                Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
+            }
+            rcv.nxt = rcv.nxt &+ UInt32(dataLen)
             let ackSeg = TCPSegmentToSend(
                 flags: .ack,
                 seq: snd.nxt,
@@ -173,16 +186,23 @@ private func _tcpProcessImpl(
                 window: 65535,
                 payload: nil
             )
-            return (.established, [ackSeg], nil)
+            if segment.flags.isFin {
+                rcv.nxt = rcv.nxt &+ 1
+                let finAck = TCPSegmentToSend(
+                    flags: [.ack],
+                    seq: snd.nxt,
+                    ack: rcv.nxt,
+                    window: 65535,
+                    payload: nil
+                )
+                return (.closeWait, [ackSeg, finAck], data)
+            }
+            return (.established, [ackSeg], data)
         }
 
         // Pure ACK (no data)
         if segment.flags.isAck {
-            let ack = segment.acknowledgmentNumber
-            // Advance snd.una if this ACKs new data
-            if tcpSeqGreaterThan(ack, snd.una) || ack == snd.una {
-                snd.una = ack
-            }
+            snd.una = segment.acknowledgmentNumber
         }
 
         // FIN
@@ -250,42 +270,28 @@ private func _tcpProcessImpl(
 
     case .finWait2:
         snd.wnd = segment.window
-        // Check for data (rare but valid — data after our FIN before peer FIN)
         let dataLen = segment.payload.totalLength
-        if dataLen > 0 && segment.sequenceNumber == rcv.nxt {
+        if dataLen > 0 {
             let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
                 Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
             }
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
-            // Also check for FIN
             if segment.flags.isFin {
                 rcv.nxt = rcv.nxt &+ 1
                 let ackSeg = TCPSegmentToSend(
-                    flags: .ack,
-                    seq: snd.nxt,
-                    ack: rcv.nxt,
-                    window: 65535,
-                    payload: nil
+                    flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
                 )
                 return (.closed, [ackSeg], data)
             }
             let ackSeg = TCPSegmentToSend(
-                flags: .ack,
-                seq: snd.nxt,
-                ack: rcv.nxt,
-                window: 65535,
-                payload: nil
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
             )
             return (.finWait2, [ackSeg], data)
         }
         if segment.flags.isFin {
             rcv.nxt = rcv.nxt &+ 1
             let ackSeg = TCPSegmentToSend(
-                flags: .ack,
-                seq: snd.nxt,
-                ack: rcv.nxt,
-                window: 65535,
-                payload: nil
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
             )
             return (.closed, [ackSeg], nil)
         }
@@ -293,10 +299,9 @@ private func _tcpProcessImpl(
 
     case .closeWait:
         snd.wnd = segment.window
-        // Process any remaining data
         let dataLen = segment.payload.totalLength
         var data: [UInt8]? = nil
-        if dataLen > 0 && segment.sequenceNumber == rcv.nxt {
+        if dataLen > 0 {
             data = segment.payload.withUnsafeReadableBytes {
                 Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
             }
@@ -329,12 +334,7 @@ private func _tcpProcessImpl(
 }
 
 /// Generate an Initial Sequence Number.
-/// Uses wall-clock time for simplicity (adequate for a proxy).
+/// Uses arc4random for collision-resistant ISNs (RFC 6528 §3).
 func tcpGenerateISN() -> UInt32 {
-    UInt32(UInt64(Darwin.time(nil)) & 0xFFFFFFFF)
-}
-
-/// Sequence number comparison accounting for wraparound (RFC 1982).
-func tcpSeqGreaterThan(_ a: UInt32, _ b: UInt32) -> Bool {
-    Int32(bitPattern: a &- b) > 0
+    arc4random()
 }

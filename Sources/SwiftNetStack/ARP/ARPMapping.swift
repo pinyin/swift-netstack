@@ -5,11 +5,18 @@ public struct ARPEntry {
     public let ip: IPv4Address
     public let mac: MACAddress
     public let endpointID: Int
+    public let createdAt: UInt64
 
     public init(ip: IPv4Address, mac: MACAddress, endpointID: Int) {
         self.ip = ip
         self.mac = mac
         self.endpointID = endpointID
+        self.createdAt = UInt64(Darwin.time(nil))
+    }
+
+    /// Entries older than 1 hour are considered stale.
+    var isExpired: Bool {
+        UInt64(Darwin.time(nil)) - createdAt > 3600
     }
 }
 
@@ -34,22 +41,25 @@ public struct ARPMapping {
 
     // MARK: - Query
 
-    /// Look up the MAC for an IP. Returns nil if unknown.
+    /// Look up the MAC for an IP. Returns nil if unknown or expired.
     public func lookup(ip: IPv4Address) -> MACAddress? {
-        entries[ip.addr]?.mac
+        guard let entry = entries[ip.addr], !entry.isExpired else { return nil }
+        return entry.mac
     }
 
-    /// Look up the endpoint ID for a MAC address. Returns nil if unknown.
+    /// Look up the endpoint ID for a MAC address. Returns nil if unknown or expired.
     public func lookupEndpoint(mac: MACAddress) -> Int? {
         for entry in entries.values where entry.mac == mac {
+            if entry.isExpired { return nil }
             return entry.endpointID
         }
         return nil
     }
 
-    /// Whether this IP is known (gateway or DHCP-leased container).
+    /// Whether this IP is known and not expired.
     public func isKnown(_ ip: IPv4Address) -> Bool {
-        entries[ip.addr] != nil
+        guard let entry = entries[ip.addr] else { return false }
+        return !entry.isExpired
     }
 
     // MARK: - Mutation

@@ -2,7 +2,7 @@
 # Test: Internet access through NAT.
 #
 # Part 1 (guest→host HTTP): Uses the host-side HTTP test server.
-# Part 2 (guest→internet): DNS + TCP connectivity + HTTP fetch.
+# Part 2 (guest→internet): DNS + HTTP fetch.
 
 . /tests/lib.sh
 
@@ -33,27 +33,29 @@ fi
 
 # ── Part 2: Guest → Internet ──
 
-echo "  Guest→Internet: DNS + TCP connectivity..."
+echo "  Guest→Internet: DNS + HTTP fetch..."
 
 # Verify upstream DNS forwarding
-HTTPBIN_IP=$(nslookup httpbin.org 2>/dev/null | awk '/^Address:/ && !/[#:][0-9]+$/ {print $2; exit}')
+HTTPBIN_IP=$(nslookup example.com 2>/dev/null | awk '/^Address:/ && !/[#:][0-9]+$/ {print $2; exit}')
 if [ -z "$HTTPBIN_IP" ]; then
     echo "  DNS cannot resolve internet hostnames"
     test_fail "nat-http-internet"
     return 0
 fi
-echo "  DNS OK: httpbin.org → $HTTPBIN_IP"
+echo "  DNS OK: example.com -> $HTTPBIN_IP"
 
-# Test 1: Raw TCP connectivity — send a short string, expect any response
-echo "  TCP probe to $HTTPBIN_IP:80..."
-echo "hello" | nc -w 10 "$HTTPBIN_IP" 80 > /tmp/inet-tcp-probe.txt 2>/dev/null
-TCP_RESP=$(wc -c < /tmp/inet-tcp-probe.txt)
-echo "  TCP probe response: $TCP_RESP bytes"
+# Use printf+nc for raw HTTP request with proper Host header.
+# This avoids issues with busybox wget DNS resolution and --header support.
+echo "  HTTP fetch http://$HTTPBIN_IP/ ..."
+printf 'GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n' \
+    | nc -w 10 "$HTTPBIN_IP" 80 > /tmp/inet-http-resp.txt 2>/tmp/inet-http-err.txt
+TCP_RESP=$(wc -c < /tmp/inet-http-resp.txt)
+echo "  response: $TCP_RESP bytes"
 if [ "$TCP_RESP" -gt 0 ]; then
-    echo "  TCP connectivity OK"
     test_pass "nat-http-internet"
     return 0
 fi
 
-echo "  No TCP response from internet host"
+echo "  HTTP fetch failed"
+echo "  stderr: $(cat /tmp/inet-http-err.txt)"
 test_fail "nat-http-internet"

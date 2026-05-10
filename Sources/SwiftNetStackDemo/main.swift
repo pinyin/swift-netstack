@@ -22,130 +22,6 @@ func die(_ msg: String) -> Never {
     exit(1)
 }
 
-func hexDump(_ pkt: PacketBuffer, label: String, maxLen: Int = 64) {
-    pkt.withUnsafeReadableBytes { buf in
-        let n = min(buf.count, maxLen)
-        let hex = (0..<n).map { String(format: "%02x", buf[$0]) }.joined(separator: " ")
-        log("\(label) len=\(buf.count): \(hex)")
-    }
-}
-
-// MARK: - Socket helpers
-
-func makeSocketPair() -> (Int32, Int32) {
-    var fds: [Int32] = [0, 0]
-    guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds) == 0 else {
-        die("socketpair: \(String(cString: strerror(errno)))")
-    }
-    for fd in fds {
-        let flags = fcntl(fd, F_GETFL, 0)
-        guard flags >= 0 else { die("fcntl(F_GETFL): \(String(cString: strerror(errno)))") }
-        guard fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-            die("fcntl(F_SETFL): \(String(cString: strerror(errno)))")
-        }
-    }
-    return (fds[0], fds[1])
-}
-
-// MARK: - Shutdown flag (reference type for cross-boundary signalling)
-
-final class ShutdownFlag: @unchecked Sendable {
-    var isSet: Bool = false
-}
-
-// MARK: - Frame stats (reference type to survive any Transport boxing)
-
-final class FrameStats: @unchecked Sendable {
-    var rx: UInt64 = 0
-    var tx: UInt64 = 0
-}
-
-// MARK: - VZ Transport
-
-/// Transport that reads raw Ethernet frames from a VZFileHandleNetworkDevice
-/// socket pair, plus a shutdown fd that wakes poll() for clean exit.
-struct VZTransport: Transport {
-    let endpointID: Int
-    let vmFD: Int32
-    let shutdownFD: Int32
-    let shutdownFlag: ShutdownFlag
-    let stats: FrameStats
-    let mtu: Int
-    private let maxPackets: Int = 256
-
-    init(endpointID: Int, vmFD: Int32, shutdownFD: Int32, shutdownFlag: ShutdownFlag, stats: FrameStats, mtu: Int = 1500) {
-        self.endpointID = endpointID
-        self.vmFD = vmFD
-        self.shutdownFD = shutdownFD
-        self.shutdownFlag = shutdownFlag
-        self.stats = stats
-        self.mtu = mtu
-
-        var sndSize: Int = 1 * 1024 * 1024
-        setsockopt(vmFD, SOL_SOCKET, SO_SNDBUF, &sndSize, socklen_t(MemoryLayout<Int>.size))
-        var rcvSize: Int = 4 * 1024 * 1024
-        setsockopt(vmFD, SOL_SOCKET, SO_RCVBUF, &rcvSize, socklen_t(MemoryLayout<Int>.size))
-    }
-
-    mutating func readPackets(round: RoundContext) -> [(endpointID: Int, packet: PacketBuffer)] {
-        var pollfds: [pollfd] = [
-            pollfd(fd: vmFD, events: Int16(POLLIN), revents: 0),
-            pollfd(fd: shutdownFD, events: Int16(POLLIN), revents: 0),
-        ]
-
-        let rc = Darwin.poll(&pollfds, UInt32(pollfds.count), 100)  // 100ms timeout so pollSockets runs periodically
-        guard rc > 0 else { return [] }
-
-        // Shutdown signal — drain the byte, set flag, return empty
-        if pollfds[1].revents & Int16(POLLIN) != 0 {
-            var buf: UInt8 = 0
-            _ = Darwin.read(shutdownFD, &buf, 1)
-            shutdownFlag.isSet = true
-            return []
-        }
-
-        // Check for dead VM fd
-        if pollfds[0].revents & Int16(POLLNVAL | POLLERR | POLLHUP) != 0 {
-            return []
-        }
-
-        guard pollfds[0].revents & Int16(POLLIN) != 0 else { return [] }
-
-        var frames: [(endpointID: Int, packet: PacketBuffer)] = []
-        frames.reserveCapacity(maxPackets)
-
-        while frames.count < maxPackets {
-            var pkt = round.allocate(capacity: mtu, headroom: 0)
-            guard let ptr = pkt.appendPointer(count: mtu) else { break }
-
-            var iov = iovec(iov_base: ptr, iov_len: mtu)
-            var msg = msghdr(msg_name: nil, msg_namelen: 0, msg_iov: &iov, msg_iovlen: 1, msg_control: nil, msg_controllen: 0, msg_flags: 0)
-            let n = Darwin.recvmsg(vmFD, &msg, 0)
-            if n <= 0 { break }
-            if n < mtu { pkt.trimBack(mtu - n) }
-            frames.append((endpointID, pkt))
-            stats.rx += 1
-            if stats.rx <= 5 {
-                hexDump(pkt, label: "RX[\(stats.rx)]")
-            }
-        }
-
-        return frames
-    }
-
-    mutating func writePackets(_ packets: [(endpointID: Int, packet: PacketBuffer)]) {
-        for (_, pkt) in packets {
-            let n = pkt.sendmsg(to: vmFD, flags: Int32(MSG_DONTWAIT))
-            if n < 0 {
-                log("VZTransport.writePackets: sendmsg failed errno=\(errno) \(String(cString: strerror(errno)))")
-            } else if stats.tx < 5 {
-                hexDump(pkt, label: "TX[\(stats.tx)]")
-            }
-            stats.tx += 1
-        }
-    }
-}
-
 // MARK: - VM Delegate
 
 final class VMDelegate: NSObject, VZVirtualMachineDelegate {
@@ -246,14 +122,11 @@ func buildVM(_ cfg: VMConfig) throws -> (VZVirtualMachine, Int32) {
 // MARK: - Args
 
 struct Args {
-    // Linux boot
     var kernel = ""
     var initrd = ""
     var cmdline = "console=hvc0 init=/init loglevel=4 panic=10"
-    // EFI boot
     var disk = ""
     var efiStore = ""
-    // Common
     var cpus = 2
     var memory = 1024
     var mac = "72:20:43:51:64:01"
@@ -295,67 +168,6 @@ func parseArgs() -> Args? {
     let hasEFI = !args.disk.isEmpty && !args.efiStore.isEmpty
     guard hasLinux || hasEFI else { return nil }
     return args
-}
-
-// MARK: - IP address parsing
-
-func parseIPv4(_ s: String) -> IPv4Address? {
-    let parts = s.split(separator: ".", omittingEmptySubsequences: false)
-    guard parts.count == 4,
-          let a = UInt8(parts[0]), let b = UInt8(parts[1]),
-          let c = UInt8(parts[2]), let d = UInt8(parts[3]) else { return nil }
-    return IPv4Address(a, b, c, d)
-}
-
-func parseSubnet(_ s: String) -> (IPv4Address, Int)? {
-    let parts = s.split(separator: "/")
-    guard parts.count == 2,
-          let ip = parseIPv4(String(parts[0])),
-          let prefix = Int(parts[1]) else { return nil }
-    return (ip, prefix)
-}
-
-// MARK: - Run BDP loop
-
-func runBDPLoop(
-    endpoint: VMEndpoint,
-    hostMAC: MACAddress,
-    hosts: [String: IPv4Address],
-    upstreamDNS: IPv4Address?,
-    shutdownFD: Int32,
-    shutdownFlag: ShutdownFlag,
-    stats: FrameStats
-) {
-    var transport: any Transport = VZTransport(
-        endpointID: endpoint.id,
-        vmFD: endpoint.fd,
-        shutdownFD: shutdownFD,
-        shutdownFlag: shutdownFlag,
-        stats: stats,
-        mtu: endpoint.mtu
-    )
-    var loop = DeliberationLoop(
-        endpoints: [endpoint],
-        hostMAC: hostMAC,
-        hosts: hosts,
-        upstreamDNS: upstreamDNS
-    )
-
-    var roundCount: UInt64 = 0
-    var totalReplies: UInt64 = 0
-
-    while !shutdownFlag.isSet {
-        let n = loop.runOneRound(transport: &transport)
-        roundCount += 1
-        totalReplies += UInt64(max(0, n))
-        if n > 0 {
-            log("BDP round \(roundCount): replies=\(n) rx=\(stats.rx) tx=\(stats.tx)")
-        } else if roundCount <= 3 || roundCount % 100 == 0 {
-            log("BDP round \(roundCount): idle (rx=\(stats.rx) tx=\(stats.tx))")
-        }
-    }
-
-    log("BDP loop exited: rounds=\(roundCount) replies=\(totalReplies) rx_frames=\(stats.rx) tx_frames=\(stats.tx)")
 }
 
 // MARK: - Entry point
@@ -422,35 +234,35 @@ do {
 }
 
 let (shutdownRead, shutdownWrite) = makeSocketPair()
-let shutdownFlag = ShutdownFlag()
-let stats = FrameStats()
 let endpoint = VMEndpoint(id: 1, fd: bridgeFd, subnet: subnet, gateway: gatewayIP, mtu: 1500)
 
-// Capture by copy to avoid actor isolation issues
-let _endpoint = endpoint
-let _hostMAC = hostMAC
-let _hosts = hosts
-let _upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
-if !args.upstreamDNS.isEmpty && _upstreamDNS == nil {
+let upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
+if !args.upstreamDNS.isEmpty && upstreamDNS == nil {
     log("WARNING: invalid upstream DNS address: \(args.upstreamDNS), DNS forwarding disabled")
 }
-let _shutdownRead = shutdownRead
-let _shutdownFlag = shutdownFlag
-let _stats = stats
 
+// Start the BDP pipeline on a dedicated background queue.
 let bdpQueue = DispatchQueue(label: "bdp.loop", qos: .userInitiated)
 bdpQueue.async {
-    runBDPLoop(
-        endpoint: _endpoint,
-        hostMAC: _hostMAC,
-        hosts: _hosts,
-        upstreamDNS: _upstreamDNS,
-        shutdownFD: _shutdownRead,
-        shutdownFlag: _shutdownFlag,
-        stats: _stats
+    var shutdown = false
+    var transport = PollingTransport(
+        endpoints: [endpoint],
+        shutdownFD: shutdownRead,
+        onShutdown: { shutdown = true },
+        pollTimeout: 100
     )
+    var loop = DeliberationLoop(
+        endpoints: [endpoint],
+        hostMAC: hostMAC,
+        hosts: hosts,
+        upstreamDNS: upstreamDNS
+    )
+
+    let rounds = loop.run(transport: &transport, while: { !shutdown })
+    log("BDP loop exited: rounds=\(rounds)")
 }
 
+// VM lifecycle — write shutdown signal on stop, drain the main run loop
 let vmDelegate = VMDelegate { error in
     log("VM stopped: \(error)")
     var one: UInt8 = 1

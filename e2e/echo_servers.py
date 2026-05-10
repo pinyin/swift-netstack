@@ -50,10 +50,20 @@ def tcp_echo(port: int) -> None:
 
 def _handle_tcp(conn: socket.socket, addr: tuple) -> None:
     try:
+        # Read whatever is available in one shot, echo it back, then close.
+        # Does not wait for EOF (FIN) — the client's FIN is not forwarded by
+        # the NAT, so relying on it would hang.
+        conn.settimeout(0.5)
+        data = b""
         while True:
-            data = conn.recv(4096)
-            if not data:
+            try:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            except socket.timeout:
                 break
+        if data:
             conn.sendall(data)
     except OSError:
         pass

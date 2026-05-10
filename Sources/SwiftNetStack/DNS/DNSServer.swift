@@ -12,7 +12,6 @@ public struct DNSServer {
     private let upstreamAddr: sockaddr_in?
     private var pendingQueries: [UInt16: PendingQuery] = [:]
     private var nextTxID: UInt16 = 1
-    private static let pendingTimeout: UInt64 = 10  // seconds
 
     /// Create a DNS server with the given hosts-file mappings and optional upstream.
     /// - Parameter hosts: hostname-to-IP mappings (keys are normalised at init).
@@ -91,8 +90,14 @@ public struct DNSServer {
         return IPv4Address(a, b, c, d)
     }
 
-    /// The upstream socket fd, if configured. Exposed for BDP loop polling.
+    /// The upstream socket fd, if configured.
     public var pollFD: Int32? { upstreamFD }
+
+    /// Register the upstream DNS socket with Transport for unified polling.
+    public mutating func registerUpstreamFD(with transport: inout PollingTransport) {
+        guard let fd = upstreamFD else { return }
+        transport.registerFD(fd, events: Int16(POLLIN), kind: .rawDatagram)
+    }
 
     /// Process a single DNS query datagram.
     ///
@@ -107,6 +112,7 @@ public struct DNSServer {
         srcMAC: MACAddress,
         endpointID: Int,
         hostMAC: MACAddress,
+        transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
@@ -138,6 +144,7 @@ public struct DNSServer {
                 srcIP: srcIP, dstIP: dstIP,
                 srcPort: srcPort, dstPort: dstPort,
                 srcMAC: srcMAC, endpointID: endpointID,
+                transport: &transport,
                 round: round
             ) {
                 return  // pending — reply will come via pollUpstream
@@ -159,43 +166,47 @@ public struct DNSServer {
         }
     }
 
-    /// Poll the upstream socket and process any responses.
-    /// Called from the BDP loop after Phase 11 (NAT poll).
-    public mutating func pollUpstream(
+    // MARK: - Upstream poll (I/O + processing)
+
+    /// Drain upstream DNS responses and immediately build VM reply frames.
+    /// The upstream DNS socket fd, for inclusion in the unified transport poll.
+    public var upstreamPollFD: Int32? { upstreamFD }
+
+    /// Expire pending upstream queries older than 5 seconds, replying NXDOMAIN.
+    public mutating func expireQueries(
+        hostMAC: MACAddress,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)],
+        round: RoundContext
+    ) {
+        let now = UInt64(Darwin.time(nil))
+        let expiredKeys = pendingQueries.filter { now - $0.value.createdAt > 5 }.map { $0.key }
+        for key in expiredKeys {
+            guard let pending = pendingQueries.removeValue(forKey: key) else { continue }
+            if let replyPayload = DNSPacket.buildNXDOMAIN(
+                txID: pending.originalTxID, question: pending.question, round: round
+            ) {
+                if let frame = buildUDPFrame(
+                    hostMAC: hostMAC, dstMAC: pending.srcMAC,
+                    srcIP: pending.dstIP, dstIP: pending.srcIP,
+                    srcPort: pending.dstPort, dstPort: pending.srcPort,
+                    payload: replyPayload, round: round
+                ) {
+                    replies.append((pending.endpointID, frame))
+                }
+            }
+        }
+    }
+
+    /// Process upstream DNS responses already read by Transport.
+    public mutating func processUpstreamReady(
+        data rawDatagramReads: [(fd: Int32, data: PacketBuffer)],
         hostMAC: MACAddress,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
         guard let fd = upstreamFD else { return }
 
-        // Expire stale pending queries first — runs every call regardless of
-        // whether responses arrive, so a quiet upstream won't leak entries.
-        let now = UInt64(Darwin.time(nil))
-        var expired: [UInt16] = []
-        for (txID, pq) in pendingQueries where now - pq.timestamp > DNSServer.pendingTimeout {
-            expired.append(txID)
-        }
-        for txID in expired {
-            pendingQueries.removeValue(forKey: txID)
-        }
-
-        // Drain all available responses
-        var buf = [UInt8](repeating: 0, count: 4096)
-
-        while true {
-            let n = Darwin.recvfrom(fd, &buf, buf.count, 0, nil, nil)
-            if n < 0 {
-                if errno == EAGAIN || errno == EWOULDBLOCK { break }
-                if errno == EINTR { continue }
-                // Hard error on the upstream socket — close it so future
-                // lookups fall through to NXDOMAIN.
-                close(fd)
-                upstreamFD = nil
-                return
-            }
-            guard n >= 12 else { break }
-
-            let pkt = makePacketBuffer(buf, count: n, round: round)
+        for (rfd, pkt) in rawDatagramReads where rfd == fd {
             guard let (rxID, _) = DNSPacket.parseResponse(from: pkt) else { continue }
             guard let pending = pendingQueries.removeValue(forKey: rxID) else { continue }
 
@@ -247,7 +258,7 @@ public struct DNSServer {
         let dstPort: UInt16
         let srcMAC: MACAddress
         let endpointID: Int
-        let timestamp: UInt64
+        let createdAt: UInt64
     }
 
     // MARK: - Upstream forwarding
@@ -261,6 +272,7 @@ public struct DNSServer {
         dstPort: UInt16,
         srcMAC: MACAddress,
         endpointID: Int,
+        transport: inout PollingTransport,
         round: RoundContext
     ) -> Bool {
         guard let fd = upstreamFD, let upstream = upstreamAddr else { return false }
@@ -275,7 +287,7 @@ public struct DNSServer {
             srcIP: srcIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: dstPort,
             srcMAC: srcMAC, endpointID: endpointID,
-            timestamp: UInt64(Darwin.time(nil))
+            createdAt: UInt64(Darwin.time(nil))
         )
 
         // Rebuild the query with our transaction ID
@@ -284,13 +296,7 @@ public struct DNSServer {
             return false
         }
 
-        queryPkt.withUnsafeReadableBytes { buf in
-            withUnsafePointer(to: upstream) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = Darwin.sendto(fd, buf.baseAddress!, buf.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
+        transport.writeDatagram(queryPkt, to: fd, addr: upstream)
         return true
     }
 

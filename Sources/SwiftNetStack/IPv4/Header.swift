@@ -115,3 +115,40 @@ public func internetChecksum(_ buf: UnsafeRawBufferPointer) -> UInt16 {
     }
     return ~UInt16(sum & 0xFFFF)
 }
+
+// MARK: - Checksum helpers for two-pass computation
+
+/// Initial 16-bit sum from pseudo-header bytes (must be even-length).
+func pseudoSum(_ bytes: [UInt8]) -> UInt32 {
+    var sum: UInt32 = 0
+    var i = 0
+    while i + 1 < bytes.count {
+        sum += UInt32((UInt16(bytes[i]) << 8) | UInt16(bytes[i + 1]))
+        i += 2
+    }
+    return sum
+}
+
+/// Add bytes to an existing 16-bit checksum accumulator.
+func checksumAdd(_ sum: UInt32, _ ptr: UnsafeRawPointer, _ count: Int) -> UInt32 {
+    var s = sum
+    var i = 0
+    let p = ptr.assumingMemoryBound(to: UInt8.self)
+    while i + 1 < count {
+        s += UInt32((UInt16(p[i]) << 8) | UInt16(p[i + 1]))
+        i += 2
+    }
+    if i < count {
+        s += UInt32(p[i]) << 8
+    }
+    return s
+}
+
+/// Fold carries and return one's complement.
+func finalizeChecksum(_ sum: UInt32) -> UInt16 {
+    var s = sum
+    while s >> 16 != 0 {
+        s = (s & 0xFFFF) + (s >> 16)
+    }
+    return ~UInt16(s & 0xFFFF)
+}

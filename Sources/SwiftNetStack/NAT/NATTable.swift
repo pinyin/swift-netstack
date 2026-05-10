@@ -10,6 +10,10 @@ import Darwin
 /// Each NAT entry (TCP connection or UDP mapping) owns exactly one POSIX fd,
 /// making the fd→key reverse lookup trivial and symmetric across protocols.
 public struct NATTable {
+    // Connection limits
+    private let maxTCPConnections: Int = 256
+    private let maxUDPMappings: Int = 256
+
     // TCP
     private var tcpEntries: [NATKey: NATEntry] = [:]
     private var tcpFdToKey: [Int32: NATKey] = [:]
@@ -21,9 +25,6 @@ public struct NATTable {
     // Listeners (TCP + UDP port forwards)
     private var tcpListeners: [(fd: Int32, entry: PortForwardEntry)] = []
     private var udpListeners: [(fd: Int32, entry: PortForwardEntry)] = []
-
-    // Rate limiting
-    private var endpointRateState: [Int: EndpointRateState] = [:]
 
     private var _nextID: UInt64 = 0
 
@@ -47,38 +48,26 @@ public struct NATTable {
     public var tcpCount: Int { tcpEntries.count }
     public var udpCount: Int { udpEntries.count }
 
-    /// TCP port-forward listener ports (for tests to discover OS-assigned ports).
     public var tcpListenerPorts: [UInt16] {
         tcpListeners.compactMap { listenerPort($0.fd) }
     }
 
-    /// UDP port-forward listener ports.
     public var udpListenerPorts: [UInt16] {
         udpListeners.compactMap { listenerPort($0.fd) }
     }
 
     // MARK: - Dynamic port forwarding
 
-    /// Current port-forward rules (read-only snapshot).
     public var activePortForwards: [PortForwardEntry] {
         tcpListeners.map { $0.entry } + udpListeners.map { $0.entry }
     }
 
-    /// Add a port-forward rule at runtime. Returns `false` if the port is already
-    /// occupied or the listener cannot be created.
-    ///
-    /// When `hostPort` is 0 the OS assigns a free port; the actual port can be
-    /// discovered via `tcpListenerPorts` or `activePortForwards` combined with
-    /// `getsockname`.
     @discardableResult
     public mutating func addPortForward(_ pf: PortForwardEntry) -> Bool {
-        // Check: is the requested port already occupied by an existing listener?
-        // For hostPort==0 (auto-assign), never a conflict.
         if pf.hostPort != 0 {
             let existingPorts = allListenerPorts()
             if existingPorts.contains(pf.hostPort) { return false }
         }
-
         switch pf.protocol {
         case .tcp:
             guard let fd = createTCPListener(port: pf.hostPort) else { return false }
@@ -93,10 +82,6 @@ public struct NATTable {
         }
     }
 
-    /// Remove a port-forward rule by its *actual* bound port.
-    ///
-    /// The listener socket is closed, but established connections accepted
-    /// through it remain active.
     @discardableResult
     public mutating func removePortForward(hostPort: UInt16, protocol: IPProtocol) -> Bool {
         switch `protocol` {
@@ -115,7 +100,6 @@ public struct NATTable {
         }
     }
 
-    /// Collect all actual bound listener ports for duplicate detection.
     private func allListenerPorts() -> Set<UInt16> {
         var ports = Set<UInt16>()
         for listener in tcpListeners {
@@ -127,7 +111,6 @@ public struct NATTable {
         return ports
     }
 
-    /// Return the actual bound port for a listener fd, or nil on error.
     private func listenerPort(_ fd: Int32) -> UInt16? {
         var addr = sockaddr_in()
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -142,26 +125,27 @@ public struct NATTable {
 
     // MARK: - Phase 9: UDP processing (VM → external)
 
-    /// Process a UDP datagram from a VM. Called when no SocketHandler matches.
     public mutating func processUDP(
         eth: EthernetFrame,
         ip: IPv4Header,
         udp: UDPHeader,
         endpointID: Int,
-        hostMAC _: MACAddress,
-        replies _: inout [(endpointID: Int, packet: PacketBuffer)],
-        round _: RoundContext
+        hostMAC: MACAddress,
+        transport: inout PollingTransport,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)],
+        round: RoundContext
     ) {
         let key = NATKey(vmIP: ip.srcAddr, vmPort: udp.srcPort, dstIP: ip.dstAddr, dstPort: udp.dstPort, protocol: .udp)
 
         if var mapping = udpEntries[key] {
             mapping.lastActivity = currentTime()
             udpEntries[key] = mapping
-            sendUDP(fd: mapping.fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort)
+            sendUDP(fd: mapping.fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
             return
         }
 
-        // New outbound UDP mapping
+        if udpEntries.count >= maxUDPMappings { return }
+
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { return }
         setNonBlocking(fd)
@@ -186,37 +170,37 @@ public struct NATTable {
         )
         udpEntries[key] = mapping
         udpFdToKey[fd] = key
+        transport.registerFD(fd, events: Int16(POLLIN), kind: .datagram)
 
-        sendUDP(fd: fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort)
+        sendUDP(fd: fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
     }
 
     // MARK: - Phase 10: TCP processing (VM → external)
 
-    /// Process a TCP segment from a VM.
     public mutating func processTCP(
         eth: EthernetFrame,
         ip: IPv4Header,
         tcp: TCPHeader,
         endpointID: Int,
         hostMAC: MACAddress,
+        transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
         let key = NATKey(vmIP: ip.srcAddr, vmPort: tcp.srcPort, dstIP: ip.dstAddr, dstPort: tcp.dstPort, protocol: .tcp)
 
-        // New outbound connection (VM SYN without ACK)
         if tcp.flags.isSyn, !tcp.flags.isAck {
             handleOutboundSYN(
                 key: key, eth: eth, ip: ip, tcp: tcp, endpointID: endpointID,
-                hostMAC: hostMAC, replies: &replies, round: round
+                hostMAC: hostMAC, transport: &transport,
+                replies: &replies, round: round
             )
             return
         }
 
-        // RST → cleanup
         if tcp.flags.isRst {
             if let entry = tcpEntries[key] {
-                cleanupTCP(fd: entry.connection.posixFD, key: key)
+                cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
             }
             return
         }
@@ -224,7 +208,31 @@ public struct NATTable {
         guard var entry = tcpEntries[key] else { return }
 
         var conn = entry.connection
+
+        // If we're waiting for the external connect() to complete, don't
+        // process the VM's ACK yet — return without responding so the VM
+        // retransmits.  Once the external handshake finishes, the retransmitted
+        // ACK will be processed and data forwarding can begin.
+        //
+        // Use getpeername() rather than getsockopt(SO_ERROR): on macOS, SO_ERROR
+        // returns 0 (no error) even while connect() is still in progress, which
+        // would cause us to prematurely transition to established and silently
+        // lose data written to a not-yet-connected socket (ENOTCONN).
+        if conn.state == .synReceived {
+            var addr = sockaddr_in()
+            var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let result = withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getpeername(conn.posixFD, $0, &addrLen)
+                }
+            }
+            if result < 0 {
+                return
+            }
+        }
+
         let oldState = conn.state
+        let oldUna = conn.snd.una
         let (newState, toSend, dataToExternal) = tcpProcess(
             state: conn.state,
             segment: tcp,
@@ -233,6 +241,11 @@ public struct NATTable {
             appClose: false
         )
         conn.state = newState
+        // Drain acknowledged data from sendBuf after FSM advanced snd.una
+        let unaDelta = Int(conn.snd.una &- oldUna)
+        if unaDelta > 0 {
+            conn.ackSendBuf(delta: unaDelta)
+        }
         if oldState != newState {
             debugLog("[NAT-TCP-PROC] state \(oldState) → \(newState) for \(key.dstIP):\(key.dstPort), flags=\(tcp.flags.rawValue)\n")
         }
@@ -240,26 +253,19 @@ public struct NATTable {
             debugLog("[NAT-TCP-PROC] sending \(d.count)B to external \(key.dstIP):\(key.dstPort)\n")
         }
 
-        // Write data to external socket
         if let data = dataToExternal, !data.isEmpty {
-            let wn = writeToSocket(fd: conn.posixFD, data: data, conn: &conn)
-            if wn > 0 { conn.wroteSinceRead = true }
-            if wn < 0 && errno != EAGAIN {
-                cleanupTCP(fd: conn.posixFD, key: key)
-                return
+            var pkt = round.allocate(capacity: data.count, headroom: 0)
+            if let ptr = pkt.appendPointer(count: data.count) {
+                data.withUnsafeBufferPointer { ptr.copyMemory(from: $0.baseAddress!, byteCount: data.count) }
+                transport.writeStream(pkt, to: conn.posixFD)
             }
         }
 
-        // VM initiated close: enter deferred shutdown sequence.
-        // If we wrote data to the kernel since the last read, wait for a
-        // response before calling shutdown(SHUT_WR) — macOS can lose the
-        // remote peer's response when shutdown fires too soon after write.
-        if newState == .closeWait, conn.deferredShutdown == .idle {
-            let hasPendingWrites = conn.wroteSinceRead || !conn.writeBuffer.isEmpty
-            conn.deferredShutdown = hasPendingWrites ? .waitingForData : .ready
-        }
-
-        // Build reply frames
+        // Never forward the VM's FIN to the external server via shutdown(SHUT_WR).
+        // External servers (HTTP and others) may close without responding when
+        // data+FIN arrive in close proximity. Instead, keep the external write
+        // side open — the external server will eventually close on its own
+        // (after sending a response), and handleStreamHangup relays that FIN.
         for seg in toSend {
             if let frame = buildTCPFrame(
                 hostMAC: hostMAC, dstMAC: eth.srcMAC,
@@ -278,142 +284,302 @@ public struct NATTable {
         tcpEntries[key] = entry
 
         if newState == .closed {
-            cleanupTCP(fd: conn.posixFD, key: key)
+            cleanupTCP(fd: conn.posixFD, key: key, transport: &transport)
         }
     }
 
-    // MARK: - Phase 11: NAT socket poll (external → VM)
+    // MARK: - Phase 11: Poll + process external I/O
 
-    /// Poll all managed sockets for incoming data or state changes.
-    public mutating func pollSockets(
+    /// Poll all managed sockets and immediately build VM reply frames.
+    /// Single unified phase — no intermediate queues.
+    // MARK: - External FD registration (for unified poll)
+
+    /// Register all existing NAT-controlled FDs with Transport.
+    /// Called once before the main loop starts.
+    public mutating func syncExternalFDs(with transport: inout PollingTransport) {
+        for (fd, _) in tcpListeners { transport.registerFD(fd, events: Int16(POLLIN), kind: .stream) }
+        for (fd, _) in udpListeners { transport.registerFD(fd, events: Int16(POLLIN), kind: .datagram) }
+        for (_, entry) in tcpEntries {
+            var events = Int16(POLLIN)
+            if entry.connection.wantsPOLLOUT() { events |= Int16(POLLOUT) }
+            transport.registerFD(entry.connection.posixFD, events: events, kind: .stream)
+        }
+        for (_, mapping) in udpEntries {
+            transport.registerFD(mapping.fd, events: Int16(POLLIN), kind: .datagram)
+        }
+    }
+
+    /// Consume data read by Transport and build VM reply frames.
+    /// Transport has already performed all I/O — this method does pure
+    /// protocol processing and uses Transport for writes.
+    public mutating func processTransportResult(
+        _ result: TransportResult,
+        transport: inout PollingTransport,
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
-        // Collect all fds
-        var fds: [Int32] = []
-        var kinds: [PollKind] = []
+        cleanupExpiredUDP(transport: &transport)
 
-        for (fd, _) in tcpListeners { fds.append(fd); kinds.append(.tcpListener) }
-        for (fd, _) in udpListeners { fds.append(fd); kinds.append(.udpListener) }
-        for (key, entry) in tcpEntries {
-            fds.append(entry.connection.posixFD)
-            kinds.append(.tcpSocket(key))
-        }
-        for (key, mapping) in udpEntries {
-            fds.append(mapping.fd)
-            kinds.append(.udpSocket(key))
-        }
-
-        guard !fds.isEmpty else { return }
-
-        var pollfds: [pollfd] = []
-        for i in 0..<fds.count {
-            var pfd = pollfd()
-            pfd.fd = fds[i]
-            pfd.events = Int16(POLLIN)
-            switch kinds[i] {
-            case .tcpSocket(let key):
-                if let entry = tcpEntries[key] {
-                    if entry.connection.wantsPOLLOUT() {
-                        pfd.events |= Int16(POLLOUT)
-                    }
-                }
-            default:
-                break
-            }
-            pfd.revents = 0
-            pollfds.append(pfd)
-        }
-
-        let ret = Darwin.poll(&pollfds, UInt32(pollfds.count), 0)
-        guard ret > 0 else { return }
-
-        for i in 0..<pollfds.count where pollfds[i].revents != 0 {
-            let revents = pollfds[i].revents
-
-            // Debug: log socket events for ALL tcp sockets
-            if case .tcpSocket(let key) = kinds[i] {
-                var evtParts: [String] = []
-                if revents & Int16(POLLIN) != 0 { evtParts.append("IN") }
-                if revents & Int16(POLLOUT) != 0 { evtParts.append("OUT") }
-                if revents & Int16(POLLHUP) != 0 { evtParts.append("HUP") }
-                if revents & Int16(POLLERR) != 0 { evtParts.append("ERR") }
-                if revents & Int16(POLLNVAL) != 0 { evtParts.append("NVAL") }
-                debugLog("[NAT-POLL] fd=\(fds[i]) \(key.dstIP):\(key.dstPort) → \(evtParts.joined(separator: ","))\n")
-            }
-
-            // POLLERR / POLLNVAL are hard errors — close immediately.
-            if revents & (Int16(POLLERR) | Int16(POLLNVAL)) != 0 {
-                switch kinds[i] {
-                case .tcpListener: close(fds[i]); tcpListeners.removeAll { $0.fd == fds[i] }
-                case .udpListener: close(fds[i]); udpListeners.removeAll { $0.fd == fds[i] }
-                case .tcpSocket(let key):
-                    handleTCPError(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                case .udpSocket(let key):
-                    cleanupUDP(fd: fds[i], key: key)
-                }
-                continue
-            }
-
-            // POLLHUP alone (without POLLIN) means the remote side closed
-            // and there is no pending data to read — clean up.
-            // When both POLLHUP and POLLIN are set there may still be an EOF
-            // (read returns 0) that triggers a FIN toward the VM; fall through
-            // to the normal POLLIN path below.
-            if revents & Int16(POLLHUP) != 0 && revents & Int16(POLLIN) == 0 {
-                switch kinds[i] {
-                case .tcpListener: close(fds[i]); tcpListeners.removeAll { $0.fd == fds[i] }
-                case .udpListener: close(fds[i]); udpListeners.removeAll { $0.fd == fds[i] }
-                case .tcpSocket(let key):
-                    handleTCPError(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                case .udpSocket(let key):
-                    cleanupUDP(fd: fds[i], key: key)
-                }
-                continue
-            }
-
-            switch kinds[i] {
-            case .tcpListener:
-                if revents & Int16(POLLIN) != 0 {
-                    handleTCPAccept(fd: fds[i], hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                }
-            case .udpListener:
-                if revents & Int16(POLLIN) != 0 {
-                    handleUDPAccept(fd: fds[i], pf: findUDPListener(fd: fds[i]), hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                }
-            case .tcpSocket(let key):
-                if revents & Int16(POLLOUT) != 0 {
-                    handleTCPWritable(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                }
-                if revents & Int16(POLLIN) != 0 {
-                    handleTCPReadable(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                }
-                // When the external side has already EOFed (read returned 0)
-                // and POLLHUP signals the peer has fully closed, clean up the
-                // entry — the external half of the connection is gone.
-                if revents & Int16(POLLHUP) != 0,
-                   let entry = tcpEntries[key],
-                   entry.connection.externalEOF {
-                    cleanupTCP(fd: entry.connection.posixFD, key: key)
-                }
-            case .udpSocket(let key):
-                if revents & Int16(POLLIN) != 0 {
-                    handleUDPReadable(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-                }
+        // Dead FDs → cleanup
+        for fd in result.deadFDs {
+            if tcpListeners.contains(where: { $0.fd == fd }) {
+                transport.unregisterFD(fd); close(fd)
+                tcpListeners.removeAll { $0.fd == fd }
+            } else if udpListeners.contains(where: { $0.fd == fd }) {
+                transport.unregisterFD(fd); close(fd)
+                udpListeners.removeAll { $0.fd == fd }
+            } else if let key = tcpFdToKey[fd] {
+                cleanupTCP(fd: fd, key: key, transport: &transport)
+            } else if let key = udpFdToKey[fd] {
+                cleanupUDP(fd: fd, key: key, transport: &transport)
             }
         }
 
-        // UDP timeout cleanup
-        cleanupExpiredUDP(hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
+        // Stream connects completed
+        for fd in result.streamConnects {
+            pollTCPWritable(fd: fd, transport: &transport)
+        }
+
+        // Stream accepts → new inbound connections
+        for (listenerFD, newFD, remoteAddr) in result.streamAccepts {
+            pollTCPAccept(listenerFd: listenerFD, newFD: newFD, clientAddr: remoteAddr,
+                          hostMAC: hostMAC, arpMapping: arpMapping,
+                          transport: &transport, replies: &replies, round: round)
+        }
+
+        // Stream reads → TCP data from external
+        for (fd, data) in result.streamReads {
+            if let key = tcpFdToKey[fd] {
+                pollTCPReadable(key: key, data: data, hostMAC: hostMAC,
+                                replies: &replies, round: round)
+            }
+        }
+
+        // Stream hangup → TCP half-close (or connect failure)
+        for fd in result.streamHangup {
+            if let key = tcpFdToKey[fd] {
+                handleStreamHangup(key: key, hostMAC: hostMAC,
+                                   transport: &transport,
+                                   replies: &replies, round: round)
+            } else if tcpListeners.contains(where: { $0.fd == fd }) {
+                close(fd); tcpListeners.removeAll { $0.fd == fd }
+            }
+        }
+
+        // Datagram reads → UDP data from external
+        for (fd, data, from) in result.datagramReads {
+            if udpListeners.contains(where: { $0.fd == fd }) {
+                pollUDPAccept(fd: fd, data: data, from: from,
+                              hostMAC: hostMAC, arpMapping: arpMapping,
+                              replies: &replies, round: round)
+            } else if let key = udpFdToKey[fd] {
+                pollUDPReadable(key: key, data: data, hostMAC: hostMAC,
+                                arpMapping: arpMapping, replies: &replies, round: round)
+            }
+        }
     }
 
-    private enum PollKind {
-        case tcpListener
-        case udpListener
-        case tcpSocket(NATKey)
-        case udpSocket(NATKey)
+    // MARK: ── Poll handlers (I/O + frame building) ──
+
+    private mutating func pollTCPAccept(
+        listenerFd: Int32, newFD: Int32, clientAddr: sockaddr_in,
+        hostMAC: MACAddress, arpMapping: ARPMapping, transport: inout PollingTransport,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
+    ) {
+        guard tcpEntries.count < maxTCPConnections else { close(newFD); return }
+        setNoDelay(newFD)
+
+        guard let pf = findTCPListener(fd: listenerFd) else { close(newFD); return }
+        let externalIP = IPv4Address(addr: clientAddr.sin_addr.s_addr.bigEndian)
+        let externalPort = clientAddr.sin_port.bigEndian
+
+        let key = NATKey(vmIP: pf.vmIP, vmPort: pf.vmPort, dstIP: externalIP, dstPort: externalPort, protocol: .tcp)
+        guard let (vmMAC, vmEp) = lookupVM(ip: pf.vmIP, arpMapping: arpMapping) else { close(newFD); return }
+
+        let isn = tcpGenerateISN()
+        var conn = TCPConnection(
+            connectionID: nextID(), posixFD: newFD, state: .synReceived,
+            vmMAC: vmMAC, vmIP: pf.vmIP, vmPort: pf.vmPort,
+            dstIP: externalIP, dstPort: externalPort, endpointID: vmEp
+        )
+        conn.snd.nxt = isn
+        conn.snd.una = isn
+
+        let synSeg = TCPSegmentToSend(flags: .syn, seq: isn, ack: 0, window: 65535, payload: nil)
+        conn.snd.nxt = isn &+ 1
+
+        tcpEntries[key] = NATEntry(connection: conn, isInbound: true)
+        tcpFdToKey[newFD] = key
+        transport.registerFD(newFD, events: Int16(POLLIN), kind: .stream)
+
+        if let frame = buildTCPFrame(
+            hostMAC: hostMAC, dstMAC: vmMAC,
+            srcIP: externalIP, dstIP: pf.vmIP,
+            srcPort: externalPort, dstPort: pf.vmPort,
+            seqNumber: synSeg.seq, ackNumber: synSeg.ack,
+            flags: synSeg.flags, window: synSeg.window,
+            payload: nil, round: round
+        ) {
+            replies.append((vmEp, frame))
+        }
+    }
+
+    private mutating func pollUDPAccept(
+        fd: Int32, data: PacketBuffer, from srcAddr: sockaddr_in,
+        hostMAC: MACAddress, arpMapping: ARPMapping,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
+    ) {
+        guard let pf = findUDPListener(fd: fd) else { return }
+        let externalIP = IPv4Address(addr: srcAddr.sin_addr.s_addr.bigEndian)
+        let externalPort = srcAddr.sin_port.bigEndian
+        guard let (vmMAC, vmEp) = lookupVM(ip: pf.vmIP, arpMapping: arpMapping) else { return }
+
+        guard let frame = buildUDPFrame(
+            hostMAC: hostMAC, dstMAC: vmMAC,
+            srcIP: externalIP, dstIP: pf.vmIP,
+            srcPort: externalPort, dstPort: pf.vmPort,
+            payload: data, round: round
+        ) else { return }
+
+        replies.append((vmEp, frame))
+    }
+
+    private mutating func pollTCPWritable(fd: Int32, transport: inout PollingTransport) {
+        guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { return }
+        let st = entry.connection.state
+        guard st == .listen || st == .synReceived else { return }
+
+        var addr = sockaddr_in()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getpeername(fd, $0, &addrLen)
+            }
+        }
+        if result < 0 {
+            if errno == ENOTCONN { return }
+            debugLog("[NAT-TCP-WR] connect failed for \(key.dstIP):\(key.dstPort): errno=\(errno)")
+            cleanupTCP(fd: fd, key: key, transport: &transport)
+            return
+        }
+        if var entry = tcpEntries[key] {
+            entry.connection.externalConnecting = false
+            tcpEntries[key] = entry
+            // Re-register without POLLOUT now that connect is done
+            transport.registerFD(fd, events: Int16(POLLIN), kind: .stream)
+        }
+        if st == .synReceived {
+            debugLog("[NAT-TCP-WR] connect completed for \(key.dstIP):\(key.dstPort)")
+        }
+    }
+
+    private mutating func pollTCPReadable(
+        key: NATKey, data: PacketBuffer,
+        hostMAC: MACAddress,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
+    ) {
+        guard let entry = tcpEntries[key] else { return }
+        let st = entry.connection.state
+        guard st == .established || st == .finWait1 || st == .finWait2
+            || st == .closeWait || st == .lastAck else { return }
+        if entry.connection.externalEOF { return }
+
+        // Write data into sendBuf. A subsequent flushTCPOutgoing phase sends
+        // it with proper sequence numbers, window checking, and enables
+        // retransmission when the VM doesn't ACK (timer → SND_NXT rollback).
+        debugLog("[NAT-TCP-RD] read \(data.totalLength)B external→VM for \(key.dstIP):\(key.dstPort), state=\(st)\n")
+        data.withUnsafeReadableBytes { ptr in
+            withTCPConnection(key) { conn in
+                conn.writeSendBuf(ptr: ptr.baseAddress!, count: data.totalLength)
+            }
+        }
+    }
+
+    // MARK: - Flush TCP sendBuf (external→VM)
+
+    /// Drain sendBuf for all established TCP connections, building frames with
+    /// proper sequence/window management and retransmission support.
+    public mutating func flushTCPOutgoing(
+        hostMAC: MACAddress,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)],
+        round: RoundContext
+    ) {
+        let mss = 1400
+        var newEntries: [(NATKey, NATEntry)] = []
+
+        for (key, entry) in tcpEntries {
+            var conn = entry.connection
+            guard conn.state == .established || conn.state == .closeWait
+                  || conn.state == .finWait1 || conn.state == .finWait2
+                  || conn.state == .lastAck else { continue }
+
+            var updated = false
+
+            // Flush sendBuf data (external→VM)
+            if conn.sendSize > 0 {
+                var segCount = 0
+                let maxSegs = 64
+
+                while segCount < maxSegs {
+                    let inFlight = conn.snd.nxt &- conn.snd.una
+                    var canSend = Int(conn.snd.wnd) - Int(inFlight)
+                    if canSend <= 0 { break }
+                    if canSend > mss { canSend = mss }
+
+                    let data = conn.peekSendData(max: canSend)
+                    if data.isEmpty { break }
+
+                    debugLog("[NAT-TCP-FLUSH] flushing \(data.count)B to VM \(conn.vmIP):\(conn.vmPort), state=\(conn.state), sendSize=\(conn.sendSize)\n")
+
+                    let flags: TCPFlags = [.ack, .psh]
+                    if let frame = buildTCPFrame(
+                        hostMAC: hostMAC, dstMAC: conn.vmMAC,
+                        srcIP: conn.dstIP, dstIP: conn.vmIP,
+                        srcPort: conn.dstPort, dstPort: conn.vmPort,
+                        seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
+                        flags: flags, window: 65535,
+                        payload: makePayload(data, round: round), round: round
+                    ) {
+                        replies.append((conn.endpointID, frame))
+                        conn.snd.nxt = conn.snd.nxt &+ UInt32(data.count)
+                        segCount += 1
+                        updated = true
+                    } else {
+                        break
+                    }
+                }
+            }
+
+            if updated {
+                newEntries.append((key, NATEntry(connection: conn, isInbound: entry.isInbound)))
+            }
+        }
+
+        for (key, entry) in newEntries {
+            tcpEntries[key] = entry
+        }
+    }
+
+    private mutating func pollUDPReadable(
+        key: NATKey, data: PacketBuffer,
+        hostMAC: MACAddress, arpMapping: ARPMapping,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
+    ) {
+        guard var mapping = udpEntries[key] else { return }
+        mapping.lastActivity = currentTime()
+        udpEntries[key] = mapping
+
+        guard let (vmMAC, vmEp) = lookupVM(ip: key.vmIP, arpMapping: arpMapping) else { return }
+        guard let frame = buildUDPFrame(
+            hostMAC: hostMAC, dstMAC: vmMAC,
+            srcIP: key.dstIP, dstIP: key.vmIP,
+            srcPort: key.dstPort, dstPort: key.vmPort,
+            payload: data, round: round
+        ) else { return }
+
+        replies.append((vmEp, frame))
     }
 
     // MARK: ── TCP outbound SYN ──
@@ -421,11 +587,22 @@ public struct NATTable {
     private mutating func handleOutboundSYN(
         key: NATKey, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader,
         endpointID: Int, hostMAC: MACAddress,
+        transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
     ) {
-        let now = UInt64(Darwin.time(nil))
-        if !checkRateLimit(endpointID: endpointID, now: now) { return }
-
+        if tcpEntries.count >= maxTCPConnections {
+            if let rstFrame = buildTCPFrame(
+                hostMAC: hostMAC, dstMAC: eth.srcMAC,
+                srcIP: ip.dstAddr, dstIP: ip.srcAddr,
+                srcPort: tcp.dstPort, dstPort: tcp.srcPort,
+                seqNumber: 0, ackNumber: tcp.sequenceNumber &+ 1,
+                flags: [.rst, .ack], window: 0,
+                payload: nil, round: round
+            ) {
+                replies.append((endpointID, rstFrame))
+            }
+            return
+        }
         debugLog("[NAT-TCP-OUT] outbound SYN to \(key.dstIP):\(key.dstPort) from VM \(key.vmIP):\(key.vmPort)\n")
 
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -447,6 +624,7 @@ public struct NATTable {
             vmMAC: eth.srcMAC, vmIP: key.vmIP, vmPort: key.vmPort,
             dstIP: key.dstIP, dstPort: key.dstPort, endpointID: endpointID
         )
+        conn.externalConnecting = true
 
         let (newState, toSend, _) = tcpProcess(
             state: .listen, segment: tcp, snd: &conn.snd, rcv: &conn.rcv, appClose: false
@@ -456,6 +634,7 @@ public struct NATTable {
 
         tcpEntries[key] = NATEntry(connection: conn, isInbound: false)
         tcpFdToKey[fd] = key
+        transport.registerFD(fd, events: Int16(POLLIN | POLLOUT), kind: .stream)
 
         for seg in toSend {
             if let frame = buildTCPFrame(
@@ -471,200 +650,42 @@ public struct NATTable {
         }
     }
 
-    // MARK: ── TCP accept (inbound) ──
-
-    private mutating func handleTCPAccept(
-        fd listenerFd: Int32, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        var clientAddr = sockaddr_in()
-        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-
-        let newFd = withUnsafeMutablePointer(to: &clientAddr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.accept(listenerFd, $0, &addrLen) }
-        }
-        guard newFd >= 0 else { return }
-        setNonBlocking(newFd)
-        setNoDelay(newFd)
-
-        guard let pf = findTCPListener(fd: listenerFd) else { close(newFd); return }
-        let externalIP = IPv4Address(addr: clientAddr.sin_addr.s_addr.bigEndian)
-        let externalPort = clientAddr.sin_port.bigEndian
-
-        let key = NATKey(vmIP: pf.vmIP, vmPort: pf.vmPort, dstIP: externalIP, dstPort: externalPort, protocol: .tcp)
-
-        guard let (vmMAC, vmEp) = lookupVM(ip: pf.vmIP, arpMapping: arpMapping) else { close(newFd); return }
-
-        let now = UInt64(Darwin.time(nil))
-        if !checkRateLimit(endpointID: vmEp, now: now) { close(newFd); return }
-
-        let isn = tcpGenerateISN()
-        var conn = TCPConnection(
-            connectionID: nextID(), posixFD: newFd, state: .synReceived,
-            vmMAC: vmMAC, vmIP: pf.vmIP, vmPort: pf.vmPort,
-            dstIP: externalIP, dstPort: externalPort, endpointID: vmEp
-        )
-        conn.snd.nxt = isn
-        conn.snd.una = isn
-
-        let synSeg = TCPSegmentToSend(flags: .syn, seq: isn, ack: 0, window: 65535, payload: nil)
-        conn.snd.nxt = isn &+ 1
-
-        tcpEntries[key] = NATEntry(connection: conn, isInbound: true)
-        tcpFdToKey[newFd] = key
-
-        if let frame = buildTCPFrame(
-            hostMAC: hostMAC, dstMAC: vmMAC,
-            srcIP: externalIP, dstIP: pf.vmIP,
-            srcPort: externalPort, dstPort: pf.vmPort,
-            seqNumber: synSeg.seq, ackNumber: synSeg.ack,
-            flags: synSeg.flags, window: synSeg.window,
-            payload: nil, round: round
-        ) {
-            replies.append((vmEp, frame))
-        }
-    }
-
-    // MARK: ── TCP writable ──
-
-    private mutating func handleTCPWritable(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        handleConnectResult(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-        flushWriteBuffer(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-        tryDeferredShutdown(key: key)
-    }
-
-    /// Verify non-blocking connect() completed successfully.
-    private mutating func handleConnectResult(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        guard let entry = tcpEntries[key] else { return }
-        let fd = entry.connection.posixFD
-        let st = entry.connection.state
-        guard st == .listen || st == .synReceived else { return }
-
-        var soError: Int32 = 0
-        var soLen = socklen_t(MemoryLayout<Int32>.size)
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soLen)
-        if soError != 0 {
-            debugLog("[NAT-TCP-WR] connect failed for \(key.dstIP):\(key.dstPort): SO_ERROR=\(soError)")
-            handleTCPError(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-            return
-        }
-        if st == .synReceived {
-            debugLog("[NAT-TCP-WR] connect completed for \(key.dstIP):\(key.dstPort)")
-        }
-    }
-
-    /// Flush data queued in writeBuffer to the POSIX socket.
-    private mutating func flushWriteBuffer(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        guard let entry = tcpEntries[key], !entry.connection.writeBuffer.isEmpty else { return }
-        let fd = entry.connection.posixFD
-        let data = entry.connection.writeBuffer
-
-        let n = Darwin.write(fd, data, data.count)
-        if n > 0 {
-            withTCPConnection(key) { conn in
-                conn.writeBuffer.removeFirst(n)
-                conn.wroteSinceRead = true
-            }
-        } else if n < 0 && errno != EAGAIN && errno != ENOTCONN {
-            handleTCPError(key: key, hostMAC: hostMAC, arpMapping: arpMapping, replies: &replies, round: round)
-        }
-    }
-
-    /// Advance the deferred shutdown state machine.
-    ///
-    /// - `.waitingForData` → increments fallback counter; forces `.ready` after
-    ///   ~2 seconds (200 cycles at 100 Hz) in case the remote peer sends no response.
-    /// - `.ready` + empty write buffer → calls `shutdown(SHUT_WR)`, then `.done`
-    ///
-    /// The `.waitingForData` → `.ready` transition normally happens in
-    /// `handleTCPReadable` when response data arrives; the fallback counter
-    /// here is only a safety net for unresponsive peers.
-    private mutating func tryDeferredShutdown(key: NATKey) {
-        withTCPConnection(key) { conn in
-            let fd = conn.posixFD
-            switch conn.deferredShutdown {
-            case .waitingForData:
-                conn.waitingCycles += 1
-                if conn.waitingCycles > 200 {
-                    conn.deferredShutdown = .ready
-                }
-            case .ready where conn.writeBuffer.isEmpty:
-                shutdown(fd, SHUT_WR)
-                conn.deferredShutdown = .done
-            default:
-                break
-            }
-        }
-    }
-
-    // MARK: ── TCP readable ──
-
-    private mutating func handleTCPReadable(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        guard let entry = tcpEntries[key] else { return }
-        let st = entry.connection.state
-        guard st == .established || st == .finWait1 || st == .finWait2
-            || st == .closeWait || st == .lastAck else {
-            debugLog("[NAT-TCP-RD] state=\(st) — skipping read for \(key.dstIP):\(key.dstPort)\n")
-            return
-        }
-        if entry.connection.externalEOF { return }
-
-        let fd = entry.connection.posixFD
-        var buf = [UInt8](repeating: 0, count: 65536)
-        let n = Darwin.read(fd, &buf, buf.count)
-
-        if n > 0 {
-            let data = Array(buf[0..<n])
-            debugLog("[NAT-TCP-RD] read \(n) bytes from \(key.dstIP):\(key.dstPort), state=\(st)\n")
-            withTCPConnection(key) { conn in
-                conn.wroteSinceRead = false
-                if conn.deferredShutdown == .waitingForData {
-                    conn.deferredShutdown = .ready
-                }
-                let seg = TCPSegmentToSend(flags: .ack, seq: conn.snd.nxt, ack: conn.rcv.nxt, window: 65535, payload: data)
-                if let frame = buildTCPFrame(
-                    hostMAC: hostMAC, dstMAC: conn.vmMAC,
-                    srcIP: conn.dstIP, dstIP: conn.vmIP,
-                    srcPort: conn.dstPort, dstPort: conn.vmPort,
-                    seqNumber: seg.seq, ackNumber: seg.ack,
-                    flags: seg.flags, window: seg.window,
-                    payload: makePayload(data, round: round), round: round
-                ) {
-                    replies.append((conn.endpointID, frame))
-                    conn.snd.nxt = conn.snd.nxt &+ UInt32(data.count)
-                }
-            }
-        } else if n == 0 {
-            debugLog("[NAT-TCP-RD] EOF from \(key.dstIP):\(key.dstPort)\n")
-            withTCPConnection(key) { conn in conn.externalEOF = true }
-            handleTCPExternalFIN(key: key, hostMAC: hostMAC, replies: &replies, round: round)
-        } else {
-            debugLog("[NAT-TCP-RD] read error from \(key.dstIP):\(key.dstPort): n=\(n) errno=\(errno)\n")
-        }
-    }
-
     // MARK: ── TCP external FIN ──
 
     private mutating func handleTCPExternalFIN(
-        key: NATKey, hostMAC: MACAddress,
+        key: NATKey, hostMAC: MACAddress, transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
     ) {
         var needsCleanup = false
         var cleanupFD: Int32 = 0
 
+        // Flush any remaining sendBuf data BEFORE sending FIN to VM.
+        // This ensures correct TCP ordering: data frames arrive at the VM
+        // before the FIN, so applications can read all data before seeing EOF.
         withTCPConnection(key) { conn in
+            let mss = 1400
+            while conn.sendSize > 0 {
+                let inFlight = conn.snd.nxt &- conn.snd.una
+                var canSend = Int(conn.snd.wnd) - Int(inFlight)
+                if canSend <= 0 { break }
+                if canSend > mss { canSend = mss }
+                let data = conn.peekSendData(max: canSend)
+                if data.isEmpty { break }
+                if let frame = buildTCPFrame(
+                    hostMAC: hostMAC, dstMAC: conn.vmMAC,
+                    srcIP: conn.dstIP, dstIP: conn.vmIP,
+                    srcPort: conn.dstPort, dstPort: conn.vmPort,
+                    seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
+                    flags: [.ack, .psh], window: 65535,
+                    payload: makePayload(data, round: round), round: round
+                ) {
+                    replies.append((conn.endpointID, frame))
+                    conn.snd.nxt = conn.snd.nxt &+ UInt32(data.count)
+                } else {
+                    break
+                }
+            }
+
             let emptyPkt = round.allocate(capacity: 0, headroom: 0)
             let dummy = TCPHeader.syntheticAck(
                 ackNumber: conn.snd.una,
@@ -691,125 +712,42 @@ public struct NATTable {
                 }
             }
 
-            if newState == .closed || newState == .lastAck {
+            // Only cleanup on closed — lastAck must wait for VM's final ACK
+            // so any remaining sendBuf data can be flushed and the connection
+            // can complete the closing handshake.
+            if newState == .closed {
                 needsCleanup = true
                 cleanupFD = conn.posixFD
             }
         }
 
         if needsCleanup {
-            cleanupTCP(fd: cleanupFD, key: key)
+            cleanupTCP(fd: cleanupFD, key: key, transport: &transport)
         }
     }
 
-    // MARK: ── TCP error ──
+    // MARK: ── Stream hangup (external TCP EOF) ──
 
-    private mutating func handleTCPError(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
+    private mutating func handleStreamHangup(
+        key: NATKey, hostMAC: MACAddress, transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
     ) {
         guard let entry = tcpEntries[key] else { return }
-        let conn = entry.connection
-
-        if let frame = buildTCPFrame(
-            hostMAC: hostMAC, dstMAC: conn.vmMAC,
-            srcIP: conn.dstIP, dstIP: conn.vmIP,
-            srcPort: conn.dstPort, dstPort: conn.vmPort,
-            seqNumber: conn.snd.nxt, ackNumber: 0,
-            flags: [.rst, .ack], window: 0, payload: nil, round: round
-        ) {
-            replies.append((conn.endpointID, frame))
+        let st = entry.connection.state
+        // If still connecting, hangup means connect failed
+        if st == .listen || st == .synReceived {
+            cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
+            return
         }
-        cleanupTCP(fd: conn.posixFD, key: key)
-    }
-
-    // MARK: ── UDP readable ──
-
-    private mutating func handleUDPReadable(
-        key: NATKey, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        guard var mapping = udpEntries[key] else { return }
-
-        var buf = [UInt8](repeating: 0, count: 65536)
-        let n = Darwin.recvfrom(mapping.fd, &buf, buf.count, 0, nil, nil)
-
-        guard n > 0 else { return }
-        let data = Array(buf[0..<n])
-        mapping.lastActivity = currentTime()
-        udpEntries[key] = mapping
-
-        guard let (vmMAC, vmEp) = lookupVM(ip: key.vmIP, arpMapping: arpMapping) else { return }
-
-        guard let frame = buildUDPFrame(
-            hostMAC: hostMAC, dstMAC: vmMAC,
-            srcIP: key.dstIP, dstIP: key.vmIP,
-            srcPort: key.dstPort, dstPort: key.vmPort,
-            payload: makePayload(data, round: round)!,
-            round: round
-        ) else { return }
-
-        replies.append((vmEp, frame))
-    }
-
-    // MARK: ── UDP accept (port forwarding) ──
-
-    private mutating func handleUDPAccept(
-        fd: Int32, pf: PortForwardEntry?, hostMAC: MACAddress, arpMapping: ARPMapping,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
-    ) {
-        guard let pf = pf else { return }
-
-        var buf = [UInt8](repeating: 0, count: 65536)
-        var srcAddr = sockaddr_in()
-        var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-
-        let n = withUnsafeMutablePointer(to: &srcAddr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                Darwin.recvfrom(fd, &buf, buf.count, 0, saPtr, &srcLen)
-            }
-        }
-        guard n > 0 else { return }
-        let data = Array(buf[0..<n])
-
-        let externalIP = IPv4Address(addr: srcAddr.sin_addr.s_addr.bigEndian)
-        let externalPort = srcAddr.sin_port.bigEndian
-
-        guard let (vmMAC, vmEp) = lookupVM(ip: pf.vmIP, arpMapping: arpMapping) else { return }
-
-        guard let frame = buildUDPFrame(
-            hostMAC: hostMAC, dstMAC: vmMAC,
-            srcIP: externalIP, dstIP: pf.vmIP,
-            srcPort: externalPort, dstPort: pf.vmPort,
-            payload: makePayload(data, round: round)!,
-            round: round
-        ) else { return }
-
-        replies.append((vmEp, frame))
-    }
-
-    // MARK: ── UDP timeout cleanup ──
-
-    private mutating func cleanupExpiredUDP(
-        hostMAC _: MACAddress, arpMapping _: ARPMapping,
-        replies _: inout [(endpointID: Int, packet: PacketBuffer)], round _: RoundContext
-    ) {
-        let now = currentTime()
-        let timeout: UInt64 = 30
-        var expired: [(Int32, NATKey)] = []
-
-        for (key, mapping) in udpEntries where now - mapping.lastActivity > timeout {
-            expired.append((mapping.fd, key))
-        }
-        for (fd, key) in expired {
-            cleanupUDP(fd: fd, key: key)
-        }
+        // Established or later: peer closed — handle as EOF
+        if entry.connection.externalEOF { return }
+        debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort), state=\(st)\n")
+        withTCPConnection(key) { conn in conn.externalEOF = true }
+        handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport, replies: &replies, round: round)
     }
 
     // MARK: ── Helpers ──
 
-    /// Read-modify-write a TCP connection in one step.
-    /// Eliminates the repetitive `var conn = entry.connection` / write-back pattern.
     private mutating func withTCPConnection(
         _ key: NATKey,
         _ body: (inout TCPConnection) -> Void
@@ -825,42 +763,35 @@ public struct NATTable {
         return (mac, ep)
     }
 
-    private mutating func writeToSocket(fd: Int32, data: [UInt8], conn: inout TCPConnection) -> Int {
-        let n = Darwin.write(fd, data, data.count)
-        if n >= 0 {
-            if n < data.count { conn.writeBuffer.append(contentsOf: data[n...]) }
-            return n
-        }
-        // EAGAIN: socket buffer full. ENOTCONN: connect not yet completed.
-        // Both are transient — buffer the data and flush via handleTCPWritable
-        // when pollSockets detects POLLOUT.
-        if errno == EAGAIN || errno == ENOTCONN {
-            conn.writeBuffer.append(contentsOf: data)
-            return 0
-        }
-        return -1
+    private func sendUDP(fd: Int32, data: PacketBuffer, dstIP: IPv4Address, dstPort: UInt16, transport: inout PollingTransport) {
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = dstPort.bigEndian
+        withUnsafeMutableBytes(of: &addr.sin_addr) { dstIP.write(to: $0.baseAddress!) }
+        transport.writeDatagram(data, to: fd, addr: addr)
     }
 
-    private func sendUDP(fd: Int32, data: PacketBuffer, dstIP: IPv4Address, dstPort: UInt16) {
-        data.withUnsafeReadableBytes { buf in
-            withSockAddr(ip: dstIP, port: dstPort) { sa, saLen in
-                _ = Darwin.sendto(fd, buf.baseAddress!, buf.count, 0, sa, saLen)
-            }
-        }
-    }
-
-    private mutating func cleanupTCP(fd: Int32, key: NATKey) {
+    private mutating func cleanupTCP(fd: Int32, key: NATKey, transport: inout PollingTransport) {
+        transport.unregisterFD(fd)
         close(fd)
         tcpFdToKey.removeValue(forKey: fd)
-        if let entry = tcpEntries.removeValue(forKey: key) {
-            endpointRateState[entry.connection.endpointID]?.release()
-        }
+        tcpEntries.removeValue(forKey: key)
     }
 
-    private mutating func cleanupUDP(fd: Int32, key: NATKey) {
+    private mutating func cleanupUDP(fd: Int32, key: NATKey, transport: inout PollingTransport) {
+        transport.unregisterFD(fd)
         close(fd)
         udpFdToKey.removeValue(forKey: fd)
         udpEntries.removeValue(forKey: key)
+    }
+
+    private mutating func cleanupExpiredUDP(transport: inout PollingTransport) {
+        let now = currentTime()
+        let timeout: UInt64 = 30
+        for (key, mapping) in udpEntries where now - mapping.lastActivity > timeout {
+            cleanupUDP(fd: mapping.fd, key: key, transport: &transport)
+        }
     }
 
     private func findTCPListener(fd: Int32) -> PortForwardEntry? {
@@ -873,16 +804,11 @@ public struct NATTable {
 
     private mutating func nextID() -> UInt64 { _nextID += 1; return _nextID }
     private func currentTime() -> UInt64 { UInt64(Darwin.time(nil)) }
-    private func debugLog(_ msg: @autoclosure () -> String) { fputs(msg(), stderr) }
-
-    // MARK: - Rate limiting
-
-    private mutating func checkRateLimit(endpointID: Int, now: UInt64) -> Bool {
-        var state = endpointRateState[endpointID] ?? EndpointRateState()
-        let ok = state.tryAcquire(now: now)
-        endpointRateState[endpointID] = state
-        return ok
-    }
+    private func debugLog(_ msg: @autoclosure () -> String) {
+    #if DEBUG
+    fputs(msg(), stderr)
+    #endif
+}
 }
 
 // MARK: - Payload construction

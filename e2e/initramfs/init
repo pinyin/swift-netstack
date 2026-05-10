@@ -42,7 +42,7 @@ TEST_COUNT=0
 # dns validates hosts-file DNS resolution.
 # routing validates default and subnet routes.
 
-TESTS="dhcp icmp arp dns routing nat-udp nat-tcp nat-tcp-large nat-tcp-binary nat-tcp-concurrent nat-udp-large nat-internet"
+TESTS="dhcp icmp arp dns routing nat-udp nat-tcp nat-tcp-large nat-tcp-binary nat-tcp-concurrent nat-udp-large nat-internet nat-tcp-slow nat-tcp-server-close"
 
 for t in $TESTS; do
     TEST_SCRIPT="/tests/test-${t}.sh"

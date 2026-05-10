@@ -23,6 +23,7 @@ TIMEOUT=60
 TCP_PORT=7777
 UDP_PORT=7778
 HTTP_PORT=7779
+TCP_CLOSE_PORT=7780
 INIT="/init"
 HOST_ARGS=()
 
@@ -80,11 +81,11 @@ ECHO_PID=""
 NAT_CMD=""
 
 if [ -n "$HOST_IP" ] && command -v python3 &>/dev/null; then
-    python3 "$SCRIPT_DIR/echo_servers.py" "$TCP_PORT" "$UDP_PORT" "$HTTP_PORT" &
+    python3 "$SCRIPT_DIR/echo_servers.py" "$TCP_PORT" "$UDP_PORT" "$HTTP_PORT" "$TCP_CLOSE_PORT" &
     ECHO_PID=$!
     sleep 0.5
     if kill -0 "$ECHO_PID" 2>/dev/null; then
-        NAT_CMD="nat_target=$HOST_IP nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT"
+        NAT_CMD="nat_target=$HOST_IP nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT"
         echo "Echo servers: TCP:$TCP_PORT UDP:$UDP_PORT HTTP:$HTTP_PORT (target=$HOST_IP)"
     else
         ECHO_PID=""

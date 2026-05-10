@@ -492,7 +492,7 @@ public struct NATTable {
     ) {
         guard let entry = tcpEntries[key] else { return }
         let st = entry.connection.state
-        guard st == .established || st == .finWait1 || st == .finWait2
+        guard st == .synReceived || st == .established || st == .finWait1 || st == .finWait2
             || st == .closeWait || st == .lastAck else { return }
         if entry.connection.externalEOF { return }
 
@@ -817,8 +817,19 @@ public struct NATTable {
     ) {
         guard let entry = tcpEntries[key] else { return }
         let st = entry.connection.state
-        // If still connecting, hangup means connect failed
+        // If still connecting, hangup means connect failed — but if the
+        // server already sent data that was buffered during synReceived,
+        // handle as EOF so the VM can read it before seeing FIN.
         if st == .listen || st == .synReceived {
+            if entry.connection.totalQueuedBytes > 0 {
+                debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort) (data queued in synReceived)\n")
+                withTCPConnection(key) { conn in
+                    conn.externalEOF = true
+                    conn.pendingExternalFin = false
+                }
+                handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport, replies: &replies, round: round)
+                return
+            }
             cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
             return
         }

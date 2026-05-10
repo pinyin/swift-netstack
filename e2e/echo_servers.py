@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """TCP, UDP echo and HTTP servers for SwiftNetStack NAT e2e tests.
 
-Usage: python3 echo_servers.py <tcp_port> <udp_port> <http_port>
+Usage: python3 echo_servers.py <tcp_port> <udp_port> <http_port> <tcp_close_port>
 """
 
 import socket
 import sys
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 class EchoHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler that returns a fixed test page."""
+    """HTTP handler with test endpoints."""
 
     def do_GET(self) -> None:
-        body = (
-            b"<html><body>\n"
-            b"<h1>SwiftNetStack E2E HTTP Test</h1>\n"
-            b"<p>endpoint-ok</p>\n"
-            b"</body></html>\n"
-        )
+        if self.path == "/slow":
+            time.sleep(3)
+            body = b"<html><body>\n<h1>Slow Response</h1>\n<p>slow-ok</p>\n</body></html>\n"
+        elif self.path == "/large":
+            body = b"X" * 102400
+        else:
+            body = (
+                b"<html><body>\n"
+                b"<h1>SwiftNetStack E2E HTTP Test</h1>\n"
+                b"<p>endpoint-ok</p>\n"
+                b"</body></html>\n"
+            )
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
@@ -79,17 +86,53 @@ def udp_echo(port: int) -> None:
         s.sendto(data, addr)
 
 
+def tcp_close_first(port: int) -> None:
+    """Server that sends a greeting then closes its write side immediately.
+
+    Uses shutdown(SHUT_WR) rather than close() to avoid macOS sending RST
+    instead of FIN. The NAT sees this as external EOF and must deliver the
+    greeting data before forwarding FIN to the VM.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(8)
+    print(f"TCP close-first listening on 0.0.0.0:{port}", flush=True)
+    while True:
+        conn, addr = s.accept()
+        t = threading.Thread(target=_handle_close_first, args=(conn, addr), daemon=True)
+        t.start()
+
+
+def _handle_close_first(conn: socket.socket, addr: tuple) -> None:
+    """Send greeting, shutdown write, then read any client data."""
+    try:
+        conn.sendall(b"HELLO-FROM-SERVER\n")
+        conn.shutdown(socket.SHUT_WR)
+        # Read whatever the client sends (may be empty)
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
 def main() -> None:
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port>", file=sys.stderr)
+    if len(sys.argv) != 5:
+        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port> <tcp_close_port>", file=sys.stderr)
         sys.exit(1)
     tcp_port = int(sys.argv[1])
     udp_port = int(sys.argv[2])
     http_port = int(sys.argv[3])
+    tcp_close_port = int(sys.argv[4])
 
     threading.Thread(target=tcp_echo, args=(tcp_port,), daemon=True).start()
     threading.Thread(target=udp_echo, args=(udp_port,), daemon=True).start()
     threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
+    threading.Thread(target=tcp_close_first, args=(tcp_close_port,), daemon=True).start()
 
     try:
         threading.Event().wait()

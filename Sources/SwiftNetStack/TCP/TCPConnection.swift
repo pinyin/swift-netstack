@@ -47,6 +47,10 @@ struct TCPConnection {
     public var sendQueueSent: Int = 0
     public static let maxQueueBytes: Int = 256 * 1024
 
+    /// True when the send queue is full and the external socket should not be
+    /// read from until the queue drains. Cleared by the flush when space opens.
+    public var sendQueueBlocked: Bool = false
+
     public var sendAvail: Int { totalQueuedBytes }
     public var sendSpace: Int { max(0, Self.maxQueueBytes - totalQueuedBytes) }
 
@@ -117,10 +121,12 @@ struct TCPConnection {
     // MARK: - External send queue (VM→external, zero-copy)
 
     /// Append VM→external data to the send queue (zero-copy via appendView).
+    /// Returns bytes queued, or 0 if the queue is at capacity.
     @discardableResult
     public mutating func appendExternalSend(_ pkt: PacketBuffer) -> Int {
         let n = pkt.totalLength
         guard n > 0 else { return 0 }
+        guard externalSendQueued + n <= Self.maxQueueBytes else { return 0 }
         externalSendQueue.appendView(pkt)
         externalSendQueued += n
         return n

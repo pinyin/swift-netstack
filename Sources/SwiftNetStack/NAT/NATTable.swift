@@ -252,6 +252,7 @@ public struct NATTable {
 
             guard var entry = tcpEntries[key] else { continue }
             var conn = entry.connection
+            entry.lastActivity = currentTime()
 
             // Check external connect completion (synReceived state)
             if conn.state == .synReceived {
@@ -277,6 +278,11 @@ public struct NATTable {
             conn.state = newState
             let unaDelta = Int(conn.snd.una &- oldUna)
             if unaDelta > 0 { conn.ackSendBuf(delta: unaDelta) }
+            // Resume external reads if backpressure cleared
+            if conn.sendQueueBlocked, conn.totalQueuedBytes < TCPConnection.maxQueueBytes / 2 {
+                conn.sendQueueBlocked = false
+                transport.setFDEvents(conn.posixFD, events: Int16(POLLIN))
+            }
             if oldState != newState {
                 debugLog("[NAT-TCP-PROC] state \(oldState) → \(newState) for \(key.dstIP):\(key.dstPort), flags=\(tcp.flags.rawValue)\n")
             }
@@ -318,8 +324,13 @@ public struct NATTable {
             if entry.connection.externalEOF { continue }
 
             debugLog("[NAT-TCP-RD] read \(data.totalLength)B external→VM for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-            entry.connection.writeSendBuf(data)
-            if let pw = externalPcap {
+            entry.lastActivity = currentTime()
+            let queued = entry.connection.writeSendBuf(data)
+            if queued == 0, !entry.connection.sendQueueBlocked {
+                entry.connection.sendQueueBlocked = true
+                transport.setFDEvents(fd, events: 0)  // pause reads until queue drains
+            }
+            if let pw = externalPcap, queued > 0 {
                 captureExternalPacket(pcap: pw, fd: fd, direction: .fromExternal,
                     conn: entry.connection, flags: [.ack, .psh], payload: data,
                     hostMAC: hostMAC, round: round)
@@ -329,13 +340,15 @@ public struct NATTable {
 
         // ── Step 4: Handle external hangups ──
         for fd in streamHangup {
-            guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { continue }
+            guard let key = tcpFdToKey[fd], var entry = tcpEntries[key] else { continue }
             let st = entry.connection.state
             if st == .listen || st == .synReceived {
                 if entry.connection.totalQueuedBytes > 0 {
                     debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort) (data queued in synReceived)\n")
-                    tcpEntries[key]?.connection.externalEOF = true
-                    tcpEntries[key]?.connection.pendingExternalFin = false
+                    entry.lastActivity = currentTime()
+                    entry.connection.externalEOF = true
+                    entry.connection.pendingExternalFin = false
+                    tcpEntries[key] = entry
                     handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                          replies: &replies, round: round)
                     continue
@@ -345,8 +358,10 @@ public struct NATTable {
             }
             if entry.connection.externalEOF { continue }
             debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-            tcpEntries[key]?.connection.externalEOF = true
-            tcpEntries[key]?.connection.pendingExternalFin = false
+            entry.lastActivity = currentTime()
+            entry.connection.externalEOF = true
+            entry.connection.pendingExternalFin = false
+            tcpEntries[key] = entry
             handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                  replies: &replies, round: round)
         }
@@ -537,6 +552,7 @@ public struct NATTable {
         round: RoundContext
     ) {
         cleanupExpiredUDP(transport: &transport)
+        cleanupExpiredTCP(transport: &transport)
 
         // Dead FDs → cleanup
         for fd in result.deadFDs {
@@ -727,7 +743,9 @@ public struct NATTable {
         conn.state = newState
         debugLog("[NAT-TCP-OUT] TCP FSM: .listen → \(newState), isn=\(conn.snd.nxt)\n")
 
-        tcpEntries[key] = NATEntry(connection: conn, isInbound: false)
+        var entry = NATEntry(connection: conn, isInbound: false)
+        entry.lastActivity = currentTime()
+        tcpEntries[key] = entry
         tcpFdToKey[fd] = key
         transport.registerFD(fd, events: Int16(POLLIN | POLLOUT), kind: .stream)
 
@@ -865,6 +883,26 @@ public struct NATTable {
         let timeout: UInt64 = 30
         for (key, mapping) in udpEntries where now - mapping.lastActivity > timeout {
             cleanupUDP(fd: mapping.fd, key: key, transport: &transport)
+        }
+    }
+
+    private mutating func cleanupExpiredTCP(transport: inout PollingTransport) {
+        let now = currentTime()
+        // Idle timeout: 5 minutes for established, 2 minutes for half-open/closed states.
+        for (key, entry) in tcpEntries {
+            let age = now - entry.lastActivity
+            let tooOld: Bool
+            switch entry.connection.state {
+            case .established:
+                tooOld = age > 300
+            case .finWait1, .finWait2, .closeWait, .lastAck:
+                tooOld = age > 120
+            case .synReceived, .listen, .closed:
+                tooOld = age > 60
+            }
+            if tooOld {
+                cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
+            }
         }
     }
 

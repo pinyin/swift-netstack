@@ -58,7 +58,7 @@ public struct PollingTransport {
     private let onShutdown: (() -> Void)?
     private let pollTimeout: Int32
 
-    public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil, onShutdown: (() -> Void)? = nil, pollTimeout: Int32 = -1) {
+    public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil, onShutdown: (() -> Void)? = nil, pollTimeout: Int32 = 100) {
         var byFD: [Int32: VMEndpoint] = [:]
         var fdByEP: [Int: Int32] = [:]
         for ep in endpoints {
@@ -88,6 +88,13 @@ public struct PollingTransport {
     /// Remove an external FD from the poll set.
     public mutating func unregisterFD(_ fd: Int32) {
         externalFDs.removeAll { $0.fd == fd }
+    }
+
+    /// Update poll events for an already-registered external FD.
+    /// Preserves the existing FD kind. No-op if the FD is not registered.
+    public mutating func setFDEvents(_ fd: Int32, events: Int16) {
+        guard let idx = externalFDs.firstIndex(where: { $0.fd == fd }) else { return }
+        externalFDs[idx].events = events
     }
 
     /// Bulk-register external FDs (used for initial sync of listener FDs).

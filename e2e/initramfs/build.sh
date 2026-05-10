@@ -30,6 +30,7 @@ BUSYBOX_APPLETS=(
     chmod cp ln arp
     wget sha256sum md5sum base64 hexdump
     printf xargs split expr
+    dd cmp seq kill
 )
 for applet in "${BUSYBOX_APPLETS[@]}"; do
     ln -sf busybox "$BUILD_DIR/bin/$applet"

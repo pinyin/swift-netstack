@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TCP, UDP echo and HTTP servers for SwiftNetStack NAT e2e tests.
 
-Usage: python3 echo_servers.py <tcp_port> <udp_port> <http_port> <tcp_close_port>
+Usage: python3 echo_servers.py <tcp_port> <udp_port> <http_port> <tcp_close_port> <bidi_port>
 """
 
 import socket
@@ -47,7 +47,7 @@ def tcp_echo(port: int) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", port))
-    s.listen(8)
+    s.listen(64)
     print(f"TCP echo listening on 0.0.0.0:{port}", flush=True)
     while True:
         conn, addr = s.accept()
@@ -120,19 +120,73 @@ def _handle_close_first(conn: socket.socket, addr: tuple) -> None:
         conn.close()
 
 
+def tcp_bidi(port: int) -> None:
+    """Bidirectional server: receives trigger line, sends 2048 bytes BEFORE
+    the client finishes writing, then echoes remaining client data.
+
+    Tests the NAT's ability to handle overlapping bidirectional data flows
+    on a single TCP connection — sendQueue and externalSendQueue draining
+    simultaneously with correct sequence number tracking.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(8)
+    print(f"TCP bidi listening on 0.0.0.0:{port}", flush=True)
+    while True:
+        conn, addr = s.accept()
+        t = threading.Thread(target=_handle_bidi, args=(conn, addr), daemon=True)
+        t.start()
+
+
+def _handle_bidi(conn: socket.socket, addr: tuple) -> None:
+    """Read trigger line, send bulk data immediately, then read+echo.
+
+    The key design: conn.sendall(2048*'S') fires while client data may
+    still be in-flight.  This creates genuine bidirectional TCP flows
+    through the NAT with both sendQueue and externalSendQueue active.
+    """
+    try:
+        # Read until newline (trigger)
+        trigger = b""
+        while not trigger.endswith(b"\n"):
+            chunk = conn.recv(1)
+            if not chunk:
+                return
+            trigger += chunk
+        # Send bulk data NOW — before client finishes sending its payload
+        conn.sendall(b"S" * 2048)
+        # Read remaining client data
+        data = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        # Echo back with prefix
+        if data:
+            conn.sendall(b"ECHO:" + data)
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
 def main() -> None:
-    if len(sys.argv) != 5:
-        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port> <tcp_close_port>", file=sys.stderr)
+    if len(sys.argv) != 6:
+        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port> <tcp_close_port> <bidi_port>", file=sys.stderr)
         sys.exit(1)
     tcp_port = int(sys.argv[1])
     udp_port = int(sys.argv[2])
     http_port = int(sys.argv[3])
     tcp_close_port = int(sys.argv[4])
+    bidi_port = int(sys.argv[5])
 
     threading.Thread(target=tcp_echo, args=(tcp_port,), daemon=True).start()
     threading.Thread(target=udp_echo, args=(udp_port,), daemon=True).start()
     threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
     threading.Thread(target=tcp_close_first, args=(tcp_close_port,), daemon=True).start()
+    threading.Thread(target=tcp_bidi, args=(bidi_port,), daemon=True).start()
 
     try:
         threading.Event().wait()

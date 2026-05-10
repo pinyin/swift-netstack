@@ -509,6 +509,7 @@ public struct NATTable {
             // response, so it's safe to signal EOF.
             if conn.pendingExternalFin {
                 conn.pendingExternalFin = false
+                conn.finWaitRounds = 0
                 forwardFin = true
                 finFD = conn.posixFD
             }
@@ -568,6 +569,7 @@ public struct NATTable {
                     ) {
                         replies.append((conn.endpointID, frame))
                         conn.snd.nxt = conn.snd.nxt &+ UInt32(data.totalLength)
+                        conn.sendQueueSent += data.totalLength
                         segCount += 1
                         updated = true
                     } else {
@@ -617,21 +619,30 @@ public struct NATTable {
             }
 
             // Forward pending FIN once the external send queue is drained.
-            // Two patterns (mirrors gvproxy's io.Copy + closeWrite):
             //
-            // finCameWithData (HTTP): data+FIN arrived in same VM segment.
-            //   pollTCPReadable (Phase 10.6, runs before this phase) forwards
-            //   FIN when the server responds.  Don't forward here — the server
-            //   needs time to process the request before seeing EOF.
+            // finCameWithData (data+FIN in same VM segment):
+            //   - pollTCPReadable forwards FIN when the server responds
+            //   - finWaitRounds provides a timeout fallback: if the server
+            //     needs EOF to respond (echo pattern with large data), forward
+            //     FIN after a few rounds so the deadlock is broken
             //
-            // !finCameWithData (echo): FIN arrived alone, meaning the server
-            //   is waiting for EOF before responding.  Forward FIN immediately
-            //   once the queue is drained.
+            // !finCameWithData (FIN arrived alone):
+            //   - Server is waiting for EOF (classic echo). Forward immediately.
             if conn.pendingExternalFin, conn.externalSendQueued == 0 {
-                if !conn.finCameWithData {
+                if conn.finCameWithData {
+                    conn.finWaitRounds += 1
+                    updated = true  // persist counter even before threshold
+                    if conn.finWaitRounds >= 5 {
+                        debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (finCameWithData timeout, rounds=\(conn.finWaitRounds))\n")
+                        shutdown(conn.posixFD, SHUT_WR)
+                        conn.pendingExternalFin = false
+                        conn.finWaitRounds = 0
+                    }
+                } else {
                     debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (echo pattern)\n")
                     shutdown(conn.posixFD, SHUT_WR)
                     conn.pendingExternalFin = false
+                    conn.finWaitRounds = 0
                     updated = true
                 }
             }
@@ -764,6 +775,7 @@ public struct NATTable {
                 ) {
                     replies.append((conn.endpointID, frame))
                     conn.snd.nxt = conn.snd.nxt &+ UInt32(data.totalLength)
+                    conn.sendQueueSent += data.totalLength
                 } else {
                     break
                 }

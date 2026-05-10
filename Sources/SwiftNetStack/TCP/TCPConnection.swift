@@ -49,10 +49,17 @@ struct TCPConnection {
     /// Appended via writeSendBuf, drained via ackSendBuf, peeked via peekSendData.
     public var sendQueue: PacketBuffer = .empty
     public var totalQueuedBytes: Int = 0
+    public var sendQueueSent: Int = 0
     public static let maxQueueBytes: Int = 256 * 1024
 
     public var sendAvail: Int { totalQueuedBytes }
     public var sendSpace: Int { max(0, Self.maxQueueBytes - totalQueuedBytes) }
+
+    /// Rounds since VM sent FIN while finCameWithData was true.  When the
+    /// server does not respond, this counter provides a timeout fallback to
+    /// forward FIN (echo servers need EOF to respond).  Reset when FIN is
+    /// forwarded or pollTCPReadable receives data.
+    public var finWaitRounds: Int = 0
 
     public init(
         connectionID: UInt64,
@@ -101,18 +108,21 @@ struct TCPConnection {
         guard d > 0 else { return }
         sendQueue.trimFront(d)
         totalQueuedBytes -= d
+        if d > sendQueueSent {
+            sendQueueSent = 0
+        } else {
+            sendQueueSent -= d
+        }
     }
 
     /// Peek up to `max` bytes of unsent data from the send queue.
     /// Returns a zero-copy PacketBuffer slice sharing Storage with the queue.
     public func peekSendData(max: Int) -> PacketBuffer? {
-        let avail = totalQueuedBytes
-        let sent = Int(snd.nxt &- snd.una)
-        guard sent < avail, avail > 0, max > 0 else { return nil }
-        let remaining = avail - sent
+        let remaining = totalQueuedBytes - sendQueueSent
+        guard remaining > 0, max > 0 else { return nil }
         var n = remaining
         if n > max { n = max }
-        return sendQueue.slice(from: sent, length: n)
+        return sendQueue.slice(from: sendQueueSent, length: n)
     }
 
     // MARK: - External send queue (VM→external, zero-copy)

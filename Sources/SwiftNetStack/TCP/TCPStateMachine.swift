@@ -126,8 +126,9 @@ func _tcpProcessImpl(
             // The handshake-completing ACK may carry data and/or FIN
             // (e.g. HTTP GET piggybacked on the third handshake segment).
             // Handle these so data isn't silently dropped.
+            // Validate in-sequence delivery: the data/FIN seq must match rcv.nxt.
             let dataLen = segment.payload.totalLength
-            if dataLen > 0 {
+            if dataLen > 0, segment.sequenceNumber == rcv.nxt {
                 let data: PacketBuffer? = segment.payload
                 rcv.nxt = rcv.nxt &+ UInt32(dataLen)
                 let ackSeg = TCPSegmentToSend(
@@ -150,7 +151,7 @@ func _tcpProcessImpl(
                 }
                 return (.established, [ackSeg], data)
             }
-            if segment.flags.isFin {
+            if segment.flags.isFin, segment.sequenceNumber == rcv.nxt {
                 rcv.nxt = rcv.nxt &+ 1
                 let ackSeg = TCPSegmentToSend(
                     flags: .ack,
@@ -169,10 +170,24 @@ func _tcpProcessImpl(
         // Update peer window
         snd.wnd = segment.window
 
-        // Check for data
+        // Check for data — MUST validate in-sequence delivery (RFC 793 §3.3).
+        // Without this check, duplicate retransmissions and out-of-order
+        // segments inflate rcv.nxt and corrupt the data stream.
         let dataLen = segment.payload.totalLength
 
         if dataLen > 0 {
+            let segSeq = segment.sequenceNumber
+            if segSeq != rcv.nxt {
+                // Out-of-order or duplicate — send dup ACK with expected seq
+                let dupAck = TCPSegmentToSend(
+                    flags: .ack,
+                    seq: snd.nxt,
+                    ack: rcv.nxt,
+                    window: 65535,
+                    payload: nil
+                )
+                return (.established, [dupAck], nil)
+            }
             let data: PacketBuffer? = segment.payload
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
             let ackSeg = TCPSegmentToSend(
@@ -183,6 +198,7 @@ func _tcpProcessImpl(
                 payload: nil
             )
             if segment.flags.isFin {
+                // FIN must also be in-sequence (seq == rcv.nxt already checked)
                 rcv.nxt = rcv.nxt &+ 1
                 let finAck = TCPSegmentToSend(
                     flags: [.ack],
@@ -201,8 +217,16 @@ func _tcpProcessImpl(
             snd.una = segment.acknowledgmentNumber
         }
 
-        // FIN
+        // FIN — only process in-sequence (or ahead, which TCP permits)
         if segment.flags.isFin {
+            // FIN ahead of expected seq is illegal but tolerated; just ACK
+            if segment.sequenceNumber != rcv.nxt {
+                let dupAck = TCPSegmentToSend(
+                    flags: .ack, seq: snd.nxt, ack: rcv.nxt,
+                    window: 65535, payload: nil
+                )
+                return (.established, [dupAck], nil)
+            }
             rcv.nxt = rcv.nxt &+ 1
             let ackSeg = TCPSegmentToSend(
                 flags: .ack,
@@ -267,7 +291,9 @@ func _tcpProcessImpl(
     case .finWait2:
         snd.wnd = segment.window
         let dataLen = segment.payload.totalLength
-        if dataLen > 0 {
+        let segSeq = segment.sequenceNumber
+
+        if dataLen > 0 && segSeq == rcv.nxt {
             let data: PacketBuffer? = segment.payload
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
             if segment.flags.isFin {
@@ -282,6 +308,14 @@ func _tcpProcessImpl(
             )
             return (.finWait2, [ackSeg], data)
         }
+        if dataLen > 0 {
+            // Out-of-order or duplicate — send dup ACK
+            let dupAck = TCPSegmentToSend(
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt,
+                window: 65535, payload: nil
+            )
+            return (.finWait2, [dupAck], nil)
+        }
         if segment.flags.isFin {
             rcv.nxt = rcv.nxt &+ 1
             let ackSeg = TCPSegmentToSend(
@@ -294,9 +328,40 @@ func _tcpProcessImpl(
     case .closeWait:
         snd.wnd = segment.window
         let dataLen = segment.payload.totalLength
-        let data: PacketBuffer? = dataLen > 0 ? segment.payload : nil
-        if dataLen > 0 {
+        let segSeq = segment.sequenceNumber
+
+        // Validate in-sequence — same as .established
+        if dataLen > 0 && segSeq == rcv.nxt {
+            let data: PacketBuffer? = segment.payload
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
+            let ackSeg = TCPSegmentToSend(
+                flags: .ack,
+                seq: snd.nxt,
+                ack: rcv.nxt,
+                window: 65535,
+                payload: nil
+            )
+            // Wait for application to signal close
+            if appClose {
+                let fin = TCPSegmentToSend(
+                    flags: [.fin, .ack],
+                    seq: snd.nxt,
+                    ack: rcv.nxt,
+                    window: 65535,
+                    payload: nil
+                )
+                snd.nxt = snd.nxt &+ 1
+                return (.lastAck, [fin], data)
+            }
+            return (.closeWait, [ackSeg], data)
+        }
+        if dataLen > 0 {
+            // Out-of-order or duplicate — send dup ACK
+            let dupAck = TCPSegmentToSend(
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt,
+                window: 65535, payload: nil
+            )
+            return (.closeWait, [dupAck], nil)
         }
         // Wait for application to signal close
         if appClose {
@@ -308,9 +373,9 @@ func _tcpProcessImpl(
                 payload: nil
             )
             snd.nxt = snd.nxt &+ 1
-            return (.lastAck, [fin], data)
+            return (.lastAck, [fin], nil)
         }
-        return (.closeWait, [], data)
+        return (.closeWait, [], nil)
 
     case .lastAck:
         if segment.flags.isAck {

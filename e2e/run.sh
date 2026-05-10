@@ -25,6 +25,7 @@ UDP_PORT=7778
 HTTP_PORT=7779
 TCP_CLOSE_PORT=7780
 BIDI_PORT=7781
+IPERF_PORT=7782
 INIT="/init"
 HOST_ARGS=()
 PCAP_PATH=""
@@ -43,7 +44,7 @@ done
 
 KERNEL="$SCRIPT_DIR/kernel/Image"
 INITRD="$SCRIPT_DIR/initramfs/initramfs.cpio.gz"
-DEMO_BIN="$PROJECT_DIR/.build/debug/SwiftNetStackDemo"
+DEMO_BIN="$PROJECT_DIR/.build/release/SwiftNetStackDemo"
 
 # ── Validate prerequisites ──
 
@@ -61,8 +62,8 @@ fi
 
 # Build demo if needed
 if [ ! -x "$DEMO_BIN" ]; then
-    echo "Building SwiftNetStackDemo..."
-    (cd "$PROJECT_DIR" && swift build --product SwiftNetStackDemo) || {
+    echo "Building SwiftNetStackDemo (release)..."
+    (cd "$PROJECT_DIR" && swift build -c release --product SwiftNetStackDemo) || {
         echo "ERROR: Build failed"
         exit 1
     }
@@ -81,6 +82,7 @@ if [ -z "$HOST_IP" ]; then
 fi
 
 ECHO_PID=""
+IPERF_PID=""
 NAT_CMD=""
 
 if [ -n "$HOST_IP" ] && command -v python3 &>/dev/null; then
@@ -88,7 +90,7 @@ if [ -n "$HOST_IP" ] && command -v python3 &>/dev/null; then
     ECHO_PID=$!
     sleep 0.5
     if kill -0 "$ECHO_PID" 2>/dev/null; then
-        NAT_CMD="nat_target=$HOST_IP nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT nat_tcp_bidi_port=$BIDI_PORT"
+        NAT_CMD="nat_target=$HOST_IP nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT nat_tcp_bidi_port=$BIDI_PORT nat_iperf_port=$IPERF_PORT"
         echo "Echo servers: TCP:$TCP_PORT UDP:$UDP_PORT HTTP:$HTTP_PORT CLOSE:$TCP_CLOSE_PORT BIDI:$BIDI_PORT (target=$HOST_IP)"
     else
         ECHO_PID=""
@@ -98,10 +100,18 @@ else
     echo "WARNING: python3 or host IP not available, NAT tests will skip"
 fi
 
+# Start iperf3 server (independent of echo_servers.py)
+if [ -n "$HOST_IP" ] && command -v iperf3 &>/dev/null; then
+    iperf3 -s -p "$IPERF_PORT" --daemon 2>/dev/null && IPERF_PID=$!
+    if [ -n "$IPERF_PID" ]; then
+        echo "iperf3 server: port $IPERF_PORT (pid $IPERF_PID)"
+    fi
+fi
+
 # ── Run test ──
 
 TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
-trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
+trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
 
 echo "========================================="
 echo "SwiftNetStack E2E Test Suite"
@@ -181,6 +191,7 @@ echo "========================================="
 kill "$DEMOPID" 2>/dev/null || true
 wait "$DEMOPID" 2>/dev/null || true
 [ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null || true
+[ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null || true
 
 if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1

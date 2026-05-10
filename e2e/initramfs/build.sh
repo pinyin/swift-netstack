@@ -15,10 +15,14 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 
 echo "Building initramfs in $BUILD_DIR..."
 
-# Copy busybox
+# Copy busybox and optional extra binaries
 mkdir -p "$BUILD_DIR/bin"
 cp "$SCRIPT_DIR/bin/busybox" "$BUILD_DIR/bin/busybox"
 chmod +x "$BUILD_DIR/bin/busybox"
+if [ -f "$SCRIPT_DIR/bin/iperf3" ]; then
+    cp "$SCRIPT_DIR/bin/iperf3" "$BUILD_DIR/bin/iperf3"
+    chmod +x "$BUILD_DIR/bin/iperf3"
+fi
 
 # Create symlinks for busybox applets
 BUSYBOX_APPLETS=(

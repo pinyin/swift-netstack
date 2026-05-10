@@ -23,21 +23,16 @@ struct TCPConnection {
     public var externalConnecting: Bool
 
     /// VM→external send queue. Data from VM is buffered here (zero-copy via
-    /// appendView) and drained to the external socket by flushTCPToExternal.
+    /// appendView) and drained to the external socket by flushOneConnection.
     /// FIN is forwarded only after the queue is fully drained — no timer needed.
     public var externalSendQueue: PacketBuffer = .empty
     public var externalSendQueued: Int = 0
 
     /// True when the VM sent FIN and it hasn't been forwarded to external yet.
-    /// Cleared when flushTCPToExternal drains the queue and calls shutdown(SHUT_WR).
+    /// Cleared when the external send queue is drained and shutdown(SHUT_WR)
+    /// is called, forwarding FIN to the server identical to how any other TCP
+    /// flag would be forwarded.
     public var pendingExternalFin: Bool = false
-
-    /// True when data and FIN arrived in the same VM segment.  Indicates the
-    /// payload is a self-contained request (e.g. HTTP) — FIN is delayed so the
-    /// server has time to respond before seeing EOF.  When false, the FIN
-    /// arrived alone (no new data), meaning the server may be waiting for EOF
-    /// (echo pattern) — FIN is forwarded immediately.
-    public var finCameWithData: Bool = false
 
     /// Whether POLLOUT should be requested for this connection's fd
     /// (only during non-blocking connect).
@@ -55,10 +50,10 @@ struct TCPConnection {
     public var sendAvail: Int { totalQueuedBytes }
     public var sendSpace: Int { max(0, Self.maxQueueBytes - totalQueuedBytes) }
 
-    /// Rounds since VM sent FIN while finCameWithData was true.  When the
-    /// server does not respond, this counter provides a timeout fallback to
-    /// forward FIN (echo servers need EOF to respond).  Reset when FIN is
-    /// forwarded or pollTCPReadable receives data.
+    /// Rounds since VM's FIN was ready to forward.  FIN is delayed by 5
+    /// rounds (500 ms) to give the server time to start responding.  Step 3
+    /// forwards FIN immediately when the server responds; step 5 forwards
+    /// after finWaitRounds >= 5 for servers that wait for EOF (echo fallback).
     public var finWaitRounds: Int = 0
 
     public init(

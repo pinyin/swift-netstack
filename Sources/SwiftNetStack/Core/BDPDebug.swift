@@ -73,7 +73,7 @@ func debugValidateIPv4Header(_ ip: IPv4Header) {
         "RFC 791 §3.1: TTL must be > 0, got \(ip.ttl)")
     // RFC 791 §3.2.1.3: Source address must not be loopback or multicast.
     // 0.0.0.0 is allowed for DHCP bootstrap (client has no IP yet).
-    precondition((ip.srcAddr.addr & 0xFF) != 127,
+    precondition(((ip.srcAddr.addr >> 24) & 0xFF) != 127,
         "RFC 791 §3.2.1.3: srcAddr must not be loopback (127.0.0.0/8)")
     precondition((ip.srcAddr.addr >> 28) != 0xE,
         "RFC 791 §3.2.1.3: srcAddr must not be multicast (224.0.0.0/4)")

@@ -134,6 +134,7 @@ struct Args {
     var gateway = "100.64.1.1"
     var hosts: [(String, String)] = []
     var upstreamDNS = ""
+    var pcapPath = ""
 }
 
 func parseArgs() -> Args? {
@@ -153,6 +154,7 @@ func parseArgs() -> Args? {
         case "--subnet":      args.subnet = argv[i + 1]; i += 2
         case "--gateway":     args.gateway = argv[i + 1]; i += 2
         case "--dns":        args.upstreamDNS = argv[i + 1]; i += 2
+        case "--pcap":       args.pcapPath = argv[i + 1]; i += 2
         case "--host":
             let parts = argv[i + 1].split(separator: ":", maxSplits: 1)
             if parts.count == 2 {
@@ -177,14 +179,17 @@ let usage = """
       Linux boot:
         SwiftNetStackDemo --kernel <path> --initrd <path> [--cmdline \"...\"] \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
-                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP]
+                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP] \\
+                          [--pcap <path>]
       EFI boot:
         SwiftNetStackDemo --disk <path> --efi-store <path> \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
-                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP]
+                          [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP] \\
+                          [--pcap <path>]
 
     Boots a Linux VM with VZFileHandleNetworkDevice networking backed by the
     SwiftNetStack BDP pipeline (ARP, DHCP, DNS, NAT, TCP).
+    --pcap <path>  Write VM↔NAT Ethernet frames to a .pcap file for Wireshark.
     """
 
 guard let args = parseArgs() else {
@@ -257,6 +262,16 @@ bdpQueue.async {
         hosts: hosts,
         upstreamDNS: upstreamDNS
     )
+
+    if !args.pcapPath.isEmpty {
+        let pw = PCAPWriter()
+        if pw.start(path: args.pcapPath) {
+            loop.pcapWriter = pw
+            log("PCAP capture enabled: \(args.pcapPath)")
+        } else {
+            log("WARNING: failed to open pcap file: \(args.pcapPath)")
+        }
+    }
 
     let rounds = loop.run(transport: &transport, while: { !shutdown })
     log("BDP loop exited: rounds=\(rounds)")

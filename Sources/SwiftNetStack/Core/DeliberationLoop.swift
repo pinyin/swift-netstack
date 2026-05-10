@@ -23,12 +23,17 @@ public struct DeliberationLoop {
     public var socketRegistry: SocketRegistry
     public var natTable: NATTable
 
+    /// Optional pcap writer for capturing VM↔NAT Ethernet frames.
+    /// Set before calling run() to record traffic for Wireshark/tcpdump analysis.
+    public var pcapWriter: PCAPWriter?
+
     public init(
         endpoints: [VMEndpoint],
         hostMAC: MACAddress,
         portForwards: [PortForwardEntry] = [],
         hosts: [String: IPv4Address] = [:],
-        upstreamDNS: IPv4Address? = nil
+        upstreamDNS: IPv4Address? = nil,
+        pcapWriter: PCAPWriter? = nil
     ) {
         self.hostMAC = hostMAC
         self.arpMapping = ARPMapping(hostMAC: hostMAC, endpoints: endpoints)
@@ -37,6 +42,7 @@ public struct DeliberationLoop {
         self.socketRegistry = SocketRegistry()
         self.natTable = NATTable(portForwards: portForwards)
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
+        self.pcapWriter = pcapWriter
     }
 
     // MARK: - Dynamic port forwarding
@@ -69,6 +75,13 @@ public struct DeliberationLoop {
 
         // ── Phase 1: Unified poll — all FDs treated equally ──
         let result = transport.readPackets(round: round)
+
+        // Capture VM→NAT frames for pcap debugging
+        if let pw = pcapWriter {
+            for (_, pkt) in result.vmFrames {
+                pw.write(packet: pkt)
+            }
+        }
 
         // ── Phase 2: Parse ALL Ethernet headers ──
         var ethParsed: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
@@ -247,19 +260,26 @@ public struct DeliberationLoop {
             )
         }
 
-        // ── Phase 10: Process ALL TCP (VM → external) ──
+        // ── Phase 10: Unified TCP processing (VM ↔ external) ──
+        // Handles all TCP work in one method: connect completion, VM segment
+        // processing, external reads/hangups, and queue draining.  Eliminates
+        // the old 4-phase design and its "manual updated flag" anti-pattern.
 #if DEBUG
         let tcpSnapshot = tcpParsed
         let replyCountPreTCP = replies.count
 #endif
-        for (ep, eth, ip, tcp) in tcpParsed {
-            natTable.processTCP(
-                eth: eth, ip: ip, tcp: tcp, endpointID: ep,
-                hostMAC: arpMapping.hostMAC,
-                transport: &transport,
-                replies: &replies, round: round
-            )
-        }
+        natTable.processTCPRound(
+            vmSegments: tcpParsed,
+            streamReads: result.streamReads,
+            streamHangup: result.streamHangup,
+            streamConnects: result.streamConnects,
+            transport: &transport,
+            hostMAC: arpMapping.hostMAC,
+            arpMapping: arpMapping,
+            replies: &replies,
+            round: round,
+            externalPcap: pcapWriter
+        )
 #if DEBUG
         debugValidateTCPPhase(
             requests: tcpSnapshot,
@@ -268,20 +288,9 @@ public struct DeliberationLoop {
         )
 #endif
 
-        // ── Phase 10.5: Flush TCP sendBuf (external → VM) ──
-        // Drains queued external data from per-connection sendBuf, building
-        // frames with proper sequence numbers, window checking, and enabling
-        // retransmission when the VM doesn't ACK.
-        natTable.flushTCPOutgoing(
-            hostMAC: arpMapping.hostMAC,
-            replies: &replies,
-            round: round
-        )
-
-        // ── Phase 10.6: NAT process ready FDs (external ↔ VM) ──
-        // Runs BEFORE flushTCPToExternal so pollTCPReadable gets first
-        // chance to forward pending FIN when the server responds (HTTP
-        // pattern).  flushTCPToExternal handles the fallback (echo pattern).
+        // ── Phase 10.6: NAT process non-TCP transport results ──
+        // Handles dead FDs, stream accepts, and UDP reads only.
+        // TCP reads/hangups/connects are handled by processTCPRound above.
 #if DEBUG
         let replyCountPreNAT = replies.count
 #endif
@@ -296,13 +305,6 @@ public struct DeliberationLoop {
 #if DEBUG
         debugValidateNATPoll(preReplies: replyCountPreNAT, replies: replies)
 #endif
-
-        // ── Phase 10.7: Flush TCP to external (VM→external send queues) ──
-        // Drains buffered VM→external data and forwards pending FIN via
-        // shutdown(SHUT_WR) as a fallback (echo pattern — server waits for
-        // EOF before responding).  HTTP-pattern FIN (finCameWithData) is
-        // handled by pollTCPReadable above.
-        natTable.flushTCPToExternal(transport: &transport)
 
         // ── Phase 11a: DNS upstream — expire + process ──
         dnsServer.expireQueries(
@@ -379,6 +381,11 @@ public struct DeliberationLoop {
         round.endRound()
 
         let allOutputs = replies + forwardPkts
+        if let pw = pcapWriter {
+            for (_, pkt) in allOutputs {
+                pw.write(packet: pkt)
+            }
+        }
         if !allOutputs.isEmpty {
             transport.writePackets(allOutputs)
         }

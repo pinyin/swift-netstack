@@ -27,6 +27,7 @@ TCP_CLOSE_PORT=7780
 BIDI_PORT=7781
 INIT="/init"
 HOST_ARGS=()
+PCAP_PATH=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,6 +36,7 @@ while [ $# -gt 0 ]; do
             HOST_ARGS+=("--host" "$2")
             shift 2
             ;;
+        --pcap) PCAP_PATH="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -120,6 +122,7 @@ echo "Starting demo..."
     --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 $NAT_CMD" \
     --cpus 1 --memory 512 \
     ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
+    ${PCAP_PATH:+--pcap "$PCAP_PATH"} \
     >"$TMPLOG" 2>&1 &
 DEMOPID=$!
 

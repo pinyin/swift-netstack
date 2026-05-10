@@ -35,7 +35,8 @@ fi
 
 echo "  Guest→Internet: DNS + HTTP fetch..."
 
-# Verify upstream DNS forwarding
+# Verify upstream DNS forwarding is working (nslookup uses busybox's own
+# DNS client which sends a plain A query — works reliably through the NAT).
 HTTPBIN_IP=$(nslookup example.com 2>/dev/null | awk '/^Address:/ && !/[#:][0-9]+$/ {print $2; exit}')
 if [ -z "$HTTPBIN_IP" ]; then
     echo "  DNS cannot resolve internet hostnames"
@@ -44,18 +45,30 @@ if [ -z "$HTTPBIN_IP" ]; then
 fi
 echo "  DNS OK: example.com -> $HTTPBIN_IP"
 
-# Use printf+nc for raw HTTP request with proper Host header.
-# This avoids issues with busybox wget DNS resolution and --header support.
-echo "  HTTP fetch http://$HTTPBIN_IP/ ..."
-printf 'GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n' \
-    | nc -w 10 "$HTTPBIN_IP" 80 > /tmp/inet-http-resp.txt 2>/tmp/inet-http-err.txt
-TCP_RESP=$(wc -c < /tmp/inet-http-resp.txt)
-echo "  response: $TCP_RESP bytes"
-if [ "$TCP_RESP" -gt 0 ]; then
-    test_pass "nat-http-internet"
-    return 0
+# Use printf|nc with explicit Host header for the HTTP request.
+# We pre-resolve the IP with nslookup (above) because wget in this
+# environment uses libc getaddrinfo() which sends AAAA queries that the
+# NAT DNS server does not forward upstream, causing resolution to fail.
+#
+# Unlike the old approach, we include the correct Host header so
+# Cloudflare (and other virtual-hosting servers) return a valid response
+# instead of HTTP 403.
+echo "  HTTP fetch http://$HTTPBIN_IP/ (Host: example.com) ..."
+# The subshell (printf; sleep) keeps stdin open for 1.5s after sending
+# the request.  This gives Cloudflare time to respond before the NAT
+# forwards the VM-side FIN — avoiding the race where Cloudflare aborts
+# if it receives FIN before it starts sending the response.
+HTTP_RESP=$( (printf "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"; sleep 1.5) | nc -w 5 "$HTTPBIN_IP" 80 2>/dev/null)
+HTTP_RC=$?
+if [ $HTTP_RC -eq 0 ] && [ -n "$HTTP_RESP" ]; then
+    if echo "$HTTP_RESP" | grep -q "HTTP/1.[01] [23]"; then
+        echo "  HTTP response: $(echo "$HTTP_RESP" | head -n 1)"
+        test_pass "nat-http-internet"
+    else
+        echo "  unexpected HTTP response: $(echo "$HTTP_RESP" | head -n 1)"
+        test_fail "nat-http-internet"
+    fi
+else
+    echo "  HTTP fetch to $HTTPBIN_IP failed (rc=$HTTP_RC)"
+    test_fail "nat-http-internet"
 fi
-
-echo "  HTTP fetch failed"
-echo "  stderr: $(cat /tmp/inet-http-err.txt)"
-test_fail "nat-http-internet"

@@ -24,6 +24,18 @@ struct TCPConnection {
     /// POLLOUT is requested until the connect completes (detected via getpeername).
     public var externalConnecting: Bool
 
+    /// Explicit FIN buffering model: tracks rounds since VM sent FIN (closeWait)
+    /// before forwarding to the external socket via shutdown(SHUT_WR).
+    /// - 0: no pending FIN (or FIN already forwarded / external closed first)
+    /// - >0: counting rounds, FIN not yet forwarded
+    /// Set when closeWait is entered; reset when FIN is forwarded or connection closes.
+    public var finWaitRounds: Int = 0
+
+    /// True when the external server has sent data since the VM sent FIN.
+    /// Indicates the server is responsive — safe to forward FIN without
+    /// breaking the response path.
+    public var externalResponded: Bool = false
+
     /// Whether POLLOUT should be requested for this connection's fd.
     public func wantsPOLLOUT() -> Bool { externalConnecting }
 

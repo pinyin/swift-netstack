@@ -261,11 +261,16 @@ public struct NATTable {
             }
         }
 
-        // Never forward the VM's FIN to the external server via shutdown(SHUT_WR).
-        // External servers (HTTP and others) may close without responding when
-        // data+FIN arrive in close proximity. Instead, keep the external write
-        // side open — the external server will eventually close on its own
-        // (after sending a response), and handleStreamHangup relays that FIN.
+        // Do not forward the VM's FIN to the external server via shutdown(SHUT_WR)
+        // immediately.  Instead, buffer it explicitly: wait for either (a) the
+        // external server to respond with data, or (b) a timeout of maxFinWaitRounds.
+        // This models gvproxy's behavior where gVisor's internal TCP stack buffers
+        // the VM's data+FIN while the external connect() completes, creating a
+        // natural delay between data delivery and FIN.
+        if newState == .closeWait {
+            conn.finWaitRounds = 1
+            conn.externalResponded = false
+        }
         for seg in toSend {
             if let frame = buildTCPFrame(
                 hostMAC: hostMAC, dstMAC: eth.srcMAC,
@@ -493,14 +498,22 @@ public struct NATTable {
         data.withUnsafeReadableBytes { ptr in
             withTCPConnection(key) { conn in
                 conn.writeSendBuf(ptr: ptr.baseAddress!, count: data.totalLength)
+                conn.externalResponded = true
             }
         }
     }
+
+    // Maximum rounds to wait for external response before forwarding FIN anyway.
+    // At ~10ms/round, 30 rounds ≈ 300ms — enough for a typical HTTP round-trip.
+    private let maxFinWaitRounds: Int = 30
 
     // MARK: - Flush TCP sendBuf (external→VM)
 
     /// Drain sendBuf for all established TCP connections, building frames with
     /// proper sequence/window management and retransmission support.
+    /// Also processes buffered FIN forwarding: when the VM has sent FIN
+    /// (closeWait state), FIN is forwarded to the external socket only after
+    /// the external server has responded with data, or a timeout expires.
     public mutating func flushTCPOutgoing(
         hostMAC: MACAddress,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
@@ -549,6 +562,26 @@ public struct NATTable {
                     } else {
                         break
                     }
+                }
+            }
+
+            // Explicit FIN buffering: forward VM's FIN to external when
+            // (a) the external server has already sent response data, or
+            // (b) maxFinWaitRounds have elapsed with no response.
+            if conn.finWaitRounds > 0 {
+                if conn.externalResponded {
+                    debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (external responded)\n")
+                    shutdown(conn.posixFD, SHUT_WR)
+                    conn.finWaitRounds = 0
+                    updated = true
+                } else if conn.finWaitRounds >= maxFinWaitRounds {
+                    debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (timeout after \(conn.finWaitRounds) rounds)\n")
+                    shutdown(conn.posixFD, SHUT_WR)
+                    conn.finWaitRounds = 0
+                    updated = true
+                } else {
+                    conn.finWaitRounds += 1
+                    updated = true
                 }
             }
 
@@ -742,7 +775,10 @@ public struct NATTable {
         // Established or later: peer closed — handle as EOF
         if entry.connection.externalEOF { return }
         debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-        withTCPConnection(key) { conn in conn.externalEOF = true }
+        withTCPConnection(key) { conn in
+            conn.externalEOF = true
+            conn.finWaitRounds = 0
+        }
         handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport, replies: &replies, round: round)
     }
 

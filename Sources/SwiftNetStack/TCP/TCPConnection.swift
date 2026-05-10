@@ -1,7 +1,5 @@
 import Darwin
 
-private let defaultSendBufSize = 256 * 1024
-
 /// Aggregates all per-connection TCP state for a NAT-proxied connection.
 struct TCPConnection {
     public let connectionID: UInt64
@@ -24,33 +22,37 @@ struct TCPConnection {
     /// POLLOUT is requested until the connect completes (detected via getpeername).
     public var externalConnecting: Bool
 
-    /// Explicit FIN buffering model: tracks rounds since VM sent FIN (closeWait)
-    /// before forwarding to the external socket via shutdown(SHUT_WR).
-    /// - 0: no pending FIN (or FIN already forwarded / external closed first)
-    /// - >0: counting rounds, FIN not yet forwarded
-    /// Set when closeWait is entered; reset when FIN is forwarded or connection closes.
-    public var finWaitRounds: Int = 0
+    /// VM→external send queue. Data from VM is buffered here (zero-copy via
+    /// appendView) and drained to the external socket by flushTCPToExternal.
+    /// FIN is forwarded only after the queue is fully drained — no timer needed.
+    public var externalSendQueue: PacketBuffer = .empty
+    public var externalSendQueued: Int = 0
 
-    /// True when the external server has sent data since the VM sent FIN.
-    /// Indicates the server is responsive — safe to forward FIN without
-    /// breaking the response path.
-    public var externalResponded: Bool = false
+    /// True when the VM sent FIN and it hasn't been forwarded to external yet.
+    /// Cleared when flushTCPToExternal drains the queue and calls shutdown(SHUT_WR).
+    public var pendingExternalFin: Bool = false
 
-    /// Whether POLLOUT should be requested for this connection's fd.
+    /// True when data and FIN arrived in the same VM segment.  Indicates the
+    /// payload is a self-contained request (e.g. HTTP) — FIN is delayed so the
+    /// server has time to respond before seeing EOF.  When false, the FIN
+    /// arrived alone (no new data), meaning the server may be waiting for EOF
+    /// (echo pattern) — FIN is forwarded immediately.
+    public var finCameWithData: Bool = false
+
+    /// Whether POLLOUT should be requested for this connection's fd
+    /// (only during non-blocking connect).
     public func wantsPOLLOUT() -> Bool { externalConnecting }
 
-    // MARK: - Send buffer (external→VM data queued for transmission + retransmit)
+    // MARK: - Send queue (external→VM data queued for zero-copy transmission)
 
-    public var sendBuf: [UInt8]
-    public var sendHead: Int = 0
-    public var sendTail: Int = 0
-    public var sendSize: Int = 0
+    /// Queued PacketBuffers from external recv(), sharing Storage via ARC.
+    /// Appended via writeSendBuf, drained via ackSendBuf, peeked via peekSendData.
+    public var sendQueue: PacketBuffer = .empty
+    public var totalQueuedBytes: Int = 0
+    public static let maxQueueBytes: Int = 256 * 1024
 
-    public var retransmitAt: UInt64 = 0
-    public var retransmitCount: Int = 0
-
-    public var sendAvail: Int { sendSize }
-    public var sendSpace: Int { sendBuf.count - sendSize }
+    public var sendAvail: Int { totalQueuedBytes }
+    public var sendSpace: Int { max(0, Self.maxQueueBytes - totalQueuedBytes) }
 
     public init(
         connectionID: UInt64,
@@ -76,70 +78,61 @@ struct TCPConnection {
         self.endpointID = endpointID
         self.externalEOF = false
         self.externalConnecting = false
-        self.sendBuf = [UInt8](repeating: 0, count: defaultSendBufSize)
     }
 
-    // MARK: - Send buffer operations
+    // MARK: - Send queue operations (zero-copy)
 
-    /// Write data from an array into the send buffer. Returns bytes written.
+    /// Append a PacketBuffer to the send queue. Shares Storage via ARC — no copy.
+    /// Returns bytes queued, or 0 if backpressure threshold exceeded.
     @discardableResult
-    public mutating func writeSendBuf(_ data: [UInt8]) -> Int {
-        data.withUnsafeBytes { writeSendBuf(ptr: $0.baseAddress!, count: data.count) }
-    }
-
-    /// Write data from a raw pointer into the send buffer. Returns bytes written.
-    @discardableResult
-    public mutating func writeSendBuf(ptr: UnsafeRawPointer, count: Int) -> Int {
-        let space = sendSpace
-        var n = count
-        if n > space { n = space }
+    public mutating func writeSendBuf(_ pkt: PacketBuffer) -> Int {
+        let n = pkt.totalLength
         guard n > 0 else { return 0 }
-        let first = min(n, sendBuf.count - sendTail)
-        sendBuf.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            memcpy(base.advanced(by: sendTail), ptr, first)
-            if n > first {
-                memcpy(base, ptr.advanced(by: first), n - first)
-            }
-        }
-        sendTail = (sendTail + n) % sendBuf.count
-        sendSize += n
+        guard totalQueuedBytes + n <= Self.maxQueueBytes else { return 0 }
+        sendQueue.appendView(pkt)
+        totalQueuedBytes += n
         return n
     }
 
-    /// Remove acknowledged data from the send buffer.
-    /// Called after the FSM advances snd.una.
+    /// Remove acknowledged data from the front of the send queue (zero-copy).
     public mutating func ackSendBuf(delta: Int) {
         var d = delta
-        if d > sendSize { d = sendSize }
+        if d > totalQueuedBytes { d = totalQueuedBytes }
         guard d > 0 else { return }
-        sendHead = (sendHead + d) % sendBuf.count
-        sendSize -= d
-        retransmitCount = 0
+        sendQueue.trimFront(d)
+        totalQueuedBytes -= d
     }
 
-    /// Peek up to `max` bytes of unsent data from the send buffer.
-    /// Returns a contiguous copy of the data.
-    public func peekSendData(max: Int) -> [UInt8] {
-        let avail = sendAvail
+    /// Peek up to `max` bytes of unsent data from the send queue.
+    /// Returns a zero-copy PacketBuffer slice sharing Storage with the queue.
+    public func peekSendData(max: Int) -> PacketBuffer? {
+        let avail = totalQueuedBytes
         let sent = Int(snd.nxt &- snd.una)
-        guard sent < avail, avail > 0, max > 0 else { return [] }
+        guard sent < avail, avail > 0, max > 0 else { return nil }
         let remaining = avail - sent
         var n = remaining
         if n > max { n = max }
-        var result = [UInt8](repeating: 0, count: n)
-        let start = (sendHead + sent) % sendBuf.count
-        let first = min(n, sendBuf.count - start)
-        sendBuf.withUnsafeBytes { src in
-            guard let srcBase = src.baseAddress else { return }
-            result.withUnsafeMutableBytes { dst in
-                guard let dstBase = dst.baseAddress else { return }
-                memcpy(dstBase, srcBase.advanced(by: start), first)
-                if n > first {
-                    memcpy(dstBase.advanced(by: first), srcBase, n - first)
-                }
-            }
-        }
-        return result
+        return sendQueue.slice(from: sent, length: n)
+    }
+
+    // MARK: - External send queue (VM→external, zero-copy)
+
+    /// Append VM→external data to the send queue (zero-copy via appendView).
+    @discardableResult
+    public mutating func appendExternalSend(_ pkt: PacketBuffer) -> Int {
+        let n = pkt.totalLength
+        guard n > 0 else { return 0 }
+        externalSendQueue.appendView(pkt)
+        externalSendQueued += n
+        return n
+    }
+
+    /// Remove written bytes from the front of the external send queue.
+    public mutating func drainExternalSend(_ delta: Int) {
+        var d = delta
+        if d > externalSendQueued { d = externalSendQueued }
+        guard d > 0 else { return }
+        externalSendQueue.trimFront(d)
+        externalSendQueued -= d
     }
 }

@@ -760,7 +760,7 @@ func debugRunTCPFSMTests() {
         var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
         let (newState, _, data) = _tcpProcessImpl(state: .established, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .established, "TCP FSM: ESTABLISHED + data → \(newState)")
-        precondition(data != nil && data!.count == 10, "TCP FSM: ESTABLISHED + data → no dataToExternal")
+        precondition(data != nil && data!.totalLength == 10, "TCP FSM: ESTABLISHED + data → no dataToExternal")
         precondition(rcv.nxt == 2010, "TCP FSM: ESTABLISHED + data → rcv.nxt not advanced")
     }
 

@@ -22,7 +22,8 @@ func buildTCPFrame(
     let payloadLen = payload?.totalLength ?? 0
     let tcpTotalLen = tcpHeaderLen + payloadLen
     let ipTotalLen = ipv4HeaderLen + tcpTotalLen
-    let frameLen = ethHeaderLen + ipTotalLen
+    let headerOnlyLen = ethHeaderLen + ipv4HeaderLen + tcpHeaderLen
+    let frameLen = headerOnlyLen + (payloadLen > 0 ? 0 : payloadLen)  // single buffer only for no-payload
 
     var frame = round.allocate(capacity: frameLen, headroom: 0)
     guard let ptr = frame.appendPointer(count: frameLen) else { return nil }
@@ -51,19 +52,31 @@ func buildTCPFrame(
     writeUInt16BE(0, to: tcpPtr.advanced(by: 16))   // checksum placeholder
     writeUInt16BE(0, to: tcpPtr.advanced(by: 18))   // urgent pointer
 
-    // TCP payload
-    if let payload = payload, payloadLen > 0 {
-        payload.withUnsafeReadableBytes { payloadBuf in
-            tcpPtr.advanced(by: tcpHeaderLen).copyMemory(from: payloadBuf.baseAddress!, byteCount: payloadLen)
-        }
-    }
-
     // TCP checksum (pseudo-header + TCP header + payload)
-    let ck = computeTCPChecksum(
-        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
-        tcpData: tcpPtr, tcpLen: tcpTotalLen
-    )
-    writeUInt16BE(ck, to: tcpPtr.advanced(by: 16))
+    if let payload = payload, payloadLen > 0 {
+        // Scatter-gather: compute checksum across header + all payload views
+        var pseudo: [UInt8] = [
+            0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue,
+            UInt8(tcpTotalLen >> 8), UInt8(tcpTotalLen & 0xFF),
+        ]
+        srcIP.write(to: &pseudo)
+        pseudo.withUnsafeMutableBytes { buf in
+            dstIP.write(to: buf.baseAddress!.advanced(by: 4))
+        }
+        var ckSum = pseudoSum(pseudo)
+        ckSum = checksumAdd(ckSum, tcpPtr, tcpHeaderLen)
+        ckSum = checksumAddViews(ckSum, payload._views)
+        let ck = finalizeChecksum(ckSum)
+        writeUInt16BE(ck, to: tcpPtr.advanced(by: 16))
+        // Zero-copy: attach payload views to the header buffer
+        frame.appendView(payload)
+    } else {
+        let ck = computeTCPChecksum(
+            pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
+            tcpData: tcpPtr, tcpLen: tcpTotalLen
+        )
+        writeUInt16BE(ck, to: tcpPtr.advanced(by: 16))
+    }
 
     return frame
 }

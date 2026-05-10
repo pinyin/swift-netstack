@@ -278,7 +278,10 @@ public struct DeliberationLoop {
             round: round
         )
 
-        // ── Phase 11: NAT process ready FDs (external ↔ VM) ──
+        // ── Phase 10.6: NAT process ready FDs (external ↔ VM) ──
+        // Runs BEFORE flushTCPToExternal so pollTCPReadable gets first
+        // chance to forward pending FIN when the server responds (HTTP
+        // pattern).  flushTCPToExternal handles the fallback (echo pattern).
 #if DEBUG
         let replyCountPreNAT = replies.count
 #endif
@@ -293,6 +296,13 @@ public struct DeliberationLoop {
 #if DEBUG
         debugValidateNATPoll(preReplies: replyCountPreNAT, replies: replies)
 #endif
+
+        // ── Phase 10.7: Flush TCP to external (VM→external send queues) ──
+        // Drains buffered VM→external data and forwards pending FIN via
+        // shutdown(SHUT_WR) as a fallback (echo pattern — server waits for
+        // EOF before responding).  HTTP-pattern FIN (finCameWithData) is
+        // handled by pollTCPReadable above.
+        natTable.flushTCPToExternal(transport: &transport)
 
         // ── Phase 11a: DNS upstream — expire + process ──
         dnsServer.expireQueries(

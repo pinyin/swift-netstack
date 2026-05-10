@@ -313,7 +313,7 @@ public struct PacketBuffer {
 
     // MARK: - Internal helpers
 
-    fileprivate static var empty: PacketBuffer {
+    internal static var empty: PacketBuffer {
         PacketBuffer(_views: [])
     }
 

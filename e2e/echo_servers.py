@@ -49,20 +49,19 @@ def tcp_echo(port: int) -> None:
 
 
 def _handle_tcp(conn: socket.socket, addr: tuple) -> None:
+    """TCP echo handler — reads until EOF (FIN), then echoes back.
+
+    No socket timeouts: data arrival and FIN are both protocol-driven.
+    The NAT forwards FIN via shutdown(SHUT_WR) once its VM→external send
+    queue is drained, so recv() returns b'' naturally.
+    """
     try:
-        # Read whatever is available in one shot, echo it back, then close.
-        # Does not wait for EOF (FIN) — the client's FIN is not forwarded by
-        # the NAT, so relying on it would hang.
-        conn.settimeout(0.5)
         data = b""
         while True:
-            try:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            except socket.timeout:
+            chunk = conn.recv(4096)
+            if not chunk:
                 break
+            data += chunk
         if data:
             conn.sendall(data)
     except OSError:

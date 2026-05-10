@@ -144,6 +144,34 @@ func checksumAdd(_ sum: UInt32, _ ptr: UnsafeRawPointer, _ count: Int) -> UInt32
     return s
 }
 
+/// Add bytes from multiple non-contiguous views to an existing checksum accumulator.
+/// Correctly carries pending odd bytes across view boundaries, matching the behavior
+/// of a single contiguous checksum pass.
+func checksumAddViews(_ initialSum: UInt32, _ views: [PacketBuffer.View]) -> UInt32 {
+    var s = initialSum
+    var pendingOdd: UInt8? = nil
+    for view in views where view.length > 0 {
+        let p = view.storage.data.advanced(by: view.offset).assumingMemoryBound(to: UInt8.self)
+        var i = 0
+        if let odd = pendingOdd {
+            s += UInt32((UInt16(odd) << 8) | UInt16(p[0]))
+            pendingOdd = nil
+            i = 1
+        }
+        while i + 1 < view.length {
+            s += UInt32((UInt16(p[i]) << 8) | UInt16(p[i + 1]))
+            i += 2
+        }
+        if i < view.length {
+            pendingOdd = p[i]
+        }
+    }
+    if let odd = pendingOdd {
+        s += UInt32(odd) << 8
+    }
+    return s
+}
+
 /// Fold carries and return one's complement.
 func finalizeChecksum(_ sum: UInt32) -> UInt16 {
     var s = sum

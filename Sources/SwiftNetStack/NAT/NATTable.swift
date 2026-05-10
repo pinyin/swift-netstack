@@ -229,6 +229,11 @@ public struct NATTable {
             if result < 0 {
                 return
             }
+            // Connect completed — update state consistently with pollTCPWritable
+            if conn.externalConnecting {
+                conn.externalConnecting = false
+                transport.registerFD(conn.posixFD, events: Int16(POLLIN), kind: .stream)
+            }
         }
 
         let oldState = conn.state
@@ -249,27 +254,27 @@ public struct NATTable {
         if oldState != newState {
             debugLog("[NAT-TCP-PROC] state \(oldState) → \(newState) for \(key.dstIP):\(key.dstPort), flags=\(tcp.flags.rawValue)\n")
         }
-        if let d = dataToExternal, !d.isEmpty {
-            debugLog("[NAT-TCP-PROC] sending \(d.count)B to external \(key.dstIP):\(key.dstPort)\n")
-        }
-
         if let data = dataToExternal, !data.isEmpty {
-            var pkt = round.allocate(capacity: data.count, headroom: 0)
-            if let ptr = pkt.appendPointer(count: data.count) {
-                data.withUnsafeBufferPointer { ptr.copyMemory(from: $0.baseAddress!, byteCount: data.count) }
-                transport.writeStream(pkt, to: conn.posixFD)
-            }
+            debugLog("[NAT-TCP-PROC] buffering \(data.totalLength)B for external \(key.dstIP):\(key.dstPort)\n")
+            conn.appendExternalSend(data)
         }
 
-        // Do not forward the VM's FIN to the external server via shutdown(SHUT_WR)
-        // immediately.  Instead, buffer it explicitly: wait for either (a) the
-        // external server to respond with data, or (b) a timeout of maxFinWaitRounds.
-        // This models gvproxy's behavior where gVisor's internal TCP stack buffers
-        // the VM's data+FIN while the external connect() completes, creating a
-        // natural delay between data delivery and FIN.
+        // Buffer the VM's FIN: it will be forwarded to the external socket
+        // via shutdown(SHUT_WR) only after externalSendQueue is fully drained.
+        // No timer needed — the drain is driven by flushTCPToExternal every round.
+        //
+        // finCameWithData distinguishes two protocol patterns:
+        // - true: data+FIN in same segment (e.g. HTTP request) — FIN is delayed
+        //   until the server responds (pollTCPReadable), giving the server time
+        //   to process the request before seeing EOF.
+        // - false: FIN arrived alone (e.g. echo) — server is waiting for EOF
+        //   before responding, so FIN is forwarded immediately once the queue
+        //   is drained (flushTCPToExternal).
         if newState == .closeWait {
-            conn.finWaitRounds = 1
-            conn.externalResponded = false
+            conn.pendingExternalFin = true
+            if let data = dataToExternal, !data.isEmpty {
+                conn.finCameWithData = true
+            }
         }
         for seg in toSend {
             if let frame = buildTCPFrame(
@@ -278,7 +283,7 @@ public struct NATTable {
                 srcPort: tcp.dstPort, dstPort: tcp.srcPort,
                 seqNumber: seg.seq, ackNumber: seg.ack,
                 flags: seg.flags, window: seg.window,
-                payload: makePayload(seg.payload, round: round),
+                payload: nil,
                 round: round
             ) {
                 replies.append((endpointID, frame))
@@ -495,17 +500,24 @@ public struct NATTable {
         // it with proper sequence numbers, window checking, and enables
         // retransmission when the VM doesn't ACK (timer → SND_NXT rollback).
         debugLog("[NAT-TCP-RD] read \(data.totalLength)B external→VM for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-        data.withUnsafeReadableBytes { ptr in
-            withTCPConnection(key) { conn in
-                conn.writeSendBuf(ptr: ptr.baseAddress!, count: data.totalLength)
-                conn.externalResponded = true
+        var forwardFin = false
+        var finFD: Int32 = 0
+        withTCPConnection(key) { conn in
+            conn.writeSendBuf(data)
+            // Server responded — forward the VM's pending FIN now (gvproxy
+            // closeWrite pattern).  Data has been acknowledged by the server's
+            // response, so it's safe to signal EOF.
+            if conn.pendingExternalFin {
+                conn.pendingExternalFin = false
+                forwardFin = true
+                finFD = conn.posixFD
             }
         }
+        if forwardFin {
+            debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (after server response)\n")
+            shutdown(finFD, SHUT_WR)
+        }
     }
-
-    // Maximum rounds to wait for external response before forwarding FIN anyway.
-    // At ~10ms/round, 30 rounds ≈ 300ms — enough for a typical HTTP round-trip.
-    private let maxFinWaitRounds: Int = 30
 
     // MARK: - Flush TCP sendBuf (external→VM)
 
@@ -530,8 +542,8 @@ public struct NATTable {
 
             var updated = false
 
-            // Flush sendBuf data (external→VM)
-            if conn.sendSize > 0 {
+            // Flush send queue data (external→VM)
+            if conn.totalQueuedBytes > 0 {
                 var segCount = 0
                 let maxSegs = 64
 
@@ -541,10 +553,9 @@ public struct NATTable {
                     if canSend <= 0 { break }
                     if canSend > mss { canSend = mss }
 
-                    let data = conn.peekSendData(max: canSend)
-                    if data.isEmpty { break }
+                    guard let data = conn.peekSendData(max: canSend) else { break }
 
-                    debugLog("[NAT-TCP-FLUSH] flushing \(data.count)B to VM \(conn.vmIP):\(conn.vmPort), state=\(conn.state), sendSize=\(conn.sendSize)\n")
+                    debugLog("[NAT-TCP-FLUSH] flushing \(data.totalLength)B to VM \(conn.vmIP):\(conn.vmPort), state=\(conn.state), queued=\(conn.totalQueuedBytes)\n")
 
                     let flags: TCPFlags = [.ack, .psh]
                     if let frame = buildTCPFrame(
@@ -553,10 +564,10 @@ public struct NATTable {
                         srcPort: conn.dstPort, dstPort: conn.vmPort,
                         seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
                         flags: flags, window: 65535,
-                        payload: makePayload(data, round: round), round: round
+                        payload: data, round: round
                     ) {
                         replies.append((conn.endpointID, frame))
-                        conn.snd.nxt = conn.snd.nxt &+ UInt32(data.count)
+                        conn.snd.nxt = conn.snd.nxt &+ UInt32(data.totalLength)
                         segCount += 1
                         updated = true
                     } else {
@@ -565,22 +576,62 @@ public struct NATTable {
                 }
             }
 
-            // Explicit FIN buffering: forward VM's FIN to external when
-            // (a) the external server has already sent response data, or
-            // (b) maxFinWaitRounds have elapsed with no response.
-            if conn.finWaitRounds > 0 {
-                if conn.externalResponded {
-                    debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (external responded)\n")
+            if updated {
+                newEntries.append((key, NATEntry(connection: conn, isInbound: entry.isInbound)))
+            }
+        }
+
+        for (key, entry) in newEntries {
+            tcpEntries[key] = entry
+        }
+    }
+
+    // MARK: - Flush TCP external send queue (VM→external)
+
+    /// Drain VM→external send queues for all TCP connections.
+    /// After the queue is fully drained, any pending FIN is forwarded
+    /// via shutdown(SHUT_WR).  Data-driven — no timers.
+    public mutating func flushTCPToExternal(transport: inout PollingTransport) {
+        var newEntries: [(NATKey, NATEntry)] = []
+
+        for (key, entry) in tcpEntries {
+            var conn = entry.connection
+            var updated = false
+
+            // Drain external send queue
+            while conn.externalSendQueued > 0 {
+                guard let chunk = conn.externalSendQueue.slice(
+                    from: 0, length: min(conn.externalSendQueued, 65536)
+                ) else { break }
+
+                let written = transport.writeStream(chunk, to: conn.posixFD)
+                if written < 0 {
+                    if errno == EAGAIN { break }
+                    debugLog("[NAT-TCP-EXT] write to \(key.dstIP):\(key.dstPort) failed: errno=\(errno)\n")
+                    break
+                }
+                if written == 0 { break }
+                debugLog("[NAT-TCP-EXT] flushed \(written)B to \(key.dstIP):\(key.dstPort)\n")
+                conn.drainExternalSend(written)
+                updated = true
+            }
+
+            // Forward pending FIN once the external send queue is drained.
+            // Two patterns (mirrors gvproxy's io.Copy + closeWrite):
+            //
+            // finCameWithData (HTTP): data+FIN arrived in same VM segment.
+            //   pollTCPReadable (Phase 10.6, runs before this phase) forwards
+            //   FIN when the server responds.  Don't forward here — the server
+            //   needs time to process the request before seeing EOF.
+            //
+            // !finCameWithData (echo): FIN arrived alone, meaning the server
+            //   is waiting for EOF before responding.  Forward FIN immediately
+            //   once the queue is drained.
+            if conn.pendingExternalFin, conn.externalSendQueued == 0 {
+                if !conn.finCameWithData {
+                    debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (echo pattern)\n")
                     shutdown(conn.posixFD, SHUT_WR)
-                    conn.finWaitRounds = 0
-                    updated = true
-                } else if conn.finWaitRounds >= maxFinWaitRounds {
-                    debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (timeout after \(conn.finWaitRounds) rounds)\n")
-                    shutdown(conn.posixFD, SHUT_WR)
-                    conn.finWaitRounds = 0
-                    updated = true
-                } else {
-                    conn.finWaitRounds += 1
+                    conn.pendingExternalFin = false
                     updated = true
                 }
             }
@@ -692,28 +743,27 @@ public struct NATTable {
         var needsCleanup = false
         var cleanupFD: Int32 = 0
 
-        // Flush any remaining sendBuf data BEFORE sending FIN to VM.
+        // Flush any remaining send queue data BEFORE sending FIN to VM.
         // This ensures correct TCP ordering: data frames arrive at the VM
         // before the FIN, so applications can read all data before seeing EOF.
         withTCPConnection(key) { conn in
             let mss = 1400
-            while conn.sendSize > 0 {
+            while conn.totalQueuedBytes > 0 {
                 let inFlight = conn.snd.nxt &- conn.snd.una
                 var canSend = Int(conn.snd.wnd) - Int(inFlight)
                 if canSend <= 0 { break }
                 if canSend > mss { canSend = mss }
-                let data = conn.peekSendData(max: canSend)
-                if data.isEmpty { break }
+                guard let data = conn.peekSendData(max: canSend) else { break }
                 if let frame = buildTCPFrame(
                     hostMAC: hostMAC, dstMAC: conn.vmMAC,
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
                     srcPort: conn.dstPort, dstPort: conn.vmPort,
                     seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
                     flags: [.ack, .psh], window: 65535,
-                    payload: makePayload(data, round: round), round: round
+                    payload: data, round: round
                 ) {
                     replies.append((conn.endpointID, frame))
-                    conn.snd.nxt = conn.snd.nxt &+ UInt32(data.count)
+                    conn.snd.nxt = conn.snd.nxt &+ UInt32(data.totalLength)
                 } else {
                     break
                 }
@@ -739,7 +789,7 @@ public struct NATTable {
                     srcPort: conn.dstPort, dstPort: conn.vmPort,
                     seqNumber: seg.seq, ackNumber: seg.ack,
                     flags: seg.flags, window: seg.window,
-                    payload: makePayload(seg.payload, round: round), round: round
+                    payload: nil, round: round
                 ) {
                     replies.append((conn.endpointID, frame))
                 }
@@ -777,7 +827,7 @@ public struct NATTable {
         debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort), state=\(st)\n")
         withTCPConnection(key) { conn in
             conn.externalEOF = true
-            conn.finWaitRounds = 0
+            conn.pendingExternalFin = false
         }
         handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport, replies: &replies, round: round)
     }
@@ -845,16 +895,6 @@ public struct NATTable {
     fputs(msg(), stderr)
     #endif
 }
-}
-
-// MARK: - Payload construction
-
-private func makePayload(_ data: [UInt8]?, round: RoundContext) -> PacketBuffer? {
-    guard let data = data, !data.isEmpty else { return nil }
-    var pkt = round.allocate(capacity: data.count, headroom: 0)
-    guard let ptr = pkt.appendPointer(count: data.count) else { return nil }
-    data.withUnsafeBufferPointer { ptr.copyMemory(from: $0.baseAddress!, byteCount: data.count) }
-    return pkt
 }
 
 // MARK: - sockaddr helpers

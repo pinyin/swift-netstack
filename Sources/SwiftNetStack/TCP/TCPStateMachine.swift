@@ -62,7 +62,7 @@ func tcpProcess(
     snd: inout SendSequence,
     rcv: inout RecvSequence,
     appClose: Bool
-) -> (newState: TCPState, toSend: [TCPSegmentToSend], dataToExternal: [UInt8]?) {
+) -> (newState: TCPState, toSend: [TCPSegmentToSend], dataToExternal: PacketBuffer?) {
     let result = _tcpProcessImpl(state: state, segment: segment,
                                  snd: &snd, rcv: &rcv, appClose: appClose)
     if result.newState != state, let tracer = tcpStateTransitionTracer {
@@ -77,7 +77,7 @@ func _tcpProcessImpl(
     snd: inout SendSequence,
     rcv: inout RecvSequence,
     appClose: Bool
-) -> (newState: TCPState, toSend: [TCPSegmentToSend], dataToExternal: [UInt8]?) {
+) -> (newState: TCPState, toSend: [TCPSegmentToSend], dataToExternal: PacketBuffer?) {
 
     // RST always immediately closes, regardless of state
     if segment.flags.isRst {
@@ -128,9 +128,7 @@ func _tcpProcessImpl(
             // Handle these so data isn't silently dropped.
             let dataLen = segment.payload.totalLength
             if dataLen > 0 {
-                let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
-                    Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
-                }
+                let data: PacketBuffer? = segment.payload
                 rcv.nxt = rcv.nxt &+ UInt32(dataLen)
                 let ackSeg = TCPSegmentToSend(
                     flags: .ack,
@@ -175,9 +173,7 @@ func _tcpProcessImpl(
         let dataLen = segment.payload.totalLength
 
         if dataLen > 0 {
-            let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
-                Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
-            }
+            let data: PacketBuffer? = segment.payload
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
             let ackSeg = TCPSegmentToSend(
                 flags: .ack,
@@ -272,9 +268,7 @@ func _tcpProcessImpl(
         snd.wnd = segment.window
         let dataLen = segment.payload.totalLength
         if dataLen > 0 {
-            let data: [UInt8]? = segment.payload.withUnsafeReadableBytes {
-                Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
-            }
+            let data: PacketBuffer? = segment.payload
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
             if segment.flags.isFin {
                 rcv.nxt = rcv.nxt &+ 1
@@ -300,11 +294,8 @@ func _tcpProcessImpl(
     case .closeWait:
         snd.wnd = segment.window
         let dataLen = segment.payload.totalLength
-        var data: [UInt8]? = nil
+        let data: PacketBuffer? = dataLen > 0 ? segment.payload : nil
         if dataLen > 0 {
-            data = segment.payload.withUnsafeReadableBytes {
-                Array(UnsafeBufferPointer(start: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: dataLen))
-            }
             rcv.nxt = rcv.nxt &+ UInt32(dataLen)
         }
         // Wait for application to signal close

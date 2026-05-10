@@ -324,18 +324,6 @@ public struct NATTable {
                     conn: entry.connection, flags: [.ack, .psh], payload: data,
                     hostMAC: hostMAC, round: round)
             }
-            if entry.connection.pendingExternalFin {
-                // Server responded — forward FIN now, no need to wait for timeout.
-                entry.connection.pendingExternalFin = false
-                entry.connection.finWaitRounds = 0
-                debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (server responded)\n")
-                shutdown(entry.connection.posixFD, SHUT_WR)
-                if let pw = externalPcap {
-                    captureExternalPacket(pcap: pw, fd: fd, direction: .toExternal,
-                        conn: entry.connection, flags: [.fin, .ack], payload: nil,
-                        hostMAC: hostMAC, round: round)
-                }
-            }
             tcpEntries[key] = entry
         }
 
@@ -445,25 +433,15 @@ public struct NATTable {
         }
 
         // ── Forward pending FIN once externalSendQueue is drained ──
-        // Delay FIN by 5 rounds (500 ms) to give servers time to process the
-        // request and start responding.  Some servers (Cloudflare) abort the
-        // response if the client's FIN arrives too early (<~300 ms after data).
-        // Step 3 forwards FIN immediately when the server responds, so fast
-        // servers are not delayed.  The timeout is only a fallback for servers
-        // that wait for EOF (echo servers).
         if conn.pendingExternalFin, conn.externalSendQueued == 0 {
-            conn.finWaitRounds += 1
-            if conn.finWaitRounds >= 5 {
-                debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort) (timeout, rounds=\(conn.finWaitRounds))\n")
-                shutdown(conn.posixFD, SHUT_WR)
-                if let pw = externalPcap {
-                    captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
-                        conn: conn, flags: [.fin, .ack], payload: nil,
-                        hostMAC: hostMAC, round: round)
-                }
-                conn.pendingExternalFin = false
-                conn.finWaitRounds = 0
+            debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort)\n")
+            shutdown(conn.posixFD, SHUT_WR)
+            if let pw = externalPcap {
+                captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
+                    conn: conn, flags: [.fin, .ack], payload: nil,
+                    hostMAC: hostMAC, round: round)
             }
+            conn.pendingExternalFin = false
         }
     }
 

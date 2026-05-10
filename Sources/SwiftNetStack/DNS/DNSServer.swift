@@ -198,6 +198,9 @@ public struct DNSServer {
     }
 
     /// Process upstream DNS responses already read by Transport.
+    /// Relays the upstream response to the VM with only the transaction ID
+    /// swapped back to the original — the answer records (A, AAAA, CNAME,
+    /// etc.) are forwarded as-is.
     public mutating func processUpstreamReady(
         data rawDatagramReads: [(fd: Int32, data: PacketBuffer)],
         hostMAC: MACAddress,
@@ -210,40 +213,16 @@ public struct DNSServer {
             guard let (rxID, _) = DNSPacket.parseResponse(from: pkt) else { continue }
             guard let pending = pendingQueries.removeValue(forKey: rxID) else { continue }
 
-            let answerIP = DNSPacket.extractFirstA(from: pkt)
-            deliverReply(
-                txID: pending.originalTxID, question: pending.question,
-                answerIP: answerIP, pending: pending,
-                hostMAC: hostMAC, replies: &replies, round: round
-            )
-        }
-    }
-
-    /// Build and append a reply frame for a pending DNS query.
-    private func deliverReply(
-        txID: UInt16,
-        question: DNSQuestion,
-        answerIP: IPv4Address?,
-        pending: PendingQuery,
-        hostMAC: MACAddress,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
-    ) {
-        let payload: PacketBuffer?
-        if let ip = answerIP {
-            payload = DNSPacket.buildAReply(txID: txID, question: question, ip: ip, round: round)
-        } else {
-            payload = DNSPacket.buildNXDOMAIN(txID: txID, question: question, round: round)
-        }
-        guard let replyPayload = payload else { return }
-
-        if let frame = buildUDPFrame(
-            hostMAC: hostMAC, dstMAC: pending.srcMAC,
-            srcIP: pending.dstIP, dstIP: pending.srcIP,
-            srcPort: pending.dstPort, dstPort: pending.srcPort,
-            payload: replyPayload, round: round
-        ) {
-            replies.append((pending.endpointID, frame))
+            guard let relayed = DNSPacket.relayResponse(pkt, originalTxID: pending.originalTxID,
+                                                        round: round) else { continue }
+            if let frame = buildUDPFrame(
+                hostMAC: hostMAC, dstMAC: pending.srcMAC,
+                srcIP: pending.dstIP, dstIP: pending.srcIP,
+                srcPort: pending.dstPort, dstPort: pending.srcPort,
+                payload: relayed, round: round
+            ) {
+                replies.append((pending.endpointID, frame))
+            }
         }
     }
 

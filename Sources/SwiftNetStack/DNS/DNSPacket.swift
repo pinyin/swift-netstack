@@ -197,6 +197,24 @@ public enum DNSPacket {
         }
     }
 
+    /// Relay an upstream DNS response to the VM, replacing only the transaction ID.
+    /// The rest of the response (flags, questions, answers, authority, additional)
+    /// is forwarded as-is. This correctly handles A, AAAA, CNAME, and any other
+    /// record type without needing per-type extraction logic.
+    public static func relayResponse(_ upstreamPkt: PacketBuffer, originalTxID: UInt16,
+                                     round: RoundContext) -> PacketBuffer? {
+        let totalLen = upstreamPkt.totalLength
+        guard totalLen >= 12 else { return nil }
+        var pkt = round.allocate(capacity: totalLen, headroom: 0)
+        guard let ptr = pkt.appendPointer(count: totalLen) else { return nil }
+        upstreamPkt.withUnsafeReadableBytes { buf in
+            guard let base = buf.baseAddress else { return }
+            ptr.copyMemory(from: base, byteCount: totalLen)
+        }
+        writeUInt16BE(originalTxID, to: ptr)
+        return pkt
+    }
+
     /// Extract the first A record (IPv4) from a DNS response.
     /// Walks past the question section and answer header to find RDATA.
     public static func extractFirstA(from payload: PacketBuffer) -> IPv4Address? {

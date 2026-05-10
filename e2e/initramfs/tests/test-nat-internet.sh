@@ -35,40 +35,20 @@ fi
 
 echo "  Guest→Internet: DNS + HTTP fetch..."
 
-# Verify upstream DNS forwarding is working (nslookup uses busybox's own
-# DNS client which sends a plain A query — works reliably through the NAT).
-HTTPBIN_IP=$(nslookup example.com 2>/dev/null | awk '/^Address:/ && !/[#:][0-9]+$/ {print $2; exit}')
-if [ -z "$HTTPBIN_IP" ]; then
-    echo "  DNS cannot resolve internet hostnames"
-    test_fail "nat-http-internet"
-    return 0
-fi
-echo "  DNS OK: example.com -> $HTTPBIN_IP"
-
-# Use printf|nc with explicit Host header for the HTTP request.
-# We pre-resolve the IP with nslookup (above) because wget in this
-# environment uses libc getaddrinfo() which sends AAAA queries that the
-# NAT DNS server does not forward upstream, causing resolution to fail.
-#
-# Unlike the old approach, we include the correct Host header so
-# Cloudflare (and other virtual-hosting servers) return a valid response
-# instead of HTTP 403.
-echo "  HTTP fetch http://$HTTPBIN_IP/ (Host: example.com) ..."
-# The subshell (printf; sleep) keeps stdin open for 1.5s after sending
-# the request.  This gives Cloudflare time to respond before the NAT
-# forwards the VM-side FIN — avoiding the race where Cloudflare aborts
-# if it receives FIN before it starts sending the response.
-HTTP_RESP=$( (printf "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"; sleep 1.5) | nc -w 5 "$HTTPBIN_IP" 80 2>/dev/null)
-HTTP_RC=$?
-if [ $HTTP_RC -eq 0 ] && [ -n "$HTTP_RESP" ]; then
-    if echo "$HTTP_RESP" | grep -q "HTTP/1.[01] [23]"; then
-        echo "  HTTP response: $(echo "$HTTP_RESP" | head -n 1)"
+# wget does its own DNS resolution through libc getaddrinfo().
+# This exercises both A and AAAA query forwarding through the NAT DNS server.
+WGET_ERR=$(wget -q -O /tmp/inet-http-resp.txt "http://example.com/" 2>&1)
+WGET_RC=$?
+if [ $WGET_RC -eq 0 ]; then
+    TCP_RESP=$(wc -c < /tmp/inet-http-resp.txt)
+    echo "  response: $TCP_RESP bytes"
+    if [ "$TCP_RESP" -gt 0 ]; then
         test_pass "nat-http-internet"
     else
-        echo "  unexpected HTTP response: $(echo "$HTTP_RESP" | head -n 1)"
+        echo "  empty response"
         test_fail "nat-http-internet"
     fi
 else
-    echo "  HTTP fetch to $HTTPBIN_IP failed (rc=$HTTP_RC)"
+    echo "  wget to example.com failed (rc=$WGET_RC): $WGET_ERR"
     test_fail "nat-http-internet"
 fi

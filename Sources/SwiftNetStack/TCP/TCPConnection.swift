@@ -50,12 +50,6 @@ struct TCPConnection {
     public var sendAvail: Int { totalQueuedBytes }
     public var sendSpace: Int { max(0, Self.maxQueueBytes - totalQueuedBytes) }
 
-    /// Rounds since VM's FIN was ready to forward.  FIN is delayed by 5
-    /// rounds (500 ms) to give the server time to start responding.  Step 3
-    /// forwards FIN immediately when the server responds; step 5 forwards
-    /// after finWaitRounds >= 5 for servers that wait for EOF (echo fallback).
-    public var finWaitRounds: Int = 0
-
     public init(
         connectionID: UInt64,
         posixFD: Int32,

@@ -1,5 +1,13 @@
 import Darwin
 
+/// Monotonic microseconds clock for timer-based operations.
+/// Uses CLOCK_MONOTONIC for sub-millisecond precision without wall-clock jumps.
+public func monotonicMicros() -> UInt64 {
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return UInt64(ts.tv_sec) * 1_000_000 + UInt64(ts.tv_nsec) / 1_000
+}
+
 /// NAT connection tracker and TCP/UDP proxy.
 ///
 /// Manages proxied connections with TCP/UDP symmetry:
@@ -24,6 +32,7 @@ public struct NATTable {
     /// Optional pcap writer for external socket traffic (synthetic frames).
     /// Set before run() to capture VM↔external data for Wireshark analysis.
     public var externalPcap: PCAPWriter? = nil
+    public var stats: NATStats
 
 #if DEBUG
     /// Current round number — set by processTCPRound, read by debugLog.
@@ -43,8 +52,11 @@ public struct NATTable {
     private var udpListeners: [(fd: Int32, entry: PortForwardEntry)] = []
 
     private var _nextID: UInt64 = 0
+    private let mss: Int
 
-    public init(portForwards: [PortForwardEntry] = []) {
+    public init(portForwards: [PortForwardEntry] = [], mss: Int = 1400) {
+        self.mss = mss
+        self.stats = NATStats()
         tcpEntries.reserveCapacity(maxTCPConnections)
         tcpFdToKey.reserveCapacity(maxTCPConnections)
         udpEntries.reserveCapacity(maxUDPMappings)
@@ -213,6 +225,106 @@ public struct NATTable {
     ///   5. Flush send queues and forward pending FIN immediately when the
     ///      external send queue is drained — FIN is a TCP signal like any
     ///      other; RFC 793 half-close allows the server to continue sending.
+    // MARK: - Delayed ACK (RFC 1122 timer-based coalescing)
+
+    /// Returns the earliest monotonic-µs deadline among all pending delayed ACKs,
+    /// or nil if no delayed ACKs are pending.
+    public func nextDelayedACKDeadline() -> UInt64? {
+        var earliest: UInt64?
+        for entry in tcpEntries.values {
+            guard entry.connection.pendingDelayedACK else { continue }
+            let dl = entry.connection.delayedACKDeadline
+            if earliest == nil || dl < earliest! { earliest = dl }
+        }
+        return earliest
+    }
+
+    /// Build a pure ACK frame, using the pre-built template and incremental
+    /// checksum (RFC 1146) when available.
+    private mutating func buildAckFrame(
+        conn: inout TCPConnection, seq: UInt32, ack: UInt32, window: UInt16, round: RoundContext
+    ) -> PacketBuffer? {
+        var outCK: UInt16 = 0
+        let result: PacketBuffer?
+        if let tmpl = conn.ackTemplate {
+            stats.ackTemplateUsed += 1
+            let incCK: UInt16?
+            if conn.ackChecksumValid && conn.lastACKWindow == window {
+                incCK = computeIncrementalTCPChecksum(
+                    oldCK: conn.lastACKChecksum,
+                    oldSeq: conn.lastACKSeq, newSeq: seq,
+                    oldAck: conn.lastACKAck, newAck: ack
+                )
+                stats.ackChecksumIncremental += 1
+            } else {
+                incCK = nil  // full checksum
+                stats.ackChecksumFull += 1
+            }
+            result = buildTCPAckFrame(template: tmpl, seq: seq, ack: ack,
+                                      srcIP: conn.dstIP, dstIP: conn.vmIP,
+                                      round: round, checksum: incCK, outCK: &outCK)
+#if DEBUG
+            // Verify incremental == full checksum when incremental was used
+            if incCK != nil, result != nil {
+                let fullCK = computeACKFullChecksum(tmpl: tmpl, seq: seq, ack: ack,
+                                                    srcIP: conn.dstIP, dstIP: conn.vmIP)
+                assert(outCK == fullCK,
+                       "Incremental checksum mismatch: inc=\(outCK) full=\(fullCK) oldCK=\(conn.lastACKChecksum) oldSeq=\(conn.lastACKSeq)→\(seq) oldAck=\(conn.lastACKAck)→\(ack)")
+            }
+#endif
+        } else {
+            stats.ackTemplateFallback += 1
+            stats.ackChecksumFull += 1
+            result = buildTCPFrame(
+                hostMAC: conn.hostMAC, dstMAC: conn.vmMAC,
+                srcIP: conn.dstIP, dstIP: conn.vmIP,
+                srcPort: conn.dstPort, dstPort: conn.vmPort,
+                seqNumber: seq, ackNumber: ack,
+                flags: .ack, window: window, payload: nil, round: round
+            )
+        }
+
+        // Update checksum cache for next incremental update
+        if result != nil {
+            conn.lastACKSeq = seq
+            conn.lastACKAck = ack
+            conn.lastACKWindow = window
+            conn.ackChecksumValid = true
+            if conn.ackTemplate != nil {
+                conn.lastACKChecksum = outCK
+            }
+        }
+
+        return result
+    }
+
+    /// Build ACK frames for all connections whose delayed ACK deadline has expired.
+    private mutating func flushExpiredDelayedACKs(
+        hostMAC: MACAddress,
+        replies: inout [(endpointID: Int, packet: PacketBuffer)],
+        round: RoundContext
+    ) {
+        let now = monotonicMicros()
+        for (key, var entry) in tcpEntries {
+            guard entry.connection.pendingDelayedACK else { continue }
+            guard entry.connection.delayedACKDeadline <= now else { continue }
+            var conn = entry.connection
+            if let frame = buildAckFrame(
+                conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
+                window: conn.delayedACKWindow, round: round
+            ) {
+                replies.append((conn.endpointID, frame))
+                stats.ackFlushedTimer += 1
+            }
+            conn.pendingDelayedACK = false
+            entry.connection = conn
+            tcpEntries[key] = entry
+        }
+    }
+
+    // MARK: - TCP Round
+
+    /// Unified TCP processing — all VM↔external work in one method.
     public mutating func processTCPRound(
         vmSegments: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)],
         streamReads: [(fd: Int32, data: PacketBuffer)],
@@ -227,6 +339,9 @@ public struct NATTable {
 #if DEBUG
         debugRound = round.roundNumber
 #endif
+
+        // ── Step 0: Flush expired delayed ACKs ──
+        flushExpiredDelayedACKs(hostMAC: hostMAC, replies: &replies, round: round)
 
         // ── Step 1: Complete non-blocking connects ──
         for fd in streamConnects {
@@ -305,6 +420,13 @@ public struct NATTable {
                 state: conn.state, segment: tcp, snd: &conn.snd, rcv: &conn.rcv, appClose: false
             )
             conn.state = newState
+            if newState == .established && conn.ackTemplate == nil {
+                conn.ackTemplate = makeAckTemplate(
+                    hostMAC: conn.hostMAC, vmMAC: conn.vmMAC,
+                    srcIP: conn.dstIP, dstIP: conn.vmIP,
+                    srcPort: conn.dstPort, dstPort: conn.vmPort, window: 65535
+                )
+            }
             let unaDelta = Int(conn.snd.una &- oldUna)
             if unaDelta > 0 { conn.ackSendBuf(delta: unaDelta) }
             // Resume external reads if backpressure cleared
@@ -332,15 +454,50 @@ public struct NATTable {
                 conn.pendingExternalFin = true
             }
             for seg in toSend {
-                if let frame = buildTCPFrame(
-                    hostMAC: hostMAC, dstMAC: eth.srcMAC,
-                    srcIP: ip.dstAddr, dstIP: ip.srcAddr,
-                    srcPort: tcp.dstPort, dstPort: tcp.srcPort,
-                    seqNumber: seg.seq, ackNumber: seg.ack,
-                    flags: seg.flags, window: seg.window,
-                    payload: nil, round: round
-                ) {
-                    replies.append((ep, frame))
+                // Timer-based delayed ACK: defer pure ACKs to coalesce with
+                // the next outgoing segment or flush on timer expiry (200µs).
+                // When a pending ACK already exists, flush it before storing
+                // the new one — this ensures at most one coalescing (≤2 ACKs
+                // merged), preventing congestion-window starvation in the VM.
+                let isPureACK = seg.flags == .ack
+                if isPureACK {
+                    if conn.pendingDelayedACK {
+                        if let frame = buildAckFrame(
+                            conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
+                            window: conn.delayedACKWindow, round: round
+                        ) {
+                            replies.append((ep, frame))
+                            stats.ackFlushedImmediate += 1
+                        }
+                    }
+                    stats.ackDeferred += 1
+                    conn.pendingDelayedACK = true
+                    conn.delayedACKDeadline = monotonicMicros() + 200
+                    conn.delayedACKSeq = seg.seq
+                    conn.delayedACKAck = seg.ack
+                    conn.delayedACKWindow = seg.window
+                } else {
+                    // Non-ACK segment — flush any pending delayed ACK first
+                    if conn.pendingDelayedACK {
+                        if let frame = buildAckFrame(
+                            conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
+                            window: conn.delayedACKWindow, round: round
+                        ) {
+                            replies.append((ep, frame))
+                            stats.ackFlushedImmediate += 1
+                        }
+                        conn.pendingDelayedACK = false
+                    }
+                    if let frame = buildTCPFrame(
+                        hostMAC: hostMAC, dstMAC: eth.srcMAC,
+                        srcIP: ip.dstAddr, dstIP: ip.srcAddr,
+                        srcPort: tcp.dstPort, dstPort: tcp.srcPort,
+                        seqNumber: seg.seq, ackNumber: seg.ack,
+                        flags: seg.flags, window: seg.window,
+                        payload: nil, round: round
+                    ) {
+                        replies.append((ep, frame))
+                    }
                 }
             }
 
@@ -435,8 +592,6 @@ public struct NATTable {
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
-        let mss = 1400
-
         // ── Drain sendQueue (external→VM) ──
         if conn.totalQueuedBytes > 0 {
             var segCount = 0
@@ -670,7 +825,8 @@ public struct NATTable {
         var conn = TCPConnection(
             connectionID: nextID(), posixFD: newFD, state: .synReceived,
             vmMAC: vmMAC, vmIP: pf.vmIP, vmPort: pf.vmPort,
-            dstIP: externalIP, dstPort: externalPort, endpointID: vmEp
+            dstIP: externalIP, dstPort: externalPort, endpointID: vmEp,
+            hostMAC: hostMAC
         )
         conn.snd.nxt = isn
         conn.snd.una = isn
@@ -776,7 +932,8 @@ public struct NATTable {
         var conn = TCPConnection(
             connectionID: nextID(), posixFD: fd, state: .listen,
             vmMAC: eth.srcMAC, vmIP: key.vmIP, vmPort: key.vmPort,
-            dstIP: key.dstIP, dstPort: key.dstPort, endpointID: endpointID
+            dstIP: key.dstIP, dstPort: key.dstPort, endpointID: endpointID,
+            hostMAC: hostMAC
         )
         conn.externalConnecting = true
 
@@ -819,7 +976,6 @@ public struct NATTable {
         var cleanupFD: Int32 = 0
 
         // Flush sendQueue before sending FIN to VM
-        let mss = 1400
         while conn.totalQueuedBytes > 0 {
             let inFlight = conn.snd.nxt &- conn.snd.una
             var canSend = Int(conn.snd.wnd) - Int(inFlight)

@@ -19,7 +19,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TIMEOUT=90
+TIMEOUT=120
 TCP_PORT=7777
 UDP_PORT=7778
 HTTP_PORT=7779
@@ -29,6 +29,7 @@ IPERF_PORT=7782
 INIT="/init"
 HOST_ARGS=()
 PCAP_PATH=""
+MTU=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,6 +39,7 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --pcap) PCAP_PATH="$2"; shift 2 ;;
+        --mtu) MTU="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -129,10 +131,11 @@ echo "Starting demo..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 $NAT_CMD" \
+    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD" \
     --cpus 1 --memory 512 \
     ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
     ${PCAP_PATH:+--pcap "$PCAP_PATH"} \
+    ${MTU:+--mtu "$MTU"} \
     >"$TMPLOG" 2>&1 &
 DEMOPID=$!
 

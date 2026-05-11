@@ -27,6 +27,9 @@ public struct DeliberationLoop {
     /// Set before calling run() to record traffic for Wireshark/tcpdump analysis.
     public var pcapWriter: PCAPWriter?
 
+    /// Per-phase cumulative CPU time for hotspot analysis.
+    public var phaseTiming = PhaseTiming()
+
     public init(
         endpoints: [VMEndpoint],
         hostMAC: MACAddress,
@@ -40,7 +43,8 @@ public struct DeliberationLoop {
         self.dhcpServer = DHCPServer(endpoints: endpoints)
         self.routingTable = RoutingTable()
         self.socketRegistry = SocketRegistry()
-        self.natTable = NATTable(portForwards: portForwards)
+        let mss = (endpoints.map { $0.mtu }.min() ?? 1500) - 40
+        self.natTable = NATTable(portForwards: portForwards, mss: mss)
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
         self.pcapWriter = pcapWriter
 
@@ -74,7 +78,17 @@ public struct DeliberationLoop {
         var replies: [(endpointID: Int, packet: PacketBuffer)] = []
         var forwardPkts: [(endpointID: Int, packet: PacketBuffer)] = []
 
+        // ── Dynamic poll timeout for delayed ACK coalescing ──
+        let nowUs = monotonicMicros()
+        if let deadline = natTable.nextDelayedACKDeadline() {
+            let deltaUs = deadline > nowUs ? deadline - nowUs : 0
+            transport.pollTimeout = Int32(max(1, Int(deltaUs / 1000)))
+        } else {
+            transport.pollTimeout = 100
+        }
+
         // ── Phase 1: Unified poll — all FDs treated equally ──
+        let tPoll = cpuNanos()
         let result = transport.readPackets(round: round)
 
         // Capture VM→NAT frames for pcap debugging
@@ -83,6 +97,10 @@ public struct DeliberationLoop {
                 pw.write(packet: pkt)
             }
         }
+        phaseTiming.pollRead &+= cpuNanos() - tPoll
+
+        // ── Phase 2-6: Parse ALL headers ──
+        let tParse = cpuNanos()
 
         // ── Phase 2: Parse ALL Ethernet headers ──
         var ethParsed: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
@@ -189,6 +207,10 @@ public struct DeliberationLoop {
 #if DEBUG
         debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed, tcpParsed: tcpParsed, unreachableParsed: unreachableParsed)
 #endif
+        phaseTiming.parse &+= cpuNanos() - tParse
+
+        // ── Phase 7-8: Process ALL ICMP ──
+        let tICMP = cpuNanos()
 
         // ── Phase 7: Process ALL ICMP Echo ──
 #if DEBUG
@@ -225,7 +247,10 @@ public struct DeliberationLoop {
             }
         }
 
+        phaseTiming.icmp &+= cpuNanos() - tICMP
+
         // ── Phase 9: Process ALL UDP ──
+        let tUDP = cpuNanos()
 #if DEBUG
         let udpSnapshot = udpParsed
         let replyCountPreUDP = replies.count
@@ -259,7 +284,10 @@ public struct DeliberationLoop {
         )
 #endif
 
+        phaseTiming.udp &+= cpuNanos() - tUDP
+
         // ── Phase 10: Process ALL DNS ──
+        let tDNS = cpuNanos()
         for (ep, eth, ip, udp) in dnsParsed {
             dnsServer.processQuery(
                 payload: udp.payload,
@@ -274,7 +302,10 @@ public struct DeliberationLoop {
             )
         }
 
+        phaseTiming.dns &+= cpuNanos() - tDNS
+
         // ── Phase 11: Unified TCP processing (VM ↔ external) ──
+        let tTCP = cpuNanos()
         // Handles all TCP work in one method: connect completion, VM segment
         // processing, external reads/hangups, and queue draining.  Eliminates
         // the old 4-phase design and its "manual updated flag" anti-pattern.
@@ -301,7 +332,10 @@ public struct DeliberationLoop {
         )
 #endif
 
+        phaseTiming.tcp &+= cpuNanos() - tTCP
+
         // ── Phase 12: Non-TCP transport results ──
+        let tNATResult = cpuNanos()
         // Handles dead FDs, stream accepts, and UDP reads only.
         // TCP reads/hangups/connects are handled by processTCPRound above.
 #if DEBUG
@@ -319,7 +353,10 @@ public struct DeliberationLoop {
         debugValidateNATPoll(preReplies: replyCountPreNAT, replies: replies)
 #endif
 
+        phaseTiming.natResult &+= cpuNanos() - tNATResult
+
         // ── Phase 13: DNS upstream — expire + process ──
+        let tDNSUp = cpuNanos()
         dnsServer.expireQueries(
             hostMAC: arpMapping.hostMAC,
             replies: &replies,
@@ -331,6 +368,11 @@ public struct DeliberationLoop {
             replies: &replies,
             round: round
         )
+
+        phaseTiming.dnsUpstream &+= cpuNanos() - tDNSUp
+
+        // ── Phase 14-15: Process DHCP + ARP ──
+        let tDHCPARP = cpuNanos()
 
         // ── Phase 14: Process ALL DHCP ──
 #if DEBUG
@@ -373,7 +415,10 @@ public struct DeliberationLoop {
         )
 #endif
 
+        phaseTiming.dhcpArp &+= cpuNanos() - tDHCPARP
+
         // ── Phase 16: Batch write + cleanup ──
+        let tWrite = cpuNanos()
 #if DEBUG
         debugValidateReplies(replies)
         debugValidateReplies(forwardPkts)
@@ -402,6 +447,8 @@ public struct DeliberationLoop {
         if !allOutputs.isEmpty {
             transport.writePackets(allOutputs)
         }
+        phaseTiming.write &+= cpuNanos() - tWrite
+        phaseTiming.totalRounds += 1
         return allOutputs.count
     }
 
@@ -417,6 +464,12 @@ public struct DeliberationLoop {
         while shouldContinue() {
             runOneRound(transport: &transport, roundNumber: roundCount)
             roundCount += 1
+            if roundCount % 1000 == 0 {
+                printStats(round: roundCount, interval: 1000,
+                           transport: transport.stats.snap(),
+                           nat: natTable.stats.snap(),
+                           phase: phaseTiming.snap())
+            }
         }
         return roundCount
     }

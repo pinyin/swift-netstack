@@ -14,6 +14,7 @@ struct TCPConnection {
     public let dstIP: IPv4Address
     public let dstPort: UInt16
     public let endpointID: Int
+    public let hostMAC: MACAddress
 
     /// True when external side has closed its write side (read returned 0).
     public var externalEOF: Bool
@@ -37,6 +38,39 @@ struct TCPConnection {
     /// Whether POLLOUT should be requested for this connection's fd
     /// (only during non-blocking connect).
     public func wantsPOLLOUT() -> Bool { externalConnecting }
+
+    // MARK: - Delayed ACK (RFC 1122 timer-based coalescing)
+
+    /// True when a pure ACK is pending and should be coalesced with the next
+    /// outgoing segment or flushed on timer expiry.
+    public var pendingDelayedACK: Bool = false
+    /// Deadline (monotonic µs) after which this ACK must be sent.
+    public var delayedACKDeadline: UInt64 = 0
+    /// Saved sequence number for the deferred ACK.
+    public var delayedACKSeq: UInt32 = 0
+    /// Saved acknowledgment number for the deferred ACK.
+    public var delayedACKAck: UInt32 = 0
+    /// Saved receive window for the deferred ACK.
+    public var delayedACKWindow: UInt16 = 65535
+
+    // MARK: - ACK frame template (pre-built 54-byte frame)
+
+    /// Pre-built Ethernet+IPv4+TCP header for pure ACK frames.
+    /// Contains all static fields; only seq, ack, and checksum are overwritten at send time.
+    public var ackTemplate: [UInt8]? = nil
+
+    // MARK: - Incremental TCP checksum cache (RFC 1146)
+
+    /// Cached checksum of the last sent pure ACK frame.
+    public var lastACKChecksum: UInt16 = 0
+    /// Sequence number of the last sent pure ACK frame.
+    public var lastACKSeq: UInt32 = 0
+    /// Acknowledgment number of the last sent pure ACK frame.
+    public var lastACKAck: UInt32 = 0
+    /// Receive window of the last sent pure ACK frame.
+    public var lastACKWindow: UInt16 = 0
+    /// True when lastACK{Checksum,Seq,Ack,Window} are valid for incremental update.
+    public var ackChecksumValid: Bool = false
 
     // MARK: - Send queue (external→VM data queued for zero-copy transmission)
 
@@ -63,7 +97,8 @@ struct TCPConnection {
         vmPort: UInt16,
         dstIP: IPv4Address,
         dstPort: UInt16,
-        endpointID: Int
+        endpointID: Int,
+        hostMAC: MACAddress
     ) {
         self.connectionID = connectionID
         self.posixFD = posixFD
@@ -76,6 +111,7 @@ struct TCPConnection {
         self.dstIP = dstIP
         self.dstPort = dstPort
         self.endpointID = endpointID
+        self.hostMAC = hostMAC
         self.externalEOF = false
         self.externalConnecting = false
     }

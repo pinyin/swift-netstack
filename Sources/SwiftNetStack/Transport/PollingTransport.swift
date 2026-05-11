@@ -56,7 +56,8 @@ public struct PollingTransport {
     private var externalFDs: [(fd: Int32, events: Int16, kind: ExternalFDKind)] = []
     private let shutdownFD: Int32?
     private let onShutdown: (() -> Void)?
-    private let pollTimeout: Int32
+    public var pollTimeout: Int32
+    public var stats: TransportStats
 
     public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil, onShutdown: (() -> Void)? = nil, pollTimeout: Int32 = 100) {
         var byFD: [Int32: VMEndpoint] = [:]
@@ -71,6 +72,7 @@ public struct PollingTransport {
         self.shutdownFD = shutdownFD
         self.onShutdown = onShutdown
         self.pollTimeout = pollTimeout
+        self.stats = TransportStats()
     }
 
     // MARK: - External FD registration
@@ -136,7 +138,9 @@ public struct PollingTransport {
         }
 
         // ── Block until activity ──
+        stats.pollCalls += 1
         let rc = Darwin.poll(&pollfds, UInt32(pollfds.count), pollTimeout)
+        if rc == 0 { stats.pollTimeouts += 1 }
         guard rc > 0 else { return result }
 
         // ── Shutdown ──
@@ -191,6 +195,7 @@ public struct PollingTransport {
                     while true {
                         var buf = round.allocate(capacity: 65536, headroom: 0)
                         guard let ptr = buf.appendPointer(count: 65536) else { break }
+                        stats.recvCalls += 1
                         let n = Darwin.recv(fd, ptr, 65536, 0)
                         if n > 0 {
                             buf.trimBack(65536 - n)
@@ -230,6 +235,7 @@ public struct PollingTransport {
                         guard let ptr = buf.appendPointer(count: 65536) else { break }
                         var srcAddr = sockaddr_in()
                         var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                        stats.recvfromCalls += 1
                         let n = withUnsafeMutablePointer(to: &srcAddr) {
                             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                                 Darwin.recvfrom(fd, ptr, 65536, 0, $0, &srcLen)
@@ -280,6 +286,7 @@ public struct PollingTransport {
                 guard let ptr = pkt.appendPointer(count: ep.mtu) else { break }
                 var iov = iovec(iov_base: ptr, iov_len: ep.mtu)
                 var msg = msghdr(msg_name: nil, msg_namelen: 0, msg_iov: &iov, msg_iovlen: 1, msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                stats.recvmsgCalls += 1
                 let n = Darwin.recvmsg(fd, &msg, 0)
                 if n <= 0 { break }
                 if msg.msg_flags & Int32(MSG_TRUNC) != 0 { continue }
@@ -313,13 +320,13 @@ public struct PollingTransport {
 
     /// Send data on a stream (TCP) socket. Returns bytes written or -1.
     @discardableResult
-    public func writeStream(_ data: PacketBuffer, to fd: Int32) -> Int {
+    public mutating func writeStream(_ data: PacketBuffer, to fd: Int32) -> Int {
         sendPacket(data, to: fd, flags: 0)
     }
 
     /// Send a datagram on a UDP socket. Returns bytes written or -1.
     @discardableResult
-    public func writeDatagram(_ data: PacketBuffer, to fd: Int32, addr: sockaddr_in) -> Int {
+    public mutating func writeDatagram(_ data: PacketBuffer, to fd: Int32, addr: sockaddr_in) -> Int {
         var iov = data.iovecs()
         guard !iov.isEmpty else { return 0 }
         var sa = addr
@@ -335,15 +342,17 @@ public struct PollingTransport {
 
     /// Send a datagram on a connected socket (no destination address).
     @discardableResult
-    public func writeDatagram(_ data: PacketBuffer, to fd: Int32) -> Int {
+    public mutating func writeDatagram(_ data: PacketBuffer, to fd: Int32) -> Int {
         sendPacket(data, to: fd, flags: 0)
     }
 
     // MARK: - Internal scatter-gather send
 
-    private func sendPacket(_ pkt: PacketBuffer, to fd: Int32, flags: Int32) -> Int {
+    private mutating func sendPacket(_ pkt: PacketBuffer, to fd: Int32, flags: Int32) -> Int {
         var iov = pkt.iovecs()
         guard !iov.isEmpty else { return 0 }
+        stats.sendmsgCalls += 1
+        stats.sendBytes += UInt64(pkt.totalLength)
         return iov.withUnsafeMutableBufferPointer { iovPtr in
             var msg = msghdr(
                 msg_name: nil, msg_namelen: 0,

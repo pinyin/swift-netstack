@@ -26,6 +26,7 @@ echo ""
 
 ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null || true
+[ -n "$MTU" ] && ip link set eth0 mtu "$MTU" 2>/dev/null || true
 sleep 1
 
 # Initialize shared test state (before sourcing any test scripts)

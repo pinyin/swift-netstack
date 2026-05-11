@@ -135,6 +135,7 @@ struct Args {
     var hosts: [(String, String)] = []
     var upstreamDNS = ""
     var pcapPath = ""
+    var mtu = 1500
 }
 
 func parseArgs() -> Args? {
@@ -154,6 +155,7 @@ func parseArgs() -> Args? {
         case "--subnet":      args.subnet = argv[i + 1]; i += 2
         case "--gateway":     args.gateway = argv[i + 1]; i += 2
         case "--dns":        args.upstreamDNS = argv[i + 1]; i += 2
+        case "--mtu":        args.mtu = Int(argv[i + 1]) ?? 1500; i += 2
         case "--pcap":       args.pcapPath = argv[i + 1]; i += 2
         case "--host":
             let parts = argv[i + 1].split(separator: ":", maxSplits: 1)
@@ -180,12 +182,12 @@ let usage = """
         SwiftNetStackDemo --kernel <path> --initrd <path> [--cmdline \"...\"] \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
                           [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP] \\
-                          [--pcap <path>]
+                          [--mtu N] [--pcap <path>]
       EFI boot:
         SwiftNetStackDemo --disk <path> --efi-store <path> \\
                           [--cpus N] [--memory MB] [--mac MAC] \\
                           [--subnet CIDR] [--gateway IP] [--dns IP] [--host name:IP] \\
-                          [--pcap <path>]
+                          [--mtu N] [--pcap <path>]
 
     Boots a Linux VM with VZFileHandleNetworkDevice networking backed by the
     SwiftNetStack BDP pipeline (ARP, DHCP, DNS, NAT, TCP).
@@ -239,7 +241,7 @@ do {
 }
 
 let (shutdownRead, shutdownWrite) = makeSocketPair()
-let endpoint = VMEndpoint(id: 1, fd: bridgeFd, subnet: subnet, gateway: gatewayIP, mtu: 1500)
+let endpoint = VMEndpoint(id: 1, fd: bridgeFd, subnet: subnet, gateway: gatewayIP, mtu: args.mtu)
 
 let upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
 if !args.upstreamDNS.isEmpty && upstreamDNS == nil {

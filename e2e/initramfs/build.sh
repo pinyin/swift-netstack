@@ -23,6 +23,10 @@ if [ -f "$SCRIPT_DIR/bin/iperf3" ]; then
     cp "$SCRIPT_DIR/bin/iperf3" "$BUILD_DIR/bin/iperf3"
     chmod +x "$BUILD_DIR/bin/iperf3"
 fi
+if [ -f "$SCRIPT_DIR/bin/tcpstress" ]; then
+    cp "$SCRIPT_DIR/bin/tcpstress" "$BUILD_DIR/bin/tcpstress"
+    chmod +x "$BUILD_DIR/bin/tcpstress"
+fi
 
 # Create symlinks for busybox applets
 BUSYBOX_APPLETS=(

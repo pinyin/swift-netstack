@@ -75,10 +75,10 @@ public struct DeliberationLoop {
         let round = RoundContext()
         round.roundNumber = roundNumber
 
-        var replies: [(endpointID: Int, packet: PacketBuffer)] = []
-        var forwardPkts: [(endpointID: Int, packet: PacketBuffer)] = []
+        var totalWritten = 0
 
         // ── Dynamic poll timeout for delayed ACK coalescing ──
+        let nowSec = UInt64(Darwin.time(nil))
         let nowUs = monotonicMicros()
         if let deadline = natTable.nextDelayedACKDeadline() {
             let deltaUs = deadline > nowUs ? deadline - nowUs : 0
@@ -110,9 +110,6 @@ public struct DeliberationLoop {
                 ethParsed.append((ep, pkt, eth))
             }
         }
-#if DEBUG
-        debugValidateEthernetParse(ethParsed)
-#endif
 
         // ── Phase 3: MAC filter + EtherType dispatch + L2 forward ──
         var arpPkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
@@ -128,12 +125,9 @@ public struct DeliberationLoop {
                 @unknown default: break
                 }
             } else if let dstEp = arpMapping.lookupEndpoint(mac: eth.dstMAC), dstEp != ep {
-                forwardPkts.append((dstEp, pkt))
+                totalWritten &+= writeReplies([(dstEp, pkt)], transport: &transport)
             }
         }
-#if DEBUG
-        debugValidateMACFilter(arpPkts: arpPkts, ipv4Pkts: ipv4Pkts, forwardPkts: forwardPkts)
-#endif
 
         // ── Phase 4: Parse ALL IPv4 headers ──
         var ipv4Parsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
@@ -142,9 +136,6 @@ public struct DeliberationLoop {
             guard let ip = IPv4Header.parse(from: eth.payload) else { continue }
             ipv4Parsed.append((ep, eth, ip))
         }
-#if DEBUG
-        debugValidateIPv4Parse(ipv4Parsed)
-#endif
 
         // ── Phase 5: Parse ALL ARP frames ──
         var arpParsed: [(ep: Int, eth: EthernetFrame, arp: ARPFrame)] = []
@@ -154,9 +145,6 @@ public struct DeliberationLoop {
                 arpParsed.append((ep, eth, arp))
             }
         }
-#if DEBUG
-        debugValidateARPParse(arpParsed)
-#endif
 
         // ── Phase 6: Parse ALL transport headers ──
         var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
@@ -204,34 +192,20 @@ public struct DeliberationLoop {
                 unreachableParsed.append((ep, eth, ip))
             }
         }
-#if DEBUG
-        debugValidateTransportParse(icmpParsed: icmpParsed, udpParsed: udpParsed, dhcpParsed: dhcpParsed, tcpParsed: tcpParsed, unreachableParsed: unreachableParsed)
-#endif
         phaseTiming.parse &+= cpuNanos() - tParse
 
         // ── Phase 7-8: Process ALL ICMP ──
         let tICMP = cpuNanos()
 
         // ── Phase 7: Process ALL ICMP Echo ──
-#if DEBUG
-        let icmpSnapshot = icmpParsed
-        let replyCountPreICMP = replies.count
-#endif
         for (ep, eth, ip, icmp) in icmpParsed {
             guard icmp.type == 8, icmp.code == 0 else { continue }
             if let reply = buildICMPEchoReply(
                 hostMAC: arpMapping.hostMAC, eth: eth, ip: ip, icmp: icmp, round: round
             ) {
-                replies.append((ep, reply))
+                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
             }
         }
-#if DEBUG
-        debugValidateICMPPhase(
-            requests: icmpSnapshot,
-            replies: replies[replyCountPreICMP...],
-            hostMAC: arpMapping.hostMAC
-        )
-#endif
 
         // ── Phase 8: Process ALL ICMP Protocol Unreachable ──
         for (ep, eth, ip) in unreachableParsed {
@@ -243,7 +217,7 @@ public struct DeliberationLoop {
                 rawIPPacket: eth.payload,
                 round: round
             ) {
-                replies.append((ep, reply))
+                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
             }
         }
 
@@ -251,11 +225,8 @@ public struct DeliberationLoop {
 
         // ── Phase 9: Process ALL UDP ──
         let tUDP = cpuNanos()
-#if DEBUG
-        let udpSnapshot = udpParsed
-        let replyCountPreUDP = replies.count
-#endif
         for (ep, eth, ip, udp) in udpParsed {
+            var phaseReplies: [(endpointID: Int, packet: PacketBuffer)] = []
             if let socket = socketRegistry.lookup(port: udp.dstPort) {
                 socket.handleDatagram(
                     payload: udp.payload,
@@ -264,7 +235,7 @@ public struct DeliberationLoop {
                     srcMAC: eth.srcMAC,
                     endpointID: ep,
                     hostMAC: arpMapping.hostMAC,
-                    replies: &replies,
+                    replies: &phaseReplies,
                     round: round
                 )
             } else {
@@ -272,22 +243,18 @@ public struct DeliberationLoop {
                     eth: eth, ip: ip, udp: udp, endpointID: ep,
                     hostMAC: arpMapping.hostMAC,
                     transport: &transport,
-                    replies: &replies, round: round
+                    replies: &phaseReplies, round: round,
+                    nowSec: nowSec
                 )
             }
+            totalWritten &+= writeReplies(phaseReplies, transport: &transport)
         }
-#if DEBUG
-        debugValidateUDPPhase(
-            requests: udpSnapshot,
-            replies: replies[replyCountPreUDP...],
-            hostMAC: arpMapping.hostMAC
-        )
-#endif
 
         phaseTiming.udp &+= cpuNanos() - tUDP
 
         // ── Phase 10: Process ALL DNS ──
         let tDNS = cpuNanos()
+        var dnsReplies: [(endpointID: Int, packet: PacketBuffer)] = []
         for (ep, eth, ip, udp) in dnsParsed {
             dnsServer.processQuery(
                 payload: udp.payload,
@@ -297,10 +264,11 @@ public struct DeliberationLoop {
                 endpointID: ep,
                 hostMAC: arpMapping.hostMAC,
                 transport: &transport,
-                replies: &replies,
+                replies: &dnsReplies,
                 round: round
             )
         }
+        totalWritten &+= writeReplies(dnsReplies, transport: &transport)
 
         phaseTiming.dns &+= cpuNanos() - tDNS
 
@@ -309,10 +277,8 @@ public struct DeliberationLoop {
         // Handles all TCP work in one method: connect completion, VM segment
         // processing, external reads/hangups, and queue draining.  Eliminates
         // the old 4-phase design and its "manual updated flag" anti-pattern.
-#if DEBUG
-        let tcpSnapshot = tcpParsed
-        let replyCountPreTCP = replies.count
-#endif
+        var tcpReplies: [(endpointID: Int, packet: PacketBuffer)] = []
+        tcpReplies.reserveCapacity(tcpParsed.count * 2 + result.streamReads.count + result.streamHangup.count)
         natTable.processTCPRound(
             vmSegments: tcpParsed,
             streamReads: result.streamReads,
@@ -321,16 +287,12 @@ public struct DeliberationLoop {
             transport: &transport,
             hostMAC: arpMapping.hostMAC,
             arpMapping: arpMapping,
-            replies: &replies,
-            round: round
+            replies: &tcpReplies,
+            round: round,
+            nowSec: nowSec,
+            nowUs: nowUs
         )
-#if DEBUG
-        debugValidateTCPPhase(
-            requests: tcpSnapshot,
-            replies: replies[replyCountPreTCP...],
-            hostMAC: arpMapping.hostMAC
-        )
-#endif
+        totalWritten &+= writeReplies(tcpReplies, transport: &transport)
 
         phaseTiming.tcp &+= cpuNanos() - tTCP
 
@@ -338,36 +300,36 @@ public struct DeliberationLoop {
         let tNATResult = cpuNanos()
         // Handles dead FDs, stream accepts, and UDP reads only.
         // TCP reads/hangups/connects are handled by processTCPRound above.
-#if DEBUG
-        let replyCountPreNAT = replies.count
-#endif
+        var natReplies: [(endpointID: Int, packet: PacketBuffer)] = []
         natTable.processTransportResult(
             result,
             transport: &transport,
             hostMAC: arpMapping.hostMAC,
             arpMapping: arpMapping,
-            replies: &replies,
+            replies: &natReplies,
             round: round
         )
-#if DEBUG
-        debugValidateNATPoll(preReplies: replyCountPreNAT, replies: replies)
-#endif
+        totalWritten &+= writeReplies(natReplies, transport: &transport)
 
         phaseTiming.natResult &+= cpuNanos() - tNATResult
 
         // ── Phase 13: DNS upstream — expire + process ──
         let tDNSUp = cpuNanos()
+        var dnsUpReplies: [(endpointID: Int, packet: PacketBuffer)] = []
         dnsServer.expireQueries(
             hostMAC: arpMapping.hostMAC,
-            replies: &replies,
+            replies: &dnsUpReplies,
             round: round
         )
+        totalWritten &+= writeReplies(dnsUpReplies, transport: &transport)
+        dnsUpReplies.removeAll(keepingCapacity: true)
         dnsServer.processUpstreamReady(
             data: result.rawDatagramReads,
             hostMAC: arpMapping.hostMAC,
-            replies: &replies,
+            replies: &dnsUpReplies,
             round: round
         )
+        totalWritten &+= writeReplies(dnsUpReplies, transport: &transport)
 
         phaseTiming.dnsUpstream &+= cpuNanos() - tDNSUp
 
@@ -375,10 +337,6 @@ public struct DeliberationLoop {
         let tDHCPARP = cpuNanos()
 
         // ── Phase 14: Process ALL DHCP ──
-#if DEBUG
-        let dhcpSnapshot = dhcpParsed
-        let replyCountPreDHCP = replies.count
-#endif
         for (ep, eth, _, dhcp) in dhcpParsed {
             guard dhcp.op == 1 else { continue }
             if let (frame, targetEp) = dhcpServer.process(
@@ -386,44 +344,20 @@ public struct DeliberationLoop {
                 endpointID: ep, hostMAC: arpMapping.hostMAC,
                 arpMapping: &arpMapping, round: round
             ) {
-                replies.append((targetEp, frame))
+                totalWritten &+= writeReplies([(targetEp, frame)], transport: &transport)
             }
         }
-#if DEBUG
-        debugValidateDHCPPhase(
-            requests: dhcpSnapshot,
-            replies: replies[replyCountPreDHCP...],
-            hostMAC: arpMapping.hostMAC
-        )
-#endif
 
         // ── Phase 15: Process ALL ARP ──
-#if DEBUG
-        let arpSnapshot = arpParsed
-        let replyCountPreARP = replies.count
-#endif
         for (ep, _, arp) in arpParsed {
             if let reply = arpMapping.processARPRequest(arp, round: round) {
-                replies.append((ep, reply))
+                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
             }
         }
-#if DEBUG
-        debugValidateARPPhase(
-            requests: arpSnapshot,
-            replies: replies[replyCountPreARP...],
-            hostMAC: arpMapping.hostMAC
-        )
-#endif
 
         phaseTiming.dhcpArp &+= cpuNanos() - tDHCPARP
 
-        // ── Phase 16: Batch write + cleanup ──
-        let tWrite = cpuNanos()
-#if DEBUG
-        debugValidateReplies(replies)
-        debugValidateReplies(forwardPkts)
-#endif
-
+        // ── Cleanup ──
         ethParsed.removeAll()
         arpPkts.removeAll()
         ipv4Pkts.removeAll()
@@ -437,19 +371,28 @@ public struct DeliberationLoop {
         unreachableParsed.removeAll()
 
         round.endRound()
-
-        let allOutputs = replies + forwardPkts
-        if let pw = pcapWriter {
-            for (_, pkt) in allOutputs {
-                pw.write(packet: pkt)
-            }
-        }
-        if !allOutputs.isEmpty {
-            transport.writePackets(allOutputs)
-        }
-        phaseTiming.write &+= cpuNanos() - tWrite
         phaseTiming.totalRounds += 1
-        return allOutputs.count
+        let wallEnd = monotonicMicros()
+        phaseTiming.wallNanos &+= (wallEnd - nowUs) * 1000
+        return totalWritten
+    }
+
+    // MARK: - Inline write helper
+
+    /// Write packets to the transport immediately and capture to pcap.
+    /// Returns the number of packets written.
+    private mutating func writeReplies(
+        _ packets: [(endpointID: Int, packet: PacketBuffer)],
+        transport: inout PollingTransport
+    ) -> Int {
+        guard !packets.isEmpty else { return 0 }
+        let t = cpuNanos()
+        if let pw = pcapWriter {
+            for (_, pkt) in packets { pw.write(packet: pkt) }
+        }
+        transport.writePackets(packets)
+        phaseTiming.write &+= cpuNanos() - t
+        return packets.count
     }
 
     /// Run the BDP loop continuously until `shouldContinue` returns false.

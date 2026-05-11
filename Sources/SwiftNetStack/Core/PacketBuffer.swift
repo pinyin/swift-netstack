@@ -228,6 +228,7 @@ public struct PacketBuffer {
             _views = other._views
             return
         }
+        _views.reserveCapacity(_views.count + other._views.count)
         for view in other._views where view.length > 0 {
             _views.append(view)
         }

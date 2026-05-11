@@ -92,6 +92,10 @@ public struct PhaseTiming {
     /// Phase 16: Batch write + cleanup
     public var write: UInt64 = 0
 
+    /// Wall-clock nanoseconds across all rounds (monotonic time, not CPU time).
+    /// Used to compute CPU utilization: totalNanos / wallNanos.
+    public var wallNanos: UInt64 = 0
+
     public var totalRounds: UInt64 = 0
 
     /// Total CPU nanoseconds across all phases.
@@ -121,6 +125,13 @@ public struct PhaseTiming {
         self = PhaseTiming()
         return s
     }
+
+    /// CPU utilization percentage (0-100). Returns nil if no wall-clock data.
+    public func utilization() -> Int? {
+        guard wallNanos > 0 else { return nil }
+        let pct = Int(Double(totalNanos) / Double(wallNanos) * 100)
+        return Swift.min(pct, 100)
+    }
 }
 
 // MARK: - printStats
@@ -148,6 +159,9 @@ public func printStats(
         if !phParts.isEmpty {
             let avgUs = total / 1000 / p.totalRounds
             parts.append("cpu[\(phParts.joined(separator: " "))] avg=\(avgUs)us/r")
+                if let util = p.utilization() {
+                    parts.append("util=\(util)%")
+                }
         }
     }
 

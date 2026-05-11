@@ -167,12 +167,13 @@ public struct NATTable {
         hostMAC: MACAddress,
         transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        round: RoundContext,
+        nowSec: UInt64
     ) {
         let key = NATKey(vmIP: ip.srcAddr, vmPort: udp.srcPort, dstIP: ip.dstAddr, dstPort: udp.dstPort, protocol: .udp)
 
         if var mapping = udpEntries[key] {
-            mapping.lastActivity = currentTime()
+            mapping.lastActivity = nowSec
             udpEntries[key] = mapping
             sendUDP(fd: mapping.fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
             return
@@ -302,12 +303,12 @@ public struct NATTable {
     private mutating func flushExpiredDelayedACKs(
         hostMAC: MACAddress,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        round: RoundContext,
+        nowUs: UInt64
     ) {
-        let now = monotonicMicros()
         for (key, var entry) in tcpEntries {
             guard entry.connection.pendingDelayedACK else { continue }
-            guard entry.connection.delayedACKDeadline <= now else { continue }
+            guard entry.connection.delayedACKDeadline <= nowUs else { continue }
             var conn = entry.connection
             if let frame = buildAckFrame(
                 conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
@@ -334,14 +335,16 @@ public struct NATTable {
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        round: RoundContext,
+        nowSec: UInt64,
+        nowUs: UInt64
     ) {
 #if DEBUG
         debugRound = round.roundNumber
 #endif
 
         // ── Step 0: Flush expired delayed ACKs ──
-        flushExpiredDelayedACKs(hostMAC: hostMAC, replies: &replies, round: round)
+        flushExpiredDelayedACKs(hostMAC: hostMAC, replies: &replies, round: round, nowUs: nowUs)
 
         // ── Step 1: Complete non-blocking connects ──
         for fd in streamConnects {
@@ -390,7 +393,7 @@ public struct NATTable {
 
             guard var entry = tcpEntries[key] else { continue }
             var conn = entry.connection
-            entry.lastActivity = currentTime()
+            entry.lastActivity = nowSec
 
             // Check external connect completion (synReceived state)
             if conn.state == .synReceived {
@@ -472,7 +475,7 @@ public struct NATTable {
                     }
                     stats.ackDeferred += 1
                     conn.pendingDelayedACK = true
-                    conn.delayedACKDeadline = monotonicMicros() + 200
+                    conn.delayedACKDeadline = nowUs + 200
                     conn.delayedACKSeq = seg.seq
                     conn.delayedACKAck = seg.ack
                     conn.delayedACKWindow = seg.window
@@ -519,7 +522,7 @@ public struct NATTable {
             if entry.connection.externalEOF { continue }
 
             debugLog("[NAT-TCP-RD] read \(data.totalLength)B external→VM for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-            entry.lastActivity = currentTime()
+            entry.lastActivity = nowSec
             let queued = entry.connection.writeSendBuf(data)
             if queued == 0, !entry.connection.sendQueueBlocked {
                 entry.connection.sendQueueBlocked = true
@@ -541,7 +544,7 @@ public struct NATTable {
             if st == .listen || st == .synReceived {
                 if entry.connection.totalQueuedBytes > 0 {
                     debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort) (data queued in synReceived)\n")
-                    entry.lastActivity = currentTime()
+                    entry.lastActivity = nowSec
                     entry.connection.externalEOF = true
                     entry.connection.pendingExternalFin = false
                     tcpEntries[key] = entry
@@ -555,7 +558,7 @@ public struct NATTable {
             }
             if entry.connection.externalEOF { continue }
             debugLog("[NAT-TCP-HUP] external EOF for \(key.dstIP):\(key.dstPort), state=\(st)\n")
-            entry.lastActivity = currentTime()
+            entry.lastActivity = nowSec
             entry.connection.externalEOF = true
             entry.connection.pendingExternalFin = false
             tcpEntries[key] = entry

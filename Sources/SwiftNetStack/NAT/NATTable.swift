@@ -1065,14 +1065,20 @@ public struct NATTable {
     private mutating func cleanupExpiredUDP(transport: inout PollingTransport) {
         let now = currentTime()
         let timeout: UInt64 = 30
-        for (key, mapping) in udpEntries where now - mapping.lastActivity > timeout {
-            cleanupUDP(fd: mapping.fd, key: key, transport: &transport)
+        let expired = udpEntries.compactMap { (key, mapping) in
+            now - mapping.lastActivity > timeout ? (key, mapping.fd) : nil
+        }
+        for (key, fd) in expired {
+            cleanupUDP(fd: fd, key: key, transport: &transport)
         }
     }
 
     private mutating func cleanupExpiredTCP(transport: inout PollingTransport) {
         let now = currentTime()
         // Idle timeout: 5 minutes for established, 2 minutes for half-open/closed states.
+        // Collect expired keys first — cleanupTCP mutates tcpEntries, which
+        // would invalidate the dictionary iterator and crash at runtime.
+        var expired: [(fd: Int32, key: NATKey)] = []
         for (key, entry) in tcpEntries {
             let age = now - entry.lastActivity
             let tooOld: Bool
@@ -1092,8 +1098,11 @@ public struct NATTable {
             #if DEBUG
                 debugSnapshotEntry(key: key, entry: entry, reason: reason)
             #endif
-                cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
+                expired.append((entry.connection.posixFD, key))
             }
+        }
+        for (fd, key) in expired {
+            cleanupTCP(fd: fd, key: key, transport: &transport)
         }
     }
 

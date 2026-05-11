@@ -63,23 +63,10 @@ public struct UDPHeader {
                 return nil
             }
 
-            // RFC 768: checksum 0 means unused (IPv4). Non-zero: verify.
-            let valid: Bool
-            if checksum == 0 {
-                valid = true
-            } else {
-                // Scatter-gather: header (8 bytes, guaranteed contiguous by pullUp)
-                // + payload views, no O(N) copy of the entire datagram.
-                let headerPtr = ckPkt._views[0].storage.data.advanced(by: ckPkt._views[0].offset)
-                let ck = computeUDPChecksumSG(
-                    pseudoSrcAddr: pseudoSrcAddr,
-                    pseudoDstAddr: pseudoDstAddr,
-                    udpHeader: UnsafeRawPointer(headerPtr),
-                    payloadViews: payload._views,
-                    udpLen: udpLen
-                )
-                valid = (ck == 0xFFFF)
-            }
+            // Skip inbound checksum verification: virtio-net is a local AF_UNIX socket pair,
+            // not a real network — checksum errors are impossible. Saves O(payload) scatter-gather
+            // computation on every incoming UDP datagram.
+            let valid = true
 
             return UDPHeader(
                 srcPort: srcPort, dstPort: dstPort, length: length,

@@ -136,39 +136,44 @@ public struct PacketBuffer {
     /// If shared, allocates a new Storage and copies the data.
     private mutating func makeFirstUnique() {
         guard !_views.isEmpty else { return }
-        // Remove first to drop our array reference, so isKnownUniquelyReferenced
-        // checks the true external reference count rather than always seeing ≥2
-        // (the array + the local copy).
         var v = _views.removeFirst()
         guard !isKnownUniquelyReferenced(&v.storage) else {
             _views.insert(v, at: 0)
             return
         }
-        // COW: clone the first view's data
+        // COW: clone the first view's data, then recycle the old shared Storage.
         let pool = ChunkPools.select(minCapacity: v.storage.capacity)
         let newStorage = pool.acquire()
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
         _views.insert(View(storage: newStorage, offset: v.offset, length: v.length), at: 0)
+        // v.storage was shared before our _views reference was dropped above.
+        // After _views.insert, we no longer hold any reference via _views.
+        // If v.storage is now uniquely referenced, recycle it before v goes out of scope.
+        if isKnownUniquelyReferenced(&v.storage) {
+            ChunkPools.poolFor(chunkCapacity: v.storage.capacity).release(v.storage)
+        }
     }
 
     /// Ensure the last view's Storage is uniquely owned before modification.
     private mutating func makeLastUnique() {
         guard !_views.isEmpty else { return }
-        // Remove last to drop array reference before checking uniqueness.
         var v = _views.removeLast()
         guard !isKnownUniquelyReferenced(&v.storage) else {
             _views.append(v)
             return
         }
-        // COW: clone the last view's data
+        // COW: clone the last view's data, then recycle the old shared Storage.
         let pool = ChunkPools.select(minCapacity: v.storage.capacity)
         let newStorage = pool.acquire()
         if v.length > 0 {
             newStorage.data.copyMemory(from: v.storage.data.advanced(by: v.offset), byteCount: v.length)
         }
         _views.append(View(storage: newStorage, offset: v.offset, length: v.length))
+        if isKnownUniquelyReferenced(&v.storage) {
+            ChunkPools.poolFor(chunkCapacity: v.storage.capacity).release(v.storage)
+        }
     }
 
     /// Reserve `count` bytes in headroom and return a write pointer.
@@ -193,6 +198,7 @@ public struct PacketBuffer {
     }
 
     /// Remove `count` bytes from the front of the buffer (zero-copy).
+    /// Returns fully-consumed Storage chunks to their pool instead of letting ARC free them.
     public mutating func trimFront(_ count: Int) {
         guard count > 0 else { return }
         precondition(count <= totalLength)
@@ -200,7 +206,12 @@ public struct PacketBuffer {
         while remaining > 0, !_views.isEmpty {
             if remaining >= _views[0].length {
                 remaining -= _views[0].length
+                var removedStorage = _views[0].storage
                 _views.removeFirst()
+                // If this was the last reference, return to pool instead of freeing.
+                if isKnownUniquelyReferenced(&removedStorage) {
+                    ChunkPools.poolFor(chunkCapacity: removedStorage.capacity).release(removedStorage)
+                }
             } else {
                 _views[0].offset += remaining
                 _views[0].length -= remaining
@@ -244,6 +255,7 @@ public struct PacketBuffer {
         // Copy count bytes from successive views
         var remaining = count
         var newViews: [View] = []
+        var consumedStorages: [Storage] = []  // fully consumed views → may be recyclable
         var viewIndex = 0
 
         for i in 0..<_views.count {
@@ -263,6 +275,9 @@ public struct PacketBuffer {
                     storage: _views[i].storage,
                     offset: _views[i].offset + take,
                     length: _views[i].length - take))
+            } else {
+                // Fully consumed: track Storage for potential recycling
+                consumedStorages.append(_views[i].storage)
             }
             viewIndex = i + 1
         }
@@ -275,10 +290,21 @@ public struct PacketBuffer {
         // Prepend the merged contiguous view
         newViews.insert(View(storage: newStorage, offset: 0, length: count), at: 0)
         _views = newViews
+
+        // Recycle fully consumed Storage chunks that are now unreferenced.
+        // The old _views array held references; after replacing with newViews,
+        // consumed Storages may have dropped to refcount 0.
+        for var s in consumedStorages {
+            if isKnownUniquelyReferenced(&s) {
+                ChunkPools.poolFor(chunkCapacity: s.capacity).release(s)
+            }
+        }
+
         return true
     }
 
     /// Remove `count` bytes from the back of the buffer (zero-copy).
+    /// Returns fully-consumed Storage chunks to their pool instead of letting ARC free them.
     public mutating func trimBack(_ count: Int) {
         guard count > 0 else { return }
         precondition(count <= totalLength)
@@ -287,7 +313,11 @@ public struct PacketBuffer {
             let lastIdx = _views.count - 1
             if remaining >= _views[lastIdx].length {
                 remaining -= _views[lastIdx].length
+                var removedStorage = _views[lastIdx].storage
                 _views.removeLast()
+                if isKnownUniquelyReferenced(&removedStorage) {
+                    ChunkPools.poolFor(chunkCapacity: removedStorage.capacity).release(removedStorage)
+                }
             } else {
                 _views[lastIdx].length -= remaining
                 remaining = 0

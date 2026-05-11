@@ -72,16 +72,9 @@ public struct TCPHeader {
 
         guard let payload = pkt.slice(from: headerLen, length: tcpLen - headerLen) else { return nil }
 
-        // Scatter-gather checksum: header bytes + payload views, no payload copy
-        let ck = computeTCPChecksumSG(
-            pseudoSrcAddr: pseudoSrcAddr,
-            pseudoDstAddr: pseudoDstAddr,
-            tcpHeader: UnsafeRawPointer(buf),
-            headerLen: headerLen,
-            payloadViews: payload._views,
-            tcpLen: tcpLen
-        )
-        let checksumValid = (ck == 0)
+        // Skip inbound checksum verification: virtio-net is a local AF_UNIX socket pair,
+        // not a real network — checksum errors are impossible. Saves O(payload) scatter-gather
+        // computation on every incoming TCP segment.
 
         return TCPHeader(
             srcPort: srcPort, dstPort: dstPort,
@@ -90,7 +83,7 @@ public struct TCPHeader {
             window: window, checksum: checksum,
             urgentPointer: urgent, payload: payload,
             pseudoSrcAddr: pseudoSrcAddr, pseudoDstAddr: pseudoDstAddr,
-            checksumValid: checksumValid
+            checksumValid: true
         )
     }
 

@@ -19,10 +19,12 @@ public final class ChunkPool {
     }
 
     public func release(_ s: Storage) {
+        guard freeList.count < 256 else {
+            // Pool is full; let ARC dealloc the Storage normally.
+            // 256 × chunkSize per pool is the ceiling (e.g. 256 × 64KB = 16MB for pool64K).
+            return
+        }
         #if DEBUG
-        // Fill with sentinel to expose stale-data bugs (e.g. checksum over
-        // uninitialized fields). Any consumer that forgets to overwrite a
-        // field will see 0xCC instead of accidentally-correct zeroes.
         s.data.initializeMemory(as: UInt8.self, repeating: 0xCC, count: s.capacity)
         #endif
         freeList.append(s)

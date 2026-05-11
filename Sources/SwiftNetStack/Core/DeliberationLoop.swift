@@ -43,6 +43,10 @@ public struct DeliberationLoop {
         self.natTable = NATTable(portForwards: portForwards)
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
         self.pcapWriter = pcapWriter
+
+#if DEBUG
+        debugRunTCPFSMTests()
+#endif
     }
 
     // MARK: - Dynamic port forwarding
@@ -59,15 +63,11 @@ public struct DeliberationLoop {
 
     // MARK: - Main loop
 
-    /// Execute one BDP deliberation round (14 phases).
+    /// Execute one BDP deliberation round (16 phases).
     ///
     /// Returns the number of packets written to the transport.
     @discardableResult
     public mutating func runOneRound(transport: inout PollingTransport, roundNumber: UInt64) -> Int {
-#if DEBUG
-        debugRunTCPFSMTests()
-#endif
-
         let round = RoundContext()
         round.roundNumber = roundNumber
 
@@ -246,7 +246,7 @@ public struct DeliberationLoop {
         )
 #endif
 
-        // ── Phase 9a: Process ALL DNS ──
+        // ── Phase 10: Process ALL DNS ──
         for (ep, eth, ip, udp) in dnsParsed {
             dnsServer.processQuery(
                 payload: udp.payload,
@@ -261,7 +261,7 @@ public struct DeliberationLoop {
             )
         }
 
-        // ── Phase 10: Unified TCP processing (VM ↔ external) ──
+        // ── Phase 11: Unified TCP processing (VM ↔ external) ──
         // Handles all TCP work in one method: connect completion, VM segment
         // processing, external reads/hangups, and queue draining.  Eliminates
         // the old 4-phase design and its "manual updated flag" anti-pattern.
@@ -278,8 +278,7 @@ public struct DeliberationLoop {
             hostMAC: arpMapping.hostMAC,
             arpMapping: arpMapping,
             replies: &replies,
-            round: round,
-            externalPcap: pcapWriter
+            round: round
         )
 #if DEBUG
         debugValidateTCPPhase(
@@ -289,7 +288,7 @@ public struct DeliberationLoop {
         )
 #endif
 
-        // ── Phase 10.6: NAT process non-TCP transport results ──
+        // ── Phase 12: Non-TCP transport results ──
         // Handles dead FDs, stream accepts, and UDP reads only.
         // TCP reads/hangups/connects are handled by processTCPRound above.
 #if DEBUG
@@ -307,7 +306,7 @@ public struct DeliberationLoop {
         debugValidateNATPoll(preReplies: replyCountPreNAT, replies: replies)
 #endif
 
-        // ── Phase 11a: DNS upstream — expire + process ──
+        // ── Phase 13: DNS upstream — expire + process ──
         dnsServer.expireQueries(
             hostMAC: arpMapping.hostMAC,
             replies: &replies,
@@ -320,7 +319,7 @@ public struct DeliberationLoop {
             round: round
         )
 
-        // ── Phase 12: Process ALL DHCP ──
+        // ── Phase 14: Process ALL DHCP ──
 #if DEBUG
         let dhcpSnapshot = dhcpParsed
         let replyCountPreDHCP = replies.count
@@ -343,7 +342,7 @@ public struct DeliberationLoop {
         )
 #endif
 
-        // ── Phase 13: Process ALL ARP ──
+        // ── Phase 15: Process ALL ARP ──
 #if DEBUG
         let arpSnapshot = arpParsed
         let replyCountPreARP = replies.count
@@ -361,7 +360,7 @@ public struct DeliberationLoop {
         )
 #endif
 
-        // ── Phase 14: Batch write + cleanup ──
+        // ── Phase 16: Batch write + cleanup ──
 #if DEBUG
         debugValidateReplies(replies)
         debugValidateReplies(forwardPkts)
@@ -400,6 +399,7 @@ public struct DeliberationLoop {
     public mutating func run(transport: inout PollingTransport, while shouldContinue: () -> Bool) -> UInt64 {
         natTable.syncExternalFDs(with: &transport)
         dnsServer.registerUpstreamFD(with: &transport)
+        natTable.externalPcap = pcapWriter
         var roundCount: UInt64 = 0
         while shouldContinue() {
             runOneRound(transport: &transport, roundNumber: roundCount)

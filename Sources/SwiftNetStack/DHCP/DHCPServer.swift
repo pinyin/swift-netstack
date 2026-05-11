@@ -267,44 +267,12 @@ public struct DHCPServer {
         dhcpPayload: PacketBuffer,
         round: RoundContext
     ) -> PacketBuffer? {
-        let dhcpLen = dhcpPayload.totalLength
-        let udpLen = udpHeaderLen + dhcpLen
-        let ipTotalLen = ipv4HeaderLen + udpLen
-        let frameLen = ethHeaderLen + ipTotalLen
-
-        var pkt = round.allocate(capacity: frameLen, headroom: 0)
-        guard let ptr = pkt.appendPointer(count: frameLen) else { return nil }
-
-        // ── Ethernet header ──
-        clientMAC.write(to: ptr)                                   // dst = client
-        hostMAC.write(to: ptr.advanced(by: 6))                     // src = host
-        writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
-
-        // ── IPv4 header (offset 14) ──
-        let ipPtr = ptr.advanced(by: ethHeaderLen)
-        writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
-                        srcIP: gatewayIP, dstIP: yiaddr)
-
-        // ── UDP header (offset 34) ──
-        let udpPtr = ptr.advanced(by: ethHeaderLen + ipv4HeaderLen)
-        writeUInt16BE(67, to: udpPtr)                              // src port = 67
-        writeUInt16BE(68, to: udpPtr.advanced(by: 2))              // dst port = 68
-        writeUInt16BE(UInt16(udpLen), to: udpPtr.advanced(by: 4))
-        writeUInt16BE(0, to: udpPtr.advanced(by: 6))               // checksum placeholder
-
-        // ── DHCP payload (offset 42) ──
-        dhcpPayload.withUnsafeReadableBytes { buf in
-            udpPtr.advanced(by: udpHeaderLen).copyMemory(from: buf.baseAddress!, byteCount: dhcpLen)
-        }
-
-        // ── UDP checksum (RFC 768) ──
-        let udpCksum = computeUDPChecksum(
-            pseudoSrcAddr: gatewayIP, pseudoDstAddr: yiaddr,
-            udpData: udpPtr, udpLen: udpLen
+        buildUDPFrame(
+            hostMAC: hostMAC, dstMAC: clientMAC,
+            srcIP: gatewayIP, dstIP: yiaddr,
+            srcPort: 67, dstPort: 68,
+            payload: dhcpPayload, round: round
         )
-        writeUInt16BE(udpCksum, to: udpPtr.advanced(by: 6))
-
-        return pkt
     }
 }
 

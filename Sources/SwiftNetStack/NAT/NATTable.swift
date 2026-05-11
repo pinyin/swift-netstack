@@ -3,9 +3,9 @@ import Darwin
 /// NAT connection tracker and TCP/UDP proxy.
 ///
 /// Manages proxied connections with TCP/UDP symmetry:
-/// - **processTCPRound** (Phase 10): all VM↔external TCP work in one method
+/// - **processTCPRound** (Phase 11): all VM↔external TCP work in one method
 /// - **processUDP** (Phase 9):  VM→external UDP via per-mapping sockets
-/// - **processTransportResult** (Phase 10.6): external→VM for UDP, dead FDs, new accepts
+/// - **processTransportResult** (Phase 12): external→VM for UDP, dead FDs, new accepts
 ///
 /// Each NAT entry (TCP connection or UDP mapping) owns exactly one POSIX fd,
 /// making the fd→key reverse lookup trivial and symmetric across protocols.
@@ -13,6 +13,13 @@ public struct NATTable {
     // Connection limits
     private let maxTCPConnections: Int = 256
     private let maxUDPMappings: Int = 256
+
+    /// Skip cleanup scanning if last scan was less than 1 second ago.
+    private var lastCleanupTime: UInt64 = 0
+
+    /// Optional pcap writer for external socket traffic (synthetic frames).
+    /// Set before run() to capture VM↔external data for Wireshark analysis.
+    public var externalPcap: PCAPWriter? = nil
 
 #if DEBUG
     /// Current round number — set by processTCPRound, read by debugLog.
@@ -180,7 +187,7 @@ public struct NATTable {
         sendUDP(fd: fd, data: udp.payload, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
     }
 
-    // MARK: - Phase 10: Unified TCP processing (VM ↔ external)
+    // MARK: - Phase 11: Unified TCP processing (VM ↔ external)
 
     /// All VM↔external TCP processing for one BDP round.
     ///
@@ -189,10 +196,10 @@ public struct NATTable {
     /// track updated flag, write back" pattern that caused bugs.
     ///
     /// Internal ordering:
-    ///   1. Complete non-blocking connects (was pollTCPWritable, Phase 10.6)
-    ///   2. Process VM→external segments (was processTCP, Phase 10)
-    ///   3. Process external→VM reads   (was pollTCPReadable, Phase 10.6)
-    ///   4. Handle external hangups     (was handleStreamHangup, Phase 10.6)
+    ///   1. Complete non-blocking connects
+    ///   2. Process VM→external segments
+    ///   3. Process external→VM reads
+    ///   4. Handle external hangups
     ///   5. Flush send queues and forward pending FIN immediately when the
     ///      external send queue is drained — FIN is a TCP signal like any
     ///      other; RFC 793 half-close allows the server to continue sending.
@@ -205,8 +212,7 @@ public struct NATTable {
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext,
-        externalPcap: PCAPWriter? = nil
+        round: RoundContext
     ) {
 #if DEBUG
         debugRound = round.roundNumber
@@ -350,7 +356,7 @@ public struct NATTable {
                 entry.connection.sendQueueBlocked = true
                 transport.setFDEvents(fd, events: 0)  // pause reads until queue drains
             }
-            if let pw = externalPcap, queued > 0 {
+            if let pw = self.externalPcap, queued > 0 {
                 captureExternalPacket(pcap: pw, fd: fd, direction: .fromExternal,
                     conn: entry.connection, flags: [.ack, .psh], payload: data,
                     hostMAC: hostMAC, round: round)
@@ -394,8 +400,7 @@ public struct NATTable {
                   || conn.state == .lastAck else { continue }
 
             flushOneConnection(key: key, conn: &conn, hostMAC: hostMAC,
-                               transport: &transport, replies: &replies, round: round,
-                               externalPcap: externalPcap)
+                               transport: &transport, replies: &replies, round: round)
             entry.connection = conn
             tcpEntries[key] = entry
         }
@@ -411,8 +416,7 @@ public struct NATTable {
         hostMAC: MACAddress,
         transport: inout PollingTransport,
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext,
-        externalPcap: PCAPWriter? = nil
+        round: RoundContext
     ) {
         let mss = 1400
 
@@ -459,7 +463,7 @@ public struct NATTable {
             }
             if written == 0 { break }
             debugLog("[NAT-TCP-EXT] flushed \(written)B to \(key.dstIP):\(key.dstPort)\n")
-            if let pw = externalPcap, let payload = chunk.slice(from: 0, length: written) {
+            if let pw = self.externalPcap, let payload = chunk.slice(from: 0, length: written) {
                 captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
                     conn: conn, flags: [.ack, .psh], payload: payload,
                     hostMAC: hostMAC, round: round)
@@ -471,7 +475,7 @@ public struct NATTable {
         if conn.pendingExternalFin, conn.externalSendQueued == 0 {
             debugLog("[NAT-TCP-FIN] forwarding FIN to \(key.dstIP):\(key.dstPort)\n")
             shutdown(conn.posixFD, SHUT_WR)
-            if let pw = externalPcap {
+            if let pw = self.externalPcap {
                 captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
                     conn: conn, flags: [.fin, .ack], payload: nil,
                     hostMAC: hostMAC, round: round)
@@ -528,25 +532,23 @@ public struct NATTable {
         let srcPort: UInt16
         let dstIP: IPv4Address
         let dstPort: UInt16
-        let seq: UInt32
-        let ack: UInt32
 
         switch direction {
         case .toExternal:
             srcIP = hostIP; srcPort = hostPort
             dstIP = serverIP; dstPort = serverPort
-            seq = conn.snd.nxt; ack = conn.rcv.nxt
         case .fromExternal:
             srcIP = serverIP; srcPort = serverPort
             dstIP = hostIP; dstPort = hostPort
-            seq = conn.rcv.nxt; ack = conn.snd.nxt
         }
 
+        // Synthetic frames use seq=0 ack=0 — the real TCP sequence numbers
+        // belong to the kernel's POSIX socket, not the NAT's FSM.
         if let frame = buildTCPFrame(
-            hostMAC: hostMAC, dstMAC: hostMAC,  // synthetic Ethernet — real traffic is on wire
+            hostMAC: hostMAC, dstMAC: hostMAC,
             srcIP: srcIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: dstPort,
-            seqNumber: seq, ackNumber: ack,
+            seqNumber: 0, ackNumber: 0,
             flags: flags, window: 65535,
             payload: payload, round: round
         ) {
@@ -559,10 +561,10 @@ public struct NATTable {
         case fromExternal
     }
 
-    // MARK: - Phase 10.6: Non-TCP transport result processing
+    // MARK: - Phase 12: Non-TCP transport result processing
 
     /// Handle dead FDs, new accepts, and UDP reads from the transport result.
-    /// TCP reads, hangups, and connects are handled by processTCPRound (Phase 10).
+    /// TCP reads, hangups, and connects are handled by processTCPRound (Phase 11).
     public mutating func processTransportResult(
         _ result: TransportResult,
         transport: inout PollingTransport,
@@ -571,8 +573,12 @@ public struct NATTable {
         replies: inout [(endpointID: Int, packet: PacketBuffer)],
         round: RoundContext
     ) {
-        cleanupExpiredUDP(transport: &transport)
-        cleanupExpiredTCP(transport: &transport)
+        let now = currentTime()
+        if now - lastCleanupTime >= 1 {
+            cleanupExpiredUDP(transport: &transport)
+            cleanupExpiredTCP(transport: &transport)
+            lastCleanupTime = now
+        }
 
         // Dead FDs → cleanup
         for fd in result.deadFDs {

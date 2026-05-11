@@ -46,8 +46,59 @@ struct VMConfig {
     let mac: String
 }
 
-func buildVM(_ cfg: VMConfig) throws -> (VZVirtualMachine, Int32) {
-    let (vzFd, bridgeFd) = makeSocketPair()
+func buildVM(_ cfg: VMConfig, externalNetSocket: String = "") throws -> (VZVirtualMachine, Int32?) {
+    let vzFd: Int32
+    let bridgeFd: Int32?
+
+    if !externalNetSocket.isEmpty {
+        // Connect VM network directly to external gvproxy via unixgram socket.
+        let fd = socket(AF_UNIX, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            throw NSError(domain: "SwiftNetStackDemo", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "socket(AF_UNIX, SOCK_DGRAM): \(String(cString: strerror(errno)))"])
+        }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        externalNetSocket.withCString { ptr in
+            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+                buf.baseAddress!.copyMemory(from: UnsafeRawPointer(ptr), byteCount: strlen(ptr) + 1)
+            }
+        }
+        // Bind a local address so the server can send replies back
+        let localPath = "/tmp/gvproxy-demo-\(getpid()).sock"
+        _ = Darwin.unlink(localPath)
+        var localAddr = sockaddr_un()
+        localAddr.sun_family = sa_family_t(AF_UNIX)
+        localPath.withCString { ptr in
+            withUnsafeMutableBytes(of: &localAddr.sun_path) { buf in
+                buf.baseAddress!.copyMemory(from: UnsafeRawPointer(ptr), byteCount: strlen(ptr) + 1)
+            }
+        }
+        let localLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        guard withUnsafePointer(to: &localAddr, { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, localLen) }
+        }) >= 0 else {
+            close(fd)
+            throw NSError(domain: "SwiftNetStackDemo", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "bind: \(String(cString: strerror(errno)))"])
+        }
+        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        guard withUnsafePointer(to: &addr, { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, addrLen) }
+        }) >= 0 else {
+            close(fd)
+            throw NSError(domain: "SwiftNetStackDemo", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "connect to \(externalNetSocket): \(String(cString: strerror(errno)))"])
+        }
+        vzFd = fd
+        bridgeFd = nil
+        log("VM network attached to external gvproxy: \(externalNetSocket)")
+    } else {
+        let pair = makeSocketPair()
+        vzFd = pair.0
+        bridgeFd = pair.1
+    }
+
     let vzFH = FileHandle(fileDescriptor: vzFd, closeOnDealloc: false)
     let netAttachment = VZFileHandleNetworkDeviceAttachment(fileHandle: vzFH)
     let netDevice = VZVirtioNetworkDeviceConfiguration()
@@ -136,6 +187,7 @@ struct Args {
     var upstreamDNS = ""
     var pcapPath = ""
     var mtu = 1500
+    var externalNetSocket = ""
 }
 
 func parseArgs() -> Args? {
@@ -157,6 +209,7 @@ func parseArgs() -> Args? {
         case "--dns":        args.upstreamDNS = argv[i + 1]; i += 2
         case "--mtu":        args.mtu = Int(argv[i + 1]) ?? 1500; i += 2
         case "--pcap":       args.pcapPath = argv[i + 1]; i += 2
+        case "--external-net": args.externalNetSocket = argv[i + 1]; i += 2
         case "--host":
             let parts = argv[i + 1].split(separator: ":", maxSplits: 1)
             if parts.count == 2 {
@@ -231,52 +284,59 @@ if !hosts.isEmpty {
     log("SwiftNetStackDemo: hosts=\(hosts.map { "\($0.key)→\($0.value)" }.joined(separator: ", "))")
 }
 
-let (vm, bridgeFd): (VZVirtualMachine, Int32)
+let (vm, bridgeFd): (VZVirtualMachine, Int32?)
 do {
     (vm, bridgeFd) = try buildVM(VMConfig(
         boot: bootMode, cpus: args.cpus, memory: args.memory, mac: args.mac
-    ))
+    ), externalNetSocket: args.externalNetSocket)
 } catch {
     die("build VM: \(error)")
 }
 
+let externalNet = !args.externalNetSocket.isEmpty
 let (shutdownRead, shutdownWrite) = makeSocketPair()
-let endpoint = VMEndpoint(id: 1, fd: bridgeFd, subnet: subnet, gateway: gatewayIP, mtu: args.mtu)
 
-let upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
-if !args.upstreamDNS.isEmpty && upstreamDNS == nil {
-    log("WARNING: invalid upstream DNS address: \(args.upstreamDNS), DNS forwarding disabled")
-}
+if !externalNet {
+    // Internal BDP pipeline mode
+    guard let fd = bridgeFd else { die("internal error: no bridge fd") }
+    let endpoint = VMEndpoint(id: 1, fd: fd, subnet: subnet, gateway: gatewayIP, mtu: args.mtu)
 
-// Start the BDP pipeline on a dedicated background queue.
-let bdpQueue = DispatchQueue(label: "bdp.loop", qos: .userInitiated)
-bdpQueue.async {
-    var shutdown = false
-    var transport = PollingTransport(
-        endpoints: [endpoint],
-        shutdownFD: shutdownRead,
-        onShutdown: { shutdown = true },
-        pollTimeout: 100
-    )
-    var loop = DeliberationLoop(
-        endpoints: [endpoint],
-        hostMAC: hostMAC,
-        hosts: hosts,
-        upstreamDNS: upstreamDNS
-    )
-
-    if !args.pcapPath.isEmpty {
-        let pw = PCAPWriter()
-        if pw.start(path: args.pcapPath) {
-            loop.pcapWriter = pw
-            log("PCAP capture enabled: \(args.pcapPath)")
-        } else {
-            log("WARNING: failed to open pcap file: \(args.pcapPath)")
-        }
+    let upstreamDNS: IPv4Address? = args.upstreamDNS.isEmpty ? nil : parseIPv4(args.upstreamDNS)
+    if !args.upstreamDNS.isEmpty && upstreamDNS == nil {
+        log("WARNING: invalid upstream DNS address: \(args.upstreamDNS), DNS forwarding disabled")
     }
 
-    let rounds = loop.run(transport: &transport, while: { !shutdown })
-    log("BDP loop exited: rounds=\(rounds)")
+    let bdpQueue = DispatchQueue(label: "bdp.loop", qos: .userInitiated)
+    bdpQueue.async {
+        var shutdown = false
+        var transport = PollingTransport(
+            endpoints: [endpoint],
+            shutdownFD: shutdownRead,
+            onShutdown: { shutdown = true },
+            pollTimeout: 100
+        )
+        var loop = DeliberationLoop(
+            endpoints: [endpoint],
+            hostMAC: hostMAC,
+            hosts: hosts,
+            upstreamDNS: upstreamDNS
+        )
+
+        if !args.pcapPath.isEmpty {
+            let pw = PCAPWriter()
+            if pw.start(path: args.pcapPath) {
+                loop.pcapWriter = pw
+                log("PCAP capture enabled: \(args.pcapPath)")
+            } else {
+                log("WARNING: failed to open pcap file: \(args.pcapPath)")
+            }
+        }
+
+        let rounds = loop.run(transport: &transport, while: { !shutdown })
+        log("BDP loop exited: rounds=\(rounds)")
+    }
+} else {
+    log("External networking mode: gvproxy at \(args.externalNetSocket), BDP loop disabled")
 }
 
 // VM lifecycle — write shutdown signal on stop, drain the main run loop
@@ -305,6 +365,6 @@ CFRunLoopRun()
 
 close(shutdownWrite)
 close(shutdownRead)
-close(bridgeFd)
+if let fd = bridgeFd { close(fd) }
 log("SwiftNetStackDemo: exiting")
 exit(0)

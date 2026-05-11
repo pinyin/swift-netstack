@@ -15,6 +15,10 @@ public final class RoundContext {
     private var allocatedChunks: [Storage] = []
     private var pendingReleases: [Storage] = []
 
+    /// Monotonically increasing round number, set by the deliberation loop.
+    /// Exposed for debug logging correlation — not used for allocation logic.
+    public var roundNumber: UInt64 = 0
+
     public init() {}
 
     // MARK: - Allocation

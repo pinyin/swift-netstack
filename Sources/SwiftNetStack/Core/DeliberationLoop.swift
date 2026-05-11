@@ -63,12 +63,13 @@ public struct DeliberationLoop {
     ///
     /// Returns the number of packets written to the transport.
     @discardableResult
-    public mutating func runOneRound(transport: inout PollingTransport) -> Int {
+    public mutating func runOneRound(transport: inout PollingTransport, roundNumber: UInt64) -> Int {
 #if DEBUG
         debugRunTCPFSMTests()
 #endif
 
         let round = RoundContext()
+        round.roundNumber = roundNumber
 
         var replies: [(endpointID: Int, packet: PacketBuffer)] = []
         var forwardPkts: [(endpointID: Int, packet: PacketBuffer)] = []
@@ -401,7 +402,7 @@ public struct DeliberationLoop {
         dnsServer.registerUpstreamFD(with: &transport)
         var roundCount: UInt64 = 0
         while shouldContinue() {
-            runOneRound(transport: &transport)
+            runOneRound(transport: &transport, roundNumber: roundCount)
             roundCount += 1
         }
         return roundCount

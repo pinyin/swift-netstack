@@ -14,6 +14,11 @@ public struct NATTable {
     private let maxTCPConnections: Int = 256
     private let maxUDPMappings: Int = 256
 
+#if DEBUG
+    /// Current round number — set by processTCPRound, read by debugLog.
+    private var debugRound: UInt64 = 0
+#endif
+
     // TCP
     private var tcpEntries: [NATKey: NATEntry] = [:]
     private var tcpFdToKey: [Int32: NATKey] = [:]
@@ -203,6 +208,10 @@ public struct NATTable {
         round: RoundContext,
         externalPcap: PCAPWriter? = nil
     ) {
+#if DEBUG
+        debugRound = round.roundNumber
+#endif
+
         // ── Step 1: Complete non-blocking connects ──
         for fd in streamConnects {
             guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { continue }
@@ -288,6 +297,14 @@ public struct NATTable {
             }
             if oldState != newState {
                 debugLog("[NAT-TCP-PROC] state \(oldState) → \(newState) for \(key.dstIP):\(key.dstPort), flags=\(tcp.flags.rawValue)\n")
+            } else if toSend.isEmpty && (dataToExternal == nil || dataToExternal!.isEmpty) {
+                // Segment didn't change state, produce a response, or carry data —
+                // log the full segment details so we can see why it was rejected.
+                debugLog("[NAT-TCP-REJ] C\(conn.connectionID) \(oldState) \(key.dstIP):\(key.dstPort) "
+                    + "seq=\(tcp.sequenceNumber) ack=\(tcp.acknowledgmentNumber) "
+                    + "flags=0x\(String(tcp.flags.rawValue, radix: 16)) "
+                    + "wnd=\(tcp.window) dataLen=\(tcp.payload.totalLength) "
+                    + "rcv.nxt=\(conn.rcv.nxt) snd.nxt=\(conn.snd.nxt) snd.una=\(conn.snd.una)\n")
             }
             if let data = dataToExternal, !data.isEmpty {
                 debugLog("[NAT-TCP-PROC] buffering \(data.totalLength)B for external \(key.dstIP):\(key.dstPort)\n")
@@ -895,15 +912,22 @@ public struct NATTable {
         for (key, entry) in tcpEntries {
             let age = now - entry.lastActivity
             let tooOld: Bool
+            let reason: String
             switch entry.connection.state {
             case .established:
                 tooOld = age > 300
+                reason = "established idle timeout"
             case .finWait1, .finWait2, .closeWait, .lastAck:
                 tooOld = age > 120
+                reason = "half-closed idle timeout"
             case .synReceived, .listen, .closed:
                 tooOld = age > 60
+                reason = "handshake idle timeout"
             }
             if tooOld {
+            #if DEBUG
+                debugSnapshotEntry(key: key, entry: entry, reason: reason)
+            #endif
                 cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
             }
         }
@@ -921,9 +945,30 @@ public struct NATTable {
     private func currentTime() -> UInt64 { UInt64(Darwin.time(nil)) }
     private func debugLog(_ msg: @autoclosure () -> String) {
     #if DEBUG
-    fputs(msg(), stderr)
+    fputs("[R\(debugRound)] \(msg())", stderr)
     #endif
     }
+
+#if DEBUG
+    /// Dump one connection's full state to stderr.  Called before idle-timeout
+    /// cleanup so there's a post-mortem record of what got pruned and why.
+    private func debugSnapshotEntry(key: NATKey, entry: NATEntry, reason: String) {
+        let c = entry.connection
+        let age = currentTime() - entry.lastActivity
+        fputs("""
+            [R\(debugRound)] [NAT-TCP-TIMEOUT] \(reason) age=\(age)s
+            [R\(debugRound)]   C\(c.connectionID) \(key.vmIP):\(key.vmPort)→\(key.dstIP):\(key.dstPort)
+            [R\(debugRound)]   state=\(c.state)  snd.nxt=\(c.snd.nxt) snd.una=\(c.snd.una) snd.wnd=\(c.snd.wnd)
+            [R\(debugRound)]   rcv.nxt=\(c.rcv.nxt)  rcv.initialSeq=\(c.rcv.initialSeq)
+            [R\(debugRound)]   sendQueue: queued=\(c.totalQueuedBytes) sent=\(c.sendQueueSent) blocked=\(c.sendQueueBlocked)
+            [R\(debugRound)]   extSendQueue: queued=\(c.externalSendQueued)  pendingFin=\(c.pendingExternalFin)
+            [R\(debugRound)]   extEOF=\(c.externalEOF) extConnecting=\(c.externalConnecting)
+            [R\(debugRound)]   fd=\(c.posixFD) endpoint=\(c.endpointID) inbound=\(entry.isInbound)
+            [R\(debugRound)]   createdAt=\(entry.createdAt) lastActivity=\(entry.lastActivity)
+            \n
+            """, stderr)
+    }
+#endif
 }
 
 // MARK: - sockaddr helpers

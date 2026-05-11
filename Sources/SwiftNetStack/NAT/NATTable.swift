@@ -223,9 +223,6 @@ public struct NATTable {
             }
             tcpEntries[key]?.connection.externalConnecting = false
             transport.registerFD(fd, events: Int16(POLLIN), kind: .stream)
-            if st == .synReceived {
-                debugLog("[NAT-TCP-WR] connect completed for \(key.dstIP):\(key.dstPort)")
-            }
         }
 
         // ── Step 2: Process VM→external segments ──
@@ -263,7 +260,13 @@ public struct NATTable {
                         getpeername(conn.posixFD, $0, &addrLen)
                     }
                 }
-                if result < 0 { continue }
+                if result < 0 {
+                    // connect still in progress — skip processing this round.
+                    // The VM will retransmit if needed (RTO); on localhost the
+                    // connect always completes before the ACK arrives so this
+                    // gate is never hit in practice.
+                    continue
+                }
                 if conn.externalConnecting {
                     conn.externalConnecting = false
                     transport.registerFD(conn.posixFD, events: Int16(POLLIN), kind: .stream)

@@ -17,6 +17,10 @@ public struct NATTable {
     /// Skip cleanup scanning if last scan was less than 1 second ago.
     private var lastCleanupTime: UInt64 = 0
 
+    /// Connections modified in this round (steps 2-4). Step 5 iterates only
+    /// these instead of all tcpEntries, avoiding O(N) idle-connection scans.
+    private var dirtyConnections: Set<NATKey> = []
+
     /// Optional pcap writer for external socket traffic (synthetic frames).
     /// Set before run() to capture VM↔external data for Wireshark analysis.
     public var externalPcap: PCAPWriter? = nil
@@ -41,6 +45,12 @@ public struct NATTable {
     private var _nextID: UInt64 = 0
 
     public init(portForwards: [PortForwardEntry] = []) {
+        tcpEntries.reserveCapacity(maxTCPConnections)
+        tcpFdToKey.reserveCapacity(maxTCPConnections)
+        udpEntries.reserveCapacity(maxUDPMappings)
+        udpFdToKey.reserveCapacity(maxUDPMappings)
+        dirtyConnections.reserveCapacity(maxTCPConnections)
+
         for pf in portForwards {
             switch pf.protocol {
             case .tcp:
@@ -251,6 +261,7 @@ public struct NATTable {
                     hostMAC: hostMAC, transport: &transport,
                     replies: &replies, round: round
                 )
+                dirtyConnections.insert(key)
                 continue
             }
 
@@ -335,6 +346,7 @@ public struct NATTable {
 
             entry.connection = conn
             tcpEntries[key] = entry
+            dirtyConnections.insert(key)
 
             if newState == .closed {
                 cleanupTCP(fd: conn.posixFD, key: key, transport: &transport)
@@ -362,6 +374,7 @@ public struct NATTable {
                     hostMAC: hostMAC, round: round)
             }
             tcpEntries[key] = entry
+            dirtyConnections.insert(key)
         }
 
         // ── Step 4: Handle external hangups ──
@@ -375,6 +388,7 @@ public struct NATTable {
                     entry.connection.externalEOF = true
                     entry.connection.pendingExternalFin = false
                     tcpEntries[key] = entry
+                    dirtyConnections.insert(key)
                     handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                          replies: &replies, round: round)
                     continue
@@ -388,12 +402,14 @@ public struct NATTable {
             entry.connection.externalEOF = true
             entry.connection.pendingExternalFin = false
             tcpEntries[key] = entry
+            dirtyConnections.insert(key)
             handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                  replies: &replies, round: round)
         }
 
-        // ── Step 5: Flush all connections (drain queues, forward FIN) ──
-        for (key, var entry) in tcpEntries {
+        // ── Step 5: Flush dirty connections (drain queues, forward FIN) ──
+        for key in dirtyConnections {
+            guard var entry = tcpEntries[key] else { continue }
             var conn = entry.connection
             guard conn.state == .established || conn.state == .closeWait
                   || conn.state == .finWait1 || conn.state == .finWait2
@@ -404,6 +420,7 @@ public struct NATTable {
             entry.connection = conn
             tcpEntries[key] = entry
         }
+        dirtyConnections.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Per-connection flush (send queues + FIN forwarding)
@@ -895,6 +912,7 @@ public struct NATTable {
         close(fd)
         tcpFdToKey.removeValue(forKey: fd)
         tcpEntries.removeValue(forKey: key)
+        dirtyConnections.remove(key)
     }
 
     private mutating func cleanupUDP(fd: Int32, key: NATKey, transport: inout PollingTransport) {

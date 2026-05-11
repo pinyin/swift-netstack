@@ -86,6 +86,7 @@ public struct DeliberationLoop {
 
         // ── Phase 2: Parse ALL Ethernet headers ──
         var ethParsed: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
+        ethParsed.reserveCapacity(result.vmFrames.count)
         for (ep, pkt) in result.vmFrames {
             if let eth = EthernetFrame.parse(from: pkt) {
                 ethParsed.append((ep, pkt, eth))
@@ -98,6 +99,9 @@ public struct DeliberationLoop {
         // ── Phase 3: MAC filter + EtherType dispatch + L2 forward ──
         var arpPkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
         var ipv4Pkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
+        let ethCount = ethParsed.count
+        arpPkts.reserveCapacity(ethCount)
+        ipv4Pkts.reserveCapacity(ethCount)
         for (ep, pkt, eth) in ethParsed {
             if eth.dstMAC == arpMapping.hostMAC || eth.dstMAC == .broadcast {
                 switch eth.etherType {
@@ -115,6 +119,7 @@ public struct DeliberationLoop {
 
         // ── Phase 4: Parse ALL IPv4 headers ──
         var ipv4Parsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
+        ipv4Parsed.reserveCapacity(ipv4Pkts.count)
         for (ep, _, eth) in ipv4Pkts {
             guard let ip = IPv4Header.parse(from: eth.payload) else { continue }
             ipv4Parsed.append((ep, eth, ip))
@@ -125,6 +130,7 @@ public struct DeliberationLoop {
 
         // ── Phase 5: Parse ALL ARP frames ──
         var arpParsed: [(ep: Int, eth: EthernetFrame, arp: ARPFrame)] = []
+        arpParsed.reserveCapacity(arpPkts.count)
         for (ep, _, eth) in arpPkts {
             if let arp = ARPFrame.parse(from: eth.payload) {
                 arpParsed.append((ep, eth, arp))
@@ -141,6 +147,13 @@ public struct DeliberationLoop {
         var dnsParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
         var tcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)] = []
         var unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
+        let ipv4Count = ipv4Parsed.count
+        icmpParsed.reserveCapacity(ipv4Count)
+        udpParsed.reserveCapacity(ipv4Count)
+        dhcpParsed.reserveCapacity(ipv4Count)
+        dnsParsed.reserveCapacity(ipv4Count)
+        tcpParsed.reserveCapacity(ipv4Count)
+        unreachableParsed.reserveCapacity(ipv4Count)
         for (ep, eth, ip) in ipv4Parsed {
             switch ip.protocol {
             case .icmp:

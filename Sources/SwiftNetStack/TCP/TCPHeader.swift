@@ -42,47 +42,56 @@ public struct TCPHeader {
         var pkt = pkt
         let tcpLen = pkt.totalLength
         guard tcpLen >= 20 else { return nil }
-        guard pkt.pullUp(tcpLen) else { return nil }
 
-        return pkt.withUnsafeReadableBytes { buf in
-            let srcPort = (UInt16(buf[0]) << 8) | UInt16(buf[1])
-            let dstPort = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-            let seqNum  = (UInt32(buf[4]) << 24) | (UInt32(buf[5]) << 16)
-                        | (UInt32(buf[6]) << 8)  |  UInt32(buf[7])
-            let ackNum  = (UInt32(buf[8]) << 24) | (UInt32(buf[9]) << 16)
-                        | (UInt32(buf[10]) << 8) |  UInt32(buf[11])
+        // Pull up only the TCP header (max 60 bytes with options), not the payload.
+        // The payload stays in its original views — no O(N) copy for large segments.
+        let maxHeaderLen = min(tcpLen, 60)
+        guard pkt.pullUp(maxHeaderLen) else { return nil }
 
-            let dataOff = buf[12] >> 4
-            guard dataOff >= 5 && dataOff <= 15 else { return nil }
-            let headerLen = Int(dataOff) * 4
-            guard tcpLen >= headerLen else { return nil }
+        // Access header bytes directly from the first view (guaranteed contiguous by pullUp).
+        let firstView = pkt._views[0]
+        let buf = firstView.storage.data.advanced(by: firstView.offset).assumingMemoryBound(to: UInt8.self)
 
-            let flags    = TCPFlags(rawValue: buf[13])
+        let srcPort = (UInt16(buf[0]) << 8) | UInt16(buf[1])
+        let dstPort = (UInt16(buf[2]) << 8) | UInt16(buf[3])
+        let seqNum  = (UInt32(buf[4]) << 24) | (UInt32(buf[5]) << 16)
+                    | (UInt32(buf[6]) << 8)  |  UInt32(buf[7])
+        let ackNum  = (UInt32(buf[8]) << 24) | (UInt32(buf[9]) << 16)
+                    | (UInt32(buf[10]) << 8) |  UInt32(buf[11])
 
-            let window   = (UInt16(buf[14]) << 8) | UInt16(buf[15])
-            let checksum = (UInt16(buf[16]) << 8) | UInt16(buf[17])
-            let urgent   = (UInt16(buf[18]) << 8) | UInt16(buf[19])
+        let dataOff = buf[12] >> 4
+        guard dataOff >= 5 && dataOff <= 15 else { return nil }
+        let headerLen = Int(dataOff) * 4
+        guard tcpLen >= headerLen else { return nil }
 
-            guard let payload = pkt.slice(from: headerLen, length: tcpLen - headerLen) else { return nil }
+        let flags    = TCPFlags(rawValue: buf[13])
 
-            let ck = computeTCPChecksum(
-                pseudoSrcAddr: pseudoSrcAddr,
-                pseudoDstAddr: pseudoDstAddr,
-                tcpData: buf.baseAddress!,
-                tcpLen: tcpLen
-            )
-            let checksumValid = (ck == 0)
+        let window   = (UInt16(buf[14]) << 8) | UInt16(buf[15])
+        let checksum = (UInt16(buf[16]) << 8) | UInt16(buf[17])
+        let urgent   = (UInt16(buf[18]) << 8) | UInt16(buf[19])
 
-            return TCPHeader(
-                srcPort: srcPort, dstPort: dstPort,
-                sequenceNumber: seqNum, acknowledgmentNumber: ackNum,
-                dataOffset: dataOff, flags: flags,
-                window: window, checksum: checksum,
-                urgentPointer: urgent, payload: payload,
-                pseudoSrcAddr: pseudoSrcAddr, pseudoDstAddr: pseudoDstAddr,
-                checksumValid: checksumValid
-            )
-        }
+        guard let payload = pkt.slice(from: headerLen, length: tcpLen - headerLen) else { return nil }
+
+        // Scatter-gather checksum: header bytes + payload views, no payload copy
+        let ck = computeTCPChecksumSG(
+            pseudoSrcAddr: pseudoSrcAddr,
+            pseudoDstAddr: pseudoDstAddr,
+            tcpHeader: UnsafeRawPointer(buf),
+            headerLen: headerLen,
+            payloadViews: payload._views,
+            tcpLen: tcpLen
+        )
+        let checksumValid = (ck == 0)
+
+        return TCPHeader(
+            srcPort: srcPort, dstPort: dstPort,
+            sequenceNumber: seqNum, acknowledgmentNumber: ackNum,
+            dataOffset: dataOff, flags: flags,
+            window: window, checksum: checksum,
+            urgentPointer: urgent, payload: payload,
+            pseudoSrcAddr: pseudoSrcAddr, pseudoDstAddr: pseudoDstAddr,
+            checksumValid: checksumValid
+        )
     }
 
     public func verifyChecksum() -> Bool { _checksumValid }

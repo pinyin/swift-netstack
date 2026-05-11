@@ -67,14 +67,18 @@ public struct UDPHeader {
             let valid: Bool
             if checksum == 0 {
                 valid = true
-            } else if let ck = udpChecksum(
-                pseudoSrcAddr: pseudoSrcAddr,
-                pseudoDstAddr: pseudoDstAddr,
-                udpPayload: ckPkt
-            ) {
-                valid = (ck == 0xFFFF)
             } else {
-                valid = false
+                // Scatter-gather: header (8 bytes, guaranteed contiguous by pullUp)
+                // + payload views, no O(N) copy of the entire datagram.
+                let headerPtr = ckPkt._views[0].storage.data.advanced(by: ckPkt._views[0].offset)
+                let ck = computeUDPChecksumSG(
+                    pseudoSrcAddr: pseudoSrcAddr,
+                    pseudoDstAddr: pseudoDstAddr,
+                    udpHeader: UnsafeRawPointer(headerPtr),
+                    payloadViews: payload._views,
+                    udpLen: udpLen
+                )
+                valid = (ck == 0xFFFF)
             }
 
             return UDPHeader(
@@ -117,6 +121,31 @@ func computeUDPChecksum(
     // Compute checksum in two passes: pseudo-header then UDP segment
     var sum = pseudoSum(pseudo)
     sum = checksumAdd(sum, udpData, udpLen)
+    let ck = finalizeChecksum(sum)
+    return ck == 0 ? 0xFFFF : ck
+}
+
+/// Compute UDP checksum using scatter-gather: header in contiguous memory,
+/// payload accessed via PacketBuffer views without copying.
+///
+/// Used by the parse (ingress) path to avoid pulling up the entire UDP datagram.
+func computeUDPChecksumSG(
+    pseudoSrcAddr: IPv4Address,
+    pseudoDstAddr: IPv4Address,
+    udpHeader: UnsafeRawPointer,
+    payloadViews: [PacketBuffer.View],
+    udpLen: Int
+) -> UInt16 {
+    var pseudo: [UInt8] = [
+        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.udp.rawValue, UInt8(udpLen >> 8), UInt8(udpLen & 0xFF),
+    ]
+    pseudoSrcAddr.write(to: &pseudo)
+    pseudo.withUnsafeMutableBytes { buf in
+        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
+    }
+    var sum = pseudoSum(pseudo)
+    sum = checksumAdd(sum, udpHeader, 8)
+    sum = checksumAddViews(sum, payloadViews)
     let ck = finalizeChecksum(sum)
     return ck == 0 ? 0xFFFF : ck
 }

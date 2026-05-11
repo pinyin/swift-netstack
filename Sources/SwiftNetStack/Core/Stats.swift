@@ -70,15 +70,6 @@ public struct NATStats {
 
 /// Cumulative CPU time per BDP phase. All values in nanoseconds.
 /// Used to identify hotspots — which phase burns the most CPU.
-///
-/// Phase structure (5 phases):
-///   1. pollRead  — poll() + read all FDs
-///   2. parse     — single-pass parse + inline dispatch (ARP, ICMP, UDP, DNS, DHCP)
-///   3. tcp       — TCP NAT (processTCPRound)
-///   4. natResult — NAT transport result (non-TCP: dead FDs, accepts, UDP reads)
-///   5. dnsUpstream — DNS upstream (expire + process)
-///
-/// icmp, udp, dns, dhcpArp are deprecated (zero) — folded into phase 2.
 public struct PhaseTiming {
     /// Phase 1: poll() + read all FDs (poll syscall overhead + read loops)
     public var pollRead: UInt64 = 0

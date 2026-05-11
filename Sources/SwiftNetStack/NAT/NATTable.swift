@@ -309,16 +309,14 @@ public struct NATTable {
         for (key, var entry) in tcpEntries {
             guard entry.connection.pendingDelayedACK else { continue }
             guard entry.connection.delayedACKDeadline <= nowUs else { continue }
-            var conn = entry.connection
             if let frame = buildAckFrame(
-                conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
-                window: conn.delayedACKWindow, round: round
+                conn: &entry.connection, seq: entry.connection.delayedACKSeq, ack: entry.connection.delayedACKAck,
+                window: entry.connection.delayedACKWindow, round: round
             ) {
-                replies.append((conn.endpointID, frame))
+                replies.append((entry.connection.endpointID, frame))
                 stats.ackFlushedTimer += 1
             }
-            conn.pendingDelayedACK = false
-            entry.connection = conn
+            entry.connection.pendingDelayedACK = false
             tcpEntries[key] = entry
         }
     }
@@ -392,104 +390,92 @@ public struct NATTable {
             }
 
             guard var entry = tcpEntries[key] else { continue }
-            var conn = entry.connection
             entry.lastActivity = nowSec
 
             // Check external connect completion (synReceived state)
-            if conn.state == .synReceived {
+            if entry.connection.state == .synReceived {
                 var addr = sockaddr_in()
                 var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
                 let result = withUnsafeMutablePointer(to: &addr) {
                     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        getpeername(conn.posixFD, $0, &addrLen)
+                        getpeername(entry.connection.posixFD, $0, &addrLen)
                     }
                 }
                 if result < 0 {
-                    // connect still in progress — skip processing this round.
-                    // The VM will retransmit if needed (RTO); on localhost the
-                    // connect always completes before the ACK arrives so this
-                    // gate is never hit in practice.
                     continue
                 }
-                if conn.externalConnecting {
-                    conn.externalConnecting = false
-                    transport.registerFD(conn.posixFD, events: Int16(POLLIN), kind: .stream)
+                if entry.connection.externalConnecting {
+                    entry.connection.externalConnecting = false
+                    transport.registerFD(entry.connection.posixFD, events: Int16(POLLIN), kind: .stream)
                 }
             }
 
-            let oldState = conn.state
-            let oldUna = conn.snd.una
+            let oldState = entry.connection.state
+            let oldUna = entry.connection.snd.una
             let (newState, toSend, dataToExternal) = tcpProcess(
-                state: conn.state, segment: tcp, snd: &conn.snd, rcv: &conn.rcv, appClose: false
+                state: entry.connection.state, segment: tcp, snd: &entry.connection.snd, rcv: &entry.connection.rcv, appClose: false
             )
-            conn.state = newState
-            if newState == .established && conn.ackTemplate == nil {
-                conn.ackTemplate = makeAckTemplate(
-                    hostMAC: conn.hostMAC, vmMAC: conn.vmMAC,
-                    srcIP: conn.dstIP, dstIP: conn.vmIP,
-                    srcPort: conn.dstPort, dstPort: conn.vmPort, window: 65535
+            entry.connection.state = newState
+            if newState == .established && entry.connection.ackTemplate == nil {
+                entry.connection.ackTemplate = makeAckTemplate(
+                    hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
+                    srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
+                    srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort, window: 65535
                 )
             }
-            let unaDelta = Int(conn.snd.una &- oldUna)
-            if unaDelta > 0 { conn.ackSendBuf(delta: unaDelta) }
+            let unaDelta = Int(entry.connection.snd.una &- oldUna)
+            if unaDelta > 0 { entry.connection.ackSendBuf(delta: unaDelta) }
             // Resume external reads if backpressure cleared
-            if conn.sendQueueBlocked, conn.totalQueuedBytes < TCPConnection.maxQueueBytes / 2 {
-                conn.sendQueueBlocked = false
-                transport.setFDEvents(conn.posixFD, events: Int16(POLLIN))
+            if entry.connection.sendQueueBlocked, entry.connection.totalQueuedBytes < TCPConnection.maxQueueBytes / 2 {
+                entry.connection.sendQueueBlocked = false
+                transport.setFDEvents(entry.connection.posixFD, events: Int16(POLLIN))
             }
             if oldState != newState {
                 debugLog("[NAT-TCP-PROC] state \(oldState) → \(newState) for \(key.dstIP):\(key.dstPort), flags=\(tcp.flags.rawValue)\n")
             } else if toSend.isEmpty && (dataToExternal == nil || dataToExternal!.isEmpty) {
-                // Segment didn't change state, produce a response, or carry data —
-                // log the full segment details so we can see why it was rejected.
-                debugLog("[NAT-TCP-REJ] C\(conn.connectionID) \(oldState) \(key.dstIP):\(key.dstPort) "
+                debugLog("[NAT-TCP-REJ] C\(entry.connection.connectionID) \(oldState) \(key.dstIP):\(key.dstPort) "
                     + "seq=\(tcp.sequenceNumber) ack=\(tcp.acknowledgmentNumber) "
                     + "flags=0x\(String(tcp.flags.rawValue, radix: 16)) "
                     + "wnd=\(tcp.window) dataLen=\(tcp.payload.totalLength) "
-                    + "rcv.nxt=\(conn.rcv.nxt) snd.nxt=\(conn.snd.nxt) snd.una=\(conn.snd.una)\n")
+                    + "rcv.nxt=\(entry.connection.rcv.nxt) snd.nxt=\(entry.connection.snd.nxt) snd.una=\(entry.connection.snd.una)\n")
             }
             if let data = dataToExternal, !data.isEmpty {
                 debugLog("[NAT-TCP-PROC] buffering \(data.totalLength)B for external \(key.dstIP):\(key.dstPort)\n")
-                conn.appendExternalSend(data)
+                entry.connection.appendExternalSend(data)
             }
 
             if newState == .closeWait {
-                conn.pendingExternalFin = true
+                entry.connection.pendingExternalFin = true
             }
             for seg in toSend {
-                // Timer-based delayed ACK: defer pure ACKs to coalesce with
-                // the next outgoing segment or flush on timer expiry (200µs).
-                // When a pending ACK already exists, flush it before storing
-                // the new one — this ensures at most one coalescing (≤2 ACKs
-                // merged), preventing congestion-window starvation in the VM.
                 let isPureACK = seg.flags == .ack
                 if isPureACK {
-                    if conn.pendingDelayedACK {
+                    if entry.connection.pendingDelayedACK {
                         if let frame = buildAckFrame(
-                            conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
-                            window: conn.delayedACKWindow, round: round
+                            conn: &entry.connection, seq: entry.connection.delayedACKSeq, ack: entry.connection.delayedACKAck,
+                            window: entry.connection.delayedACKWindow, round: round
                         ) {
                             replies.append((ep, frame))
                             stats.ackFlushedImmediate += 1
                         }
                     }
                     stats.ackDeferred += 1
-                    conn.pendingDelayedACK = true
-                    conn.delayedACKDeadline = nowUs + 200
-                    conn.delayedACKSeq = seg.seq
-                    conn.delayedACKAck = seg.ack
-                    conn.delayedACKWindow = seg.window
+                    entry.connection.pendingDelayedACK = true
+                    entry.connection.delayedACKDeadline = nowUs + 200
+                    entry.connection.delayedACKSeq = seg.seq
+                    entry.connection.delayedACKAck = seg.ack
+                    entry.connection.delayedACKWindow = seg.window
                 } else {
                     // Non-ACK segment — flush any pending delayed ACK first
-                    if conn.pendingDelayedACK {
+                    if entry.connection.pendingDelayedACK {
                         if let frame = buildAckFrame(
-                            conn: &conn, seq: conn.delayedACKSeq, ack: conn.delayedACKAck,
-                            window: conn.delayedACKWindow, round: round
+                            conn: &entry.connection, seq: entry.connection.delayedACKSeq, ack: entry.connection.delayedACKAck,
+                            window: entry.connection.delayedACKWindow, round: round
                         ) {
                             replies.append((ep, frame))
                             stats.ackFlushedImmediate += 1
                         }
-                        conn.pendingDelayedACK = false
+                        entry.connection.pendingDelayedACK = false
                     }
                     if let frame = buildTCPFrame(
                         hostMAC: hostMAC, dstMAC: eth.srcMAC,
@@ -504,12 +490,11 @@ public struct NATTable {
                 }
             }
 
-            entry.connection = conn
             tcpEntries[key] = entry
             dirtyConnections.insert(key)
 
             if newState == .closed {
-                cleanupTCP(fd: conn.posixFD, key: key, transport: &transport)
+                cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
             }
         }
 
@@ -570,14 +555,12 @@ public struct NATTable {
         // ── Step 5: Flush dirty connections (drain queues, forward FIN) ──
         for key in dirtyConnections {
             guard var entry = tcpEntries[key] else { continue }
-            var conn = entry.connection
-            guard conn.state == .established || conn.state == .closeWait
-                  || conn.state == .finWait1 || conn.state == .finWait2
-                  || conn.state == .lastAck else { continue }
+            guard entry.connection.state == .established || entry.connection.state == .closeWait
+                  || entry.connection.state == .finWait1 || entry.connection.state == .finWait2
+                  || entry.connection.state == .lastAck else { continue }
 
-            flushOneConnection(key: key, conn: &conn, hostMAC: hostMAC,
+            flushOneConnection(key: key, conn: &entry.connection, hostMAC: hostMAC,
                                transport: &transport, replies: &replies, round: round)
-            entry.connection = conn
             tcpEntries[key] = entry
         }
         dirtyConnections.removeAll(keepingCapacity: true)
@@ -973,29 +956,28 @@ public struct NATTable {
         replies: inout [(endpointID: Int, packet: PacketBuffer)], round: RoundContext
     ) {
         guard var entry = tcpEntries[key] else { return }
-        var conn = entry.connection
 
         var needsCleanup = false
         var cleanupFD: Int32 = 0
 
         // Flush sendQueue before sending FIN to VM
-        while conn.totalQueuedBytes > 0 {
-            let inFlight = conn.snd.nxt &- conn.snd.una
-            var canSend = Int(conn.snd.wnd) - Int(inFlight)
+        while entry.connection.totalQueuedBytes > 0 {
+            let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
+            var canSend = Int(entry.connection.snd.wnd) - Int(inFlight)
             if canSend <= 0 { break }
             if canSend > mss { canSend = mss }
-            guard let data = conn.peekSendData(max: canSend) else { break }
+            guard let data = entry.connection.peekSendData(max: canSend) else { break }
             if let frame = buildTCPFrame(
-                hostMAC: hostMAC, dstMAC: conn.vmMAC,
-                srcIP: conn.dstIP, dstIP: conn.vmIP,
-                srcPort: conn.dstPort, dstPort: conn.vmPort,
-                seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
+                hostMAC: hostMAC, dstMAC: entry.connection.vmMAC,
+                srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
+                srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
+                seqNumber: entry.connection.snd.nxt, ackNumber: entry.connection.rcv.nxt,
                 flags: [.ack, .psh], window: 65535,
                 payload: data, round: round
             ) {
-                replies.append((conn.endpointID, frame))
-                conn.snd.nxt = conn.snd.nxt &+ UInt32(data.totalLength)
-                conn.sendQueueSent += data.totalLength
+                replies.append((entry.connection.endpointID, frame))
+                entry.connection.snd.nxt = entry.connection.snd.nxt &+ UInt32(data.totalLength)
+                entry.connection.sendQueueSent += data.totalLength
             } else {
                 break
             }
@@ -1003,36 +985,35 @@ public struct NATTable {
 
         let emptyPkt = round.allocate(capacity: 0, headroom: 0)
         let dummy = TCPHeader.syntheticAck(
-            ackNumber: conn.snd.una,
-            sequenceNumber: conn.rcv.nxt,
-            pseudoSrcAddr: conn.dstIP,
-            pseudoDstAddr: conn.vmIP,
+            ackNumber: entry.connection.snd.una,
+            sequenceNumber: entry.connection.rcv.nxt,
+            pseudoSrcAddr: entry.connection.dstIP,
+            pseudoDstAddr: entry.connection.vmIP,
             payload: emptyPkt
         )
         let (newState, toSend, _) = tcpProcess(
-            state: conn.state, segment: dummy, snd: &conn.snd, rcv: &conn.rcv, appClose: true
+            state: entry.connection.state, segment: dummy, snd: &entry.connection.snd, rcv: &entry.connection.rcv, appClose: true
         )
-        conn.state = newState
+        entry.connection.state = newState
 
         for seg in toSend {
             if let frame = buildTCPFrame(
-                hostMAC: hostMAC, dstMAC: conn.vmMAC,
-                srcIP: conn.dstIP, dstIP: conn.vmIP,
-                srcPort: conn.dstPort, dstPort: conn.vmPort,
+                hostMAC: hostMAC, dstMAC: entry.connection.vmMAC,
+                srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
+                srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
                 seqNumber: seg.seq, ackNumber: seg.ack,
                 flags: seg.flags, window: seg.window,
                 payload: nil, round: round
             ) {
-                replies.append((conn.endpointID, frame))
+                replies.append((entry.connection.endpointID, frame))
             }
         }
 
         if newState == .closed {
             needsCleanup = true
-            cleanupFD = conn.posixFD
+            cleanupFD = entry.connection.posixFD
         }
 
-        entry.connection = conn
         tcpEntries[key] = entry
 
         if needsCleanup {

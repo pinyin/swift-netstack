@@ -349,10 +349,23 @@ public struct PollingTransport {
     // MARK: - Internal scatter-gather send
 
     private mutating func sendPacket(_ pkt: PacketBuffer, to fd: Int32, flags: Int32) -> Int {
-        var iov = pkt.iovecs()
-        guard !iov.isEmpty else { return 0 }
+        guard pkt.totalLength > 0 else { return 0 }
         stats.sendmsgCalls += 1
         stats.sendBytes += UInt64(pkt.totalLength)
+
+        // Fast path: single-view buffers (ACK frames, most writes) use a
+        // stack iovec to avoid the heap allocation from iovecs().compactMap.
+        if pkt.viewCount == 1 {
+            let v = pkt._views[0]
+            var iov = iovec(iov_base: v.storage.data.advanced(by: v.offset), iov_len: v.length)
+            var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                             msg_iov: &iov, msg_iovlen: 1,
+                             msg_control: nil, msg_controllen: 0, msg_flags: 0)
+            return Darwin.sendmsg(fd, &msg, flags)
+        }
+
+        var iov = pkt.iovecs()
+        guard !iov.isEmpty else { return 0 }
         return iov.withUnsafeMutableBufferPointer { iovPtr in
             var msg = msghdr(
                 msg_name: nil, msg_namelen: 0,

@@ -327,9 +327,23 @@ public struct PollingTransport {
     /// Send a datagram on a UDP socket. Returns bytes written or -1.
     @discardableResult
     public mutating func writeDatagram(_ data: PacketBuffer, to fd: Int32, addr: sockaddr_in) -> Int {
+        guard data.totalLength > 0 else { return 0 }
+        var sa = addr
+
+        // Fast path: single-view buffers avoid the iovecs() heap allocation.
+        if data.viewCount == 1 {
+            let v = data._views[0]
+            var iov = iovec(iov_base: v.storage.data.advanced(by: v.offset), iov_len: v.length)
+            var msg = msghdr(
+                msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
+                msg_iov: &iov, msg_iovlen: 1,
+                msg_control: nil, msg_controllen: 0, msg_flags: 0
+            )
+            return Darwin.sendmsg(fd, &msg, 0)
+        }
+
         var iov = data.iovecs()
         guard !iov.isEmpty else { return 0 }
-        var sa = addr
         return iov.withUnsafeMutableBufferPointer { iovPtr in
             var msg = msghdr(
                 msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),

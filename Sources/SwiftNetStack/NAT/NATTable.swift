@@ -303,7 +303,7 @@ public struct NATTable {
             if buildAckFrame(
                 conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                 ack: entry.connection.delayedACKAck,
-                window: entry.connection.delayedACKWindow,
+                window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
                 io: io, transport: &transport
             ) {
                 stats.ackFlushedTimer += 1
@@ -313,34 +313,41 @@ public struct NATTable {
         }
     }
 
+    // MARK: - Window scale helper
+
+    /// Convert logical window to wire-format UInt16 using RFC 1323 window scaling.
+    private func wireWindow(_ actual: UInt32, scale: UInt8) -> UInt16 {
+        UInt16(min(actual >> scale, 65535))
+    }
+
     // MARK: - Helper: write a TCP output frame directly (no OutBatch)
 
     @discardableResult
     private func addTCPOutput(
         hdrOfs: Int, endpointID: Int, io: IOBuffer,
-        transport: inout PollingTransport
+        transport: inout PollingTransport, hdrLen: Int = 54
     ) -> Bool {
         if let pw = self.externalPcap {
             let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
-            pw.writeRaw(framePtr: hdrPtr, len: 54)
+            pw.writeRaw(framePtr: hdrPtr, len: hdrLen)
         }
         return transport.writeSingleFrame(endpointID: endpointID, io: io,
-                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          hdrOfs: hdrOfs, hdrLen: hdrLen,
                                           payPtr: nil, payLen: 0)
     }
 
     @discardableResult
     private func addTCPOutput(
         hdrOfs: Int, endpointID: Int, payPtr: UnsafeRawPointer, payLen: Int,
-        io: IOBuffer, transport: inout PollingTransport
+        io: IOBuffer, transport: inout PollingTransport, hdrLen: Int = 54
     ) -> Bool {
         if let pw = self.externalPcap {
             let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
-            pw.writeRawSplit(hdr: hdrPtr, hdrLen: 54,
+            pw.writeRawSplit(hdr: hdrPtr, hdrLen: hdrLen,
                              pay: UnsafeMutableRawPointer(mutating: payPtr), payLen: payLen)
         }
         return transport.writeSingleFrame(endpointID: endpointID, io: io,
-                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          hdrOfs: hdrOfs, hdrLen: hdrLen,
                                           payPtr: payPtr, payLen: payLen)
     }
 
@@ -463,11 +470,14 @@ public struct NATTable {
                 snd: &entry.connection.snd, rcv: &entry.connection.rcv, appClose: false
             )
             entry.connection.state = newState
+            // Apply peer window scaling (FSM stores raw wire window from seg.window)
+            entry.connection.snd.wnd = UInt32(seg.window) << entry.connection.peerWindowScale
             if newState == .established && entry.connection.ackTemplate == nil {
                 entry.connection.ackTemplate = makeAckTemplate(
                     hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
-                    srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort, window: 65535
+                    srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
+                    window: wireWindow(262144, scale: entry.connection.ourWindowScale)
                 )
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
@@ -502,7 +512,7 @@ public struct NATTable {
                         _ = buildAckFrame(
                             conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                             ack: entry.connection.delayedACKAck,
-                            window: entry.connection.delayedACKWindow,
+                            window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
                             io: io, transport: &transport
                         )
                         stats.ackFlushedImmediate += 1
@@ -519,7 +529,7 @@ public struct NATTable {
                         _ = buildAckFrame(
                             conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                             ack: entry.connection.delayedACKAck,
-                            window: entry.connection.delayedACKWindow,
+                            window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
                             io: io, transport: &transport
                         )
                         stats.ackFlushedImmediate += 1
@@ -530,7 +540,7 @@ public struct NATTable {
                         srcIP: key.dstIP, dstIP: key.vmIP,
                         srcPort: key.dstPort, dstPort: key.vmPort,
                         seqNumber: segToSend.seq, ackNumber: segToSend.ack,
-                        flags: segToSend.flags, window: segToSend.window)
+                        flags: segToSend.flags, window: wireWindow(segToSend.window, scale: entry.connection.ourWindowScale))
                     if hdrOfs >= 0 {
                         finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                             srcIP: key.dstIP, dstIP: key.vmIP,
@@ -662,7 +672,7 @@ public struct NATTable {
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
                     srcPort: conn.dstPort, dstPort: conn.vmPort,
                     seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
-                    flags: [.ack, .psh], window: 65535)
+                    flags: [.ack, .psh], window: wireWindow(262144, scale: conn.ourWindowScale))
                 guard hdrOfs >= 0 else { break }
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
@@ -754,7 +764,7 @@ public struct NATTable {
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
                     srcPort: conn.dstPort, dstPort: conn.vmPort,
                     seqNumber: segToSend.seq, ackNumber: segToSend.ack,
-                    flags: segToSend.flags, window: segToSend.window)
+                    flags: segToSend.flags, window: wireWindow(segToSend.window, scale: conn.ourWindowScale))
                 if hdrOfs >= 0 {
                     finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                         srcIP: conn.dstIP, dstIP: conn.vmIP,
@@ -961,24 +971,27 @@ public struct NATTable {
         conn.snd.nxt = isn
         conn.snd.una = isn
 
-        let synSeg = TCPSegmentToSend(flags: .syn, seq: isn, ack: 0, window: 65535, payload: nil)
+        let synSeg = TCPSegmentToSend(flags: .syn, seq: isn, ack: 0, window: 262144, payload: nil)
         conn.snd.nxt = isn &+ 1
 
         tcpEntries[key] = NATEntry(connection: conn, isInbound: true)
         tcpFdToKey[newFD] = key
         transport.registerFD(newFD, events: Int16(POLLIN), kind: .stream)
 
-        let hdrOfs = buildTCPHeader(
+        let wireWin = UInt16(min(synSeg.window >> conn.ourWindowScale, 65535))
+        let wscaleOpt: [UInt8] = [3, 3, conn.ourWindowScale, 1]
+        let hdrOfs = buildTCPHeaderWithOptions(
             io: io, hostMAC: hostMAC, dstMAC: vmMAC,
             srcIP: externalIP, dstIP: pf.vmIP,
             srcPort: externalPort, dstPort: pf.vmPort,
             seqNumber: synSeg.seq, ackNumber: synSeg.ack,
-            flags: synSeg.flags, window: synSeg.window)
+            flags: synSeg.flags, window: wireWin,
+            options: wscaleOpt)
         if hdrOfs >= 0 {
-            finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
+            finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
                 srcIP: externalIP, dstIP: pf.vmIP,
-                payloadPtr: nil, payloadLen: 0)
-            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, io: io, transport: &transport)
+                tcpHdrLen: 24, payloadPtr: nil, payloadLen: 0)
+            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, io: io, transport: &transport, hdrLen: 58)
         }
     }
 
@@ -1115,6 +1128,7 @@ public struct NATTable {
             hostMAC: hostMAC
         )
         conn.externalConnecting = true
+        conn.peerWindowScale = seg.peerWindowScale
 
         let (newState, toSend, _, _) = tcpProcess(
             state: .listen, seg: seg,
@@ -1122,6 +1136,8 @@ public struct NATTable {
             snd: &conn.snd, rcv: &conn.rcv, appClose: false
         )
         conn.state = newState
+        // Apply peer window scaling after FSM (FSM stores raw wire window)
+        conn.snd.wnd = UInt32(seg.window) << conn.peerWindowScale
         debugLog("[NAT-TCP-OUT] TCP FSM: .listen → \(newState), isn=\(conn.snd.nxt)\n")
 
         var entry = NATEntry(connection: conn, isInbound: false)
@@ -1131,17 +1147,40 @@ public struct NATTable {
         transport.registerFD(fd, events: Int16(POLLIN | POLLOUT), kind: .stream)
 
         for segToSend in toSend {
-            let hdrOfs = buildTCPHeader(
-                io: io, hostMAC: hostMAC, dstMAC: srcMAC,
-                srcIP: key.dstIP, dstIP: key.vmIP,
-                srcPort: key.dstPort, dstPort: key.vmPort,
-                seqNumber: segToSend.seq, ackNumber: segToSend.ack,
-                flags: segToSend.flags, window: segToSend.window)
-            if hdrOfs >= 0 {
-                finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
+            let wireWin = UInt16(min(segToSend.window >> conn.ourWindowScale, 65535))
+            let isSynAck = segToSend.flags.contains(.syn) && segToSend.flags.contains(.ack)
+            let hdrOfs: Int
+            let hdrLen: Int
+            if isSynAck {
+                let wscaleOpt: [UInt8] = [3, 3, conn.ourWindowScale, 1]  // kind=3, len=3, shift, NOP
+                hdrLen = 14 + 20 + 20 + wscaleOpt.count  // eth + ip + tcp base + options
+                hdrOfs = buildTCPHeaderWithOptions(
+                    io: io, hostMAC: hostMAC, dstMAC: srcMAC,
                     srcIP: key.dstIP, dstIP: key.vmIP,
-                    payloadPtr: nil, payloadLen: 0)
-                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, io: io, transport: &transport)
+                    srcPort: key.dstPort, dstPort: key.vmPort,
+                    seqNumber: segToSend.seq, ackNumber: segToSend.ack,
+                    flags: segToSend.flags, window: wireWin,
+                    options: wscaleOpt)
+            } else {
+                hdrLen = 54
+                hdrOfs = buildTCPHeader(
+                    io: io, hostMAC: hostMAC, dstMAC: srcMAC,
+                    srcIP: key.dstIP, dstIP: key.vmIP,
+                    srcPort: key.dstPort, dstPort: key.vmPort,
+                    seqNumber: segToSend.seq, ackNumber: segToSend.ack,
+                    flags: segToSend.flags, window: wireWin)
+            }
+            if hdrOfs >= 0 {
+                if isSynAck {
+                    finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
+                        srcIP: key.dstIP, dstIP: key.vmIP,
+                        tcpHdrLen: 24, payloadPtr: nil, payloadLen: 0)
+                } else {
+                    finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
+                        srcIP: key.dstIP, dstIP: key.vmIP,
+                        payloadPtr: nil, payloadLen: 0)
+                }
+                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, io: io, transport: &transport, hdrLen: hdrLen)
             }
         }
     }
@@ -1179,7 +1218,7 @@ public struct NATTable {
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
                     srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
                     seqNumber: entry.connection.snd.nxt, ackNumber: entry.connection.rcv.nxt,
-                    flags: [.ack, .psh], window: 65535)
+                    flags: [.ack, .psh], window: wireWindow(262144, scale: entry.connection.ourWindowScale))
                 guard hdrOfs >= 0 else { break }
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
@@ -1237,7 +1276,7 @@ public struct NATTable {
                 srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
                 srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
                 seqNumber: segToSend.seq, ackNumber: segToSend.ack,
-                flags: segToSend.flags, window: segToSend.window)
+                flags: segToSend.flags, window: wireWindow(segToSend.window, scale: entry.connection.ourWindowScale))
             if hdrOfs >= 0 {
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,

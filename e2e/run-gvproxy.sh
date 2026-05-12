@@ -77,8 +77,8 @@ TMPLOG="$(mktemp /tmp/gvproxy-cmp.XXXXXX.log)"
 trap 'kill $DEMOPID 2>/dev/null || true; kill $GVPROXY_PID 2>/dev/null || true; kill $ECHO_PID 2>/dev/null || true; killall iperf3 2>/dev/null || true; rm -f "$TMPLOG" "$GVPROXY_SOCK" "$VFKIT_SOCK" "/tmp/gvproxy-demo-"*.sock 2>/dev/null' EXIT
 
 # ── Start gvproxy ──
-echo "Starting gvproxy (GOMAXPROCS=1, single-threaded)..."
-GOMAXPROCS=1 "$GVPROXY" \
+echo "Starting gvproxy..."
+"$GVPROXY" \
     --listen-vfkit "unixgram://$VFKIT_SOCK" \
     --listen "unix://$GVPROXY_SOCK" \
     >/tmp/gvproxy-e2e-gvproxy.log 2>&1 &

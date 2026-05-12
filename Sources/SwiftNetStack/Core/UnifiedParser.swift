@@ -191,13 +191,32 @@ private func parseOneTCP(
     let flags = TCPFlags(rawValue: tcpBuf[13])
     let window = readUInt16BE(ptr, 14)
 
+    // Extract WSCALE option from SYN segments (RFC 1323)
+    var peerWindowScale: UInt8 = 0
+    if flags.isSyn && !flags.isAck && tcpHeaderLen > 20 {
+        var optOfs = 20
+        while optOfs < tcpHeaderLen {
+            let kind = tcpBuf[optOfs]
+            if kind == 0 { break }  // End of options
+            if kind == 1 { optOfs += 1; continue }  // NOP
+            if optOfs + 1 >= tcpHeaderLen { break }
+            let optLen = Int(tcpBuf[optOfs + 1])
+            if optLen < 2 || optOfs + optLen > tcpHeaderLen { break }
+            if kind == 3, optLen == 3, optOfs + 2 < tcpHeaderLen {
+                peerWindowScale = min(tcpBuf[optOfs + 2], 14)
+            }
+            optOfs += optLen
+        }
+    }
+
     let idx = out.tcpCount
     guard idx < out.maxFrames else { return }
 
     out.tcpKeys[idx] = NATKey(vmIP: srcIP, vmPort: srcPort,
                                dstIP: dstIP, dstPort: dstPort, protocol: .tcp)
     out.tcpSegs[idx] = TCPSegmentInfo(seq: seqNum, ack: ackNum,
-                                       flags: flags, window: window)
+                                       flags: flags, window: window,
+                                       peerWindowScale: peerWindowScale)
     out.tcpPayloadOfs[idx] = baseOfs + ipPayloadOfs + tcpHeaderLen
     out.tcpPayloadLen[idx] = len - tcpHeaderLen
     out.tcpEndpointIDs[idx] = epID

@@ -57,8 +57,12 @@ public struct TCPSegmentInfo {
     public var ack: UInt32
     public var flags: TCPFlags
     public var window: UInt16
-    public init(seq: UInt32, ack: UInt32, flags: TCPFlags, window: UInt16) {
+    /// Window scale shift from SYN option (RFC 1323). 0 if not present.
+    public var peerWindowScale: UInt8
+    public init(seq: UInt32, ack: UInt32, flags: TCPFlags, window: UInt16,
+                peerWindowScale: UInt8 = 0) {
         self.seq = seq; self.ack = ack; self.flags = flags; self.window = window
+        self.peerWindowScale = peerWindowScale
     }
 }
 

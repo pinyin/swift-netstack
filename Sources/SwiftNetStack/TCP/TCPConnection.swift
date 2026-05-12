@@ -21,6 +21,11 @@ struct TCPConnection {
     /// True while the external POSIX socket is performing a non-blocking connect().
     public var externalConnecting: Bool
 
+    /// RFC 1323 window scale shift advertised to the VM (our receive window scale).
+    public var ourWindowScale: UInt8 = 6
+    /// RFC 1323 window scale shift received from the VM in SYN (their receive window scale).
+    public var peerWindowScale: UInt8 = 0
+
     /// VM→external send queue.
     public var externalSendQueue: SendQueue
     /// True when the VM sent FIN and it hasn't been forwarded to external yet.
@@ -38,7 +43,7 @@ struct TCPConnection {
     public var delayedACKDeadline: UInt64 = 0
     public var delayedACKSeq: UInt32 = 0
     public var delayedACKAck: UInt32 = 0
-    public var delayedACKWindow: UInt16 = 65535
+    public var delayedACKWindow: UInt32 = 262144
 
     // MARK: - ACK frame template
 

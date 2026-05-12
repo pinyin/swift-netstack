@@ -47,6 +47,83 @@ public func buildTCPHeader(
     return ofs
 }
 
+/// Write Ethernet+IPv4+TCP header with variable-length TCP options.
+/// Returns the slot offset, or -1 if output buffer is full.
+/// Used for SYN/SYN-ACK frames that carry TCP options (MSS, WSCALE, etc.).
+public func buildTCPHeaderWithOptions(
+    io: IOBuffer,
+    hostMAC: MACAddress, dstMAC: MACAddress,
+    srcIP: IPv4Address, dstIP: IPv4Address,
+    srcPort: UInt16, dstPort: UInt16,
+    seqNumber: UInt32, ackNumber: UInt32,
+    flags: TCPFlags, window: UInt16,
+    options: [UInt8]
+) -> Int {
+    let tcpHdrLen = 20 + options.count
+    let frameHdrLen = 14 + 20 + tcpHdrLen  // Ethernet + IPv4 + TCP
+    guard let ptr = io.allocOutput(frameHdrLen) else { return -1 }
+    let ofs = ptr - io.output.baseAddress!
+
+    // Ethernet
+    dstMAC.write(to: ptr)
+    hostMAC.write(to: ptr.advanced(by: 6))
+    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+    // IPv4
+    let ipPtr = ptr.advanced(by: ethHeaderLen)
+    let ipTotal = UInt16(20 + tcpHdrLen)
+    writeIPv4Header(to: ipPtr, totalLength: ipTotal, protocol: .tcp,
+                    srcIP: srcIP, dstIP: dstIP)
+
+    // TCP base header (20 bytes)
+    let tcpPtr = ipPtr.advanced(by: ipv4HeaderLen)
+    writeUInt16BE(srcPort, to: tcpPtr)
+    writeUInt16BE(dstPort, to: tcpPtr.advanced(by: 2))
+    writeUInt32BE(seqNumber, to: tcpPtr.advanced(by: 4))
+    writeUInt32BE(ackNumber, to: tcpPtr.advanced(by: 8))
+    let dataOff = UInt8(tcpHdrLen / 4) << 4
+    tcpPtr.advanced(by: 12).storeBytes(of: dataOff, as: UInt8.self)
+    tcpPtr.advanced(by: 13).storeBytes(of: flags.rawValue, as: UInt8.self)
+    writeUInt16BE(window, to: tcpPtr.advanced(by: 14))
+    writeUInt16BE(0, to: tcpPtr.advanced(by: 16))  // checksum (zeroed)
+    writeUInt16BE(0, to: tcpPtr.advanced(by: 18))  // urgent
+
+    // TCP options
+    options.withUnsafeBytes { optBuf in
+        tcpPtr.advanced(by: 20).copyMemory(from: optBuf.baseAddress!, byteCount: options.count)
+    }
+
+    return ofs
+}
+
+/// Compute TCP checksum for a frame with variable-length TCP header.
+public func finalizeTCPChecksumEx(
+    io: IOBuffer, hdrOfs: Int,
+    srcIP: IPv4Address, dstIP: IPv4Address,
+    tcpHdrLen: Int,
+    payloadPtr: UnsafeRawPointer?, payloadLen: Int
+) {
+    let tcpPtr = io.output.baseAddress!.advanced(by: hdrOfs + ethHeaderLen + ipv4HeaderLen)
+    let tcpTotalLen = tcpHdrLen + payloadLen
+
+    var pseudo: [UInt8] = [
+        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue,
+        UInt8(tcpTotalLen >> 8), UInt8(tcpTotalLen & 0xFF),
+    ]
+    srcIP.write(to: &pseudo)
+    pseudo.withUnsafeMutableBytes { buf in
+        dstIP.write(to: buf.baseAddress!.advanced(by: 4))
+    }
+
+    var ckSum = pseudoSum(pseudo)
+    ckSum = checksumAdd(ckSum, tcpPtr, tcpHdrLen)
+    if let pp = payloadPtr, payloadLen > 0 {
+        ckSum = checksumAdd(ckSum, pp, payloadLen)
+    }
+    let ck = finalizeChecksum(ckSum)
+    writeUInt16BE(ck, to: tcpPtr.advanced(by: 16))
+}
+
 /// Compute and write TCP checksum for a frame built by buildTCPHeader.
 /// `hdrOfs` is the offset returned by buildTCPHeader.
 /// `payloadPtr` and `payloadLen` describe the TCP payload (may be 0/nil for pure ACK).

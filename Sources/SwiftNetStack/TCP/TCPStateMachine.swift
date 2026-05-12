@@ -18,7 +18,7 @@ public enum TCPState: Equatable {
 struct SendSequence {
     var nxt: UInt32    // next sequence number to assign to a new segment
     var una: UInt32    // oldest unacknowledged sequence number
-    var wnd: UInt16    // peer's receive window (from last segment)
+    var wnd: UInt32    // peer's receive window (post-scaling, actual bytes)
 
     /// Bytes in flight (sent but not acknowledged).
     var bytesInFlight: UInt32 { nxt &- una }
@@ -35,7 +35,9 @@ public struct TCPSegmentToSend {
     public let flags: TCPFlags
     public let seq: UInt32
     public let ack: UInt32
-    public let window: UInt16
+    /// Actual (logical) window we advertise to the VM.
+    /// Scaled down to UInt16 for wire by the NAT table (RFC 1323).
+    public let window: UInt32
     public let payload: [UInt8]?
 }
 
@@ -105,12 +107,12 @@ func _tcpProcessImpl(
         // Choose our ISN
         let isn = tcpGenerateISN()
         snd.una = isn
-        snd.wnd = seg.window
+        snd.wnd = UInt32(seg.window)
         let synAck = TCPSegmentToSend(
             flags: [.syn, .ack],
             seq: isn,
             ack: rcv.nxt,
-            window: 65535,
+            window: 262144,
             payload: nil
         )
         snd.nxt = isn &+ 1  // SYN consumes one sequence number
@@ -139,7 +141,7 @@ func _tcpProcessImpl(
                     flags: .ack,
                     seq: snd.nxt,
                     ack: rcv.nxt,
-                    window: 65535,
+                    window: 262144,
                     payload: nil
                 )
                 if seg.flags.isFin {
@@ -148,7 +150,7 @@ func _tcpProcessImpl(
                         flags: [.ack],
                         seq: snd.nxt,
                         ack: rcv.nxt,
-                        window: 65535,
+                        window: 262144,
                         payload: nil
                     )
                     return (.closeWait, [ackSeg, finAck], payloadPtr, payloadLen)
@@ -161,7 +163,7 @@ func _tcpProcessImpl(
                     flags: .ack,
                     seq: snd.nxt,
                     ack: rcv.nxt,
-                    window: 65535,
+                    window: 262144,
                     payload: nil
                 )
                 return (.closeWait, [ackSeg], nil, 0)
@@ -172,7 +174,7 @@ func _tcpProcessImpl(
 
     case .established:
         // Update peer window
-        snd.wnd = seg.window
+        snd.wnd = UInt32(seg.window)
 
         // Check for data — MUST validate in-sequence delivery (RFC 793 §3.3).
         // Without this check, duplicate retransmissions and out-of-order
@@ -184,7 +186,7 @@ func _tcpProcessImpl(
                     flags: .ack,
                     seq: snd.nxt,
                     ack: rcv.nxt,
-                    window: 65535,
+                    window: 262144,
                     payload: nil
                 )
                 return (.established, [dupAck], nil, 0)
@@ -194,7 +196,7 @@ func _tcpProcessImpl(
                 flags: .ack,
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             if seg.flags.isFin {
@@ -204,7 +206,7 @@ func _tcpProcessImpl(
                     flags: [.ack],
                     seq: snd.nxt,
                     ack: rcv.nxt,
-                    window: 65535,
+                    window: 262144,
                     payload: nil
                 )
                 return (.closeWait, [ackSeg, finAck], payloadPtr, payloadLen)
@@ -223,7 +225,7 @@ func _tcpProcessImpl(
             if seg.seq != rcv.nxt {
                 let dupAck = TCPSegmentToSend(
                     flags: .ack, seq: snd.nxt, ack: rcv.nxt,
-                    window: 65535, payload: nil
+                    window: 262144, payload: nil
                 )
                 return (.established, [dupAck], nil, 0)
             }
@@ -232,7 +234,7 @@ func _tcpProcessImpl(
                 flags: .ack,
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             return (.closeWait, [ackSeg], nil, 0)
@@ -244,7 +246,7 @@ func _tcpProcessImpl(
                 flags: [.fin, .ack],
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             snd.nxt = snd.nxt &+ 1
@@ -254,7 +256,7 @@ func _tcpProcessImpl(
         return (.established, [], nil, 0)
 
     case .finWait1:
-        snd.wnd = seg.window
+        snd.wnd = UInt32(seg.window)
         if seg.flags.isAck {
             let ack = seg.ack
             if ack == snd.nxt {
@@ -267,7 +269,7 @@ func _tcpProcessImpl(
                         flags: .ack,
                         seq: snd.nxt,
                         ack: rcv.nxt,
-                        window: 65535,
+                        window: 262144,
                         payload: nil
                     )
                     return (.closed, [ackSeg], nil, 0)
@@ -281,7 +283,7 @@ func _tcpProcessImpl(
                 flags: .ack,
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             return (.closed, [ackSeg], nil, 0)
@@ -289,19 +291,19 @@ func _tcpProcessImpl(
         return (.finWait1, [], nil, 0)
 
     case .finWait2:
-        snd.wnd = seg.window
+        snd.wnd = UInt32(seg.window)
 
         if payloadLen > 0 && seg.seq == rcv.nxt {
             rcv.nxt = rcv.nxt &+ UInt32(payloadLen)
             if seg.flags.isFin {
                 rcv.nxt = rcv.nxt &+ 1
                 let ackSeg = TCPSegmentToSend(
-                    flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
+                    flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 262144, payload: nil
                 )
                 return (.closed, [ackSeg], payloadPtr, payloadLen)
             }
             let ackSeg = TCPSegmentToSend(
-                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 262144, payload: nil
             )
             return (.finWait2, [ackSeg], payloadPtr, payloadLen)
         }
@@ -309,21 +311,21 @@ func _tcpProcessImpl(
             // Out-of-order or duplicate — send dup ACK
             let dupAck = TCPSegmentToSend(
                 flags: .ack, seq: snd.nxt, ack: rcv.nxt,
-                window: 65535, payload: nil
+                window: 262144, payload: nil
             )
             return (.finWait2, [dupAck], nil, 0)
         }
         if seg.flags.isFin {
             rcv.nxt = rcv.nxt &+ 1
             let ackSeg = TCPSegmentToSend(
-                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 65535, payload: nil
+                flags: .ack, seq: snd.nxt, ack: rcv.nxt, window: 262144, payload: nil
             )
             return (.closed, [ackSeg], nil, 0)
         }
         return (.finWait2, [], nil, 0)
 
     case .closeWait:
-        snd.wnd = seg.window
+        snd.wnd = UInt32(seg.window)
 
         // Validate in-sequence — same as .established
         if payloadLen > 0 && seg.seq == rcv.nxt {
@@ -332,7 +334,7 @@ func _tcpProcessImpl(
                 flags: .ack,
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             // Wait for application to signal close
@@ -341,7 +343,7 @@ func _tcpProcessImpl(
                     flags: [.fin, .ack],
                     seq: snd.nxt,
                     ack: rcv.nxt,
-                    window: 65535,
+                    window: 262144,
                     payload: nil
                 )
                 snd.nxt = snd.nxt &+ 1
@@ -353,7 +355,7 @@ func _tcpProcessImpl(
             // Out-of-order or duplicate — send dup ACK
             let dupAck = TCPSegmentToSend(
                 flags: .ack, seq: snd.nxt, ack: rcv.nxt,
-                window: 65535, payload: nil
+                window: 262144, payload: nil
             )
             return (.closeWait, [dupAck], nil, 0)
         }
@@ -363,7 +365,7 @@ func _tcpProcessImpl(
                 flags: [.fin, .ack],
                 seq: snd.nxt,
                 ack: rcv.nxt,
-                window: 65535,
+                window: 262144,
                 payload: nil
             )
             snd.nxt = snd.nxt &+ 1

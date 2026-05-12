@@ -1,7 +1,7 @@
 import Darwin
 
 /// Holds a TCP connection managed by the NAT table.
-struct NATEntry {
+final class NATEntry {
     public var connection: TCPConnection
     public let createdAt: UInt64
     public var lastActivity: UInt64

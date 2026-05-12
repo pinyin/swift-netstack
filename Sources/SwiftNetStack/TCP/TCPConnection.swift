@@ -1,7 +1,7 @@
 import Darwin
 
 /// Aggregates all per-connection TCP state for a NAT-proxied connection.
-struct TCPConnection {
+final class TCPConnection {
     public let connectionID: UInt64
     public let posixFD: Int32
     public var state: TCPState
@@ -97,12 +97,12 @@ struct TCPConnection {
 
     /// Enqueue data from external recv(). Returns bytes queued, or 0 if full.
     @discardableResult
-    public mutating func writeSendBuf(_ data: UnsafeRawPointer, _ len: Int) -> Int {        guard len > 0, sendQueue.count + len <= Self.maxQueueBytes else { return 0 }
+    public func writeSendBuf(_ data: UnsafeRawPointer, _ len: Int) -> Int {        guard len > 0, sendQueue.count + len <= Self.maxQueueBytes else { return 0 }
         return sendQueue.enqueue(data, len)
     }
 
     /// Remove acknowledged data from the front of the send queue.
-    public mutating func ackSendBuf(delta: Int) {
+    public func ackSendBuf(delta: Int) {
         sendQueue.dequeue(delta)
         if delta > sendQueueSent {
             sendQueueSent = 0
@@ -125,13 +125,13 @@ struct TCPConnection {
 
     /// Enqueue VM→external data. Returns bytes queued, or 0 if full.
     @discardableResult
-    public mutating func appendExternalSend(_ data: UnsafeRawPointer, _ len: Int) -> Int {
+    public func appendExternalSend(_ data: UnsafeRawPointer, _ len: Int) -> Int {
         guard len > 0, externalSendQueue.count + len <= Self.maxQueueBytes else { return 0 }
         return externalSendQueue.enqueue(data, len)
     }
 
     /// Remove written bytes from the front of the external send queue.
-    public mutating func drainExternalSend(_ delta: Int) {
+    public func drainExternalSend(_ delta: Int) {
         externalSendQueue.dequeue(delta)
     }
 }

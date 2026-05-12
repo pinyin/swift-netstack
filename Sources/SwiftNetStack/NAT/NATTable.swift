@@ -229,7 +229,7 @@ public struct NATTable {
     /// Writes directly via transport — no outBatch intermediate.
     @discardableResult
     private mutating func buildAckFrame(
-        conn: inout TCPConnection, seq: UInt32, ack: UInt32, window: UInt16,
+        conn: TCPConnection, seq: UInt32, ack: UInt32, window: UInt16,
         io: IOBuffer, transport: inout PollingTransport
     ) -> Bool {
         var outCK: UInt16 = 0
@@ -297,11 +297,11 @@ public struct NATTable {
     private mutating func flushExpiredDelayedACKs(
         io: IOBuffer, transport: inout PollingTransport, nowUs: UInt64
     ) {
-        for (key, var entry) in tcpEntries {
+        for (_, entry) in tcpEntries {
             guard entry.connection.pendingDelayedACK else { continue }
             guard entry.connection.delayedACKDeadline <= nowUs else { continue }
             if buildAckFrame(
-                conn: &entry.connection, seq: entry.connection.delayedACKSeq,
+                conn: entry.connection, seq: entry.connection.delayedACKSeq,
                 ack: entry.connection.delayedACKAck,
                 window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
                 io: io, transport: &transport
@@ -309,7 +309,6 @@ public struct NATTable {
                 stats.ackFlushedTimer += 1
             }
             entry.connection.pendingDelayedACK = false
-            tcpEntries[key] = entry
         }
     }
 
@@ -443,7 +442,7 @@ public struct NATTable {
                 continue
             }
 
-            guard var entry = tcpEntries[key] else { continue }
+            guard let entry = tcpEntries[key] else { continue }
             entry.lastActivity = nowSec
 
             // Check external connect completion (synReceived state)
@@ -509,13 +508,7 @@ public struct NATTable {
                 let isPureACK = segToSend.flags == .ack
                 if isPureACK {
                     if entry.connection.pendingDelayedACK {
-                        _ = buildAckFrame(
-                            conn: &entry.connection, seq: entry.connection.delayedACKSeq,
-                            ack: entry.connection.delayedACKAck,
-                            window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
-                            io: io, transport: &transport
-                        )
-                        stats.ackFlushedImmediate += 1
+                        stats.ackOverwritten += 1
                     }
                     stats.ackDeferred += 1
                     entry.connection.pendingDelayedACK = true
@@ -527,7 +520,7 @@ public struct NATTable {
                     // Non-ACK segment — flush any pending delayed ACK first
                     if entry.connection.pendingDelayedACK {
                         _ = buildAckFrame(
-                            conn: &entry.connection, seq: entry.connection.delayedACKSeq,
+                            conn: entry.connection, seq: entry.connection.delayedACKSeq,
                             ack: entry.connection.delayedACKAck,
                             window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
                             io: io, transport: &transport
@@ -550,12 +543,26 @@ public struct NATTable {
                 }
             }
 
-            tcpEntries[key] = entry
             dirtyConnections.insert(key)
 
             if newState == .closed {
                 cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
             }
+        }
+
+        // ── Batch flush deferred ACKs after per-segment processing ──
+        for key in dirtyConnections {
+            guard let entry = tcpEntries[key] else { continue }
+            guard entry.connection.pendingDelayedACK else { continue }
+            if buildAckFrame(
+                conn: entry.connection, seq: entry.connection.delayedACKSeq,
+                ack: entry.connection.delayedACKAck,
+                window: wireWindow(entry.connection.delayedACKWindow, scale: entry.connection.ourWindowScale),
+                io: io, transport: &transport
+            ) {
+                stats.ackFlushedImmediate += 1
+            }
+            entry.connection.pendingDelayedACK = false
         }
 
         stats.tcpFsmNs &+= cpuNanos() - tFSM
@@ -567,7 +574,7 @@ public struct NATTable {
         }
         for (fd, data) in streamReads {
             debugLog("[NAT-TCP-RD-CHK] fd=\(fd) data=\(data.count)B inTcpFdToKey=\(tcpFdToKey[fd] != nil)\n")
-            guard let key = tcpFdToKey[fd], var entry = tcpEntries[key] else { continue }
+            guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { continue }
             let st = entry.connection.state
             guard st == .synReceived || st == .established || st == .finWait1 || st == .finWait2
                 || st == .closeWait || st == .lastAck else { continue }
@@ -587,13 +594,12 @@ public struct NATTable {
                     conn: entry.connection, flags: [.ack, .psh], payload: data,
                     hostMAC: hostMAC)
             }
-            tcpEntries[key] = entry
             dirtyConnections.insert(key)
         }
 
         // ── Step 4: Handle external hangups ──
         for fd in streamHangup {
-            guard let key = tcpFdToKey[fd], var entry = tcpEntries[key] else { continue }
+            guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { continue }
             let st = entry.connection.state
             if st == .listen || st == .synReceived {
                 if entry.connection.totalQueuedBytes > 0 {
@@ -601,7 +607,6 @@ public struct NATTable {
                     entry.lastActivity = nowSec
                     entry.connection.externalEOF = true
                     entry.connection.pendingExternalFin = false
-                    tcpEntries[key] = entry
                     dirtyConnections.insert(key)
                     handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                          io: io)
@@ -615,7 +620,6 @@ public struct NATTable {
             entry.lastActivity = nowSec
             entry.connection.externalEOF = true
             entry.connection.pendingExternalFin = false
-            tcpEntries[key] = entry
             dirtyConnections.insert(key)
             handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
                                  io: io)
@@ -626,14 +630,13 @@ public struct NATTable {
         // ── Step 5: Flush dirty connections (drain queues, forward FIN) ──
         let tFlush = cpuNanos()
         for key in dirtyConnections {
-            guard var entry = tcpEntries[key] else { continue }
+            guard let entry = tcpEntries[key] else { continue }
             guard entry.connection.state == .established || entry.connection.state == .closeWait
                   || entry.connection.state == .finWait1 || entry.connection.state == .finWait2
                   || entry.connection.state == .lastAck else { continue }
 
-            flushOneConnection(key: key, conn: &entry.connection, hostMAC: hostMAC,
+            flushOneConnection(key: key, conn: entry.connection, hostMAC: hostMAC,
                                transport: &transport, io: io)
-            tcpEntries[key] = entry
         }
         stats.tcpFlushNs &+= cpuNanos() - tFlush
         dirtyConnections.removeAll(keepingCapacity: true)
@@ -642,7 +645,7 @@ public struct NATTable {
     // MARK: - Per-connection flush (send queues + FIN forwarding)
 
     private mutating func flushOneConnection(
-        key: NATKey, conn: inout TCPConnection,
+        key: NATKey, conn: TCPConnection,
         hostMAC: MACAddress,
         transport: inout PollingTransport,
         io: IOBuffer
@@ -1188,7 +1191,7 @@ public struct NATTable {
         key: NATKey, hostMAC: MACAddress, transport: inout PollingTransport,
         io: IOBuffer
     ) {
-        guard var entry = tcpEntries[key] else { return }
+        guard let entry = tcpEntries[key] else { return }
 
         var needsCleanup = false
         var cleanupFD: Int32 = 0
@@ -1251,7 +1254,6 @@ public struct NATTable {
         // If drain didn't finish, defer FIN to flushOneConnection
         if !finDrainComplete {
             entry.connection.pendingFinToVM = true
-            tcpEntries[key] = entry
             return
         }
 
@@ -1286,8 +1288,6 @@ public struct NATTable {
             needsCleanup = true
             cleanupFD = entry.connection.posixFD
         }
-
-        tcpEntries[key] = entry
 
         if needsCleanup {
             cleanupTCP(fd: cleanupFD, key: key, transport: &transport)

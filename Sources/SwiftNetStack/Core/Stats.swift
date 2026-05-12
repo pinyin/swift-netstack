@@ -62,6 +62,11 @@ public struct NATStats {
     public var tcpFsmNs: UInt64 = 0
     public var tcpExtReadNs: UInt64 = 0
     public var tcpFlushNs: UInt64 = 0
+    /// FSM sub-phase breakdown: dict lookup, tcpProcess call, ACK build, dict write-back.
+    public var tcpFsmDictNs: UInt64 = 0
+    public var tcpFsmFuncNs: UInt64 = 0
+    public var tcpFsmAckNs: UInt64 = 0
+    public var tcpFsmWBkNs: UInt64 = 0
 
     /// Snapshot and reset. Returns previous values.
     public mutating func snap() -> NATStats {
@@ -203,6 +208,15 @@ public func printStats(
         let extPct      = Int(Double(n.tcpExtReadNs)  / Double(base) * 100)
         let flushPct    = Int(Double(n.tcpFlushNs)    / Double(base) * 100)
         parts.append("tcpSub[ackFlush=\(ackFlushPct)% fsm=\(fsmPct)% ext=\(extPct)% flush=\(flushPct)%]")
+    }
+    // ── FSM sub-phase timing ──
+    let fsmSubTotal = n.tcpFsmDictNs + n.tcpFsmFuncNs + n.tcpFsmAckNs + n.tcpFsmWBkNs
+    if fsmSubTotal > 0 {
+        let dictPct = Int(Double(n.tcpFsmDictNs) / Double(fsmSubTotal) * 100)
+        let funcPct = Int(Double(n.tcpFsmFuncNs) / Double(fsmSubTotal) * 100)
+        let ackPct  = Int(Double(n.tcpFsmAckNs)  / Double(fsmSubTotal) * 100)
+        let wbkPct  = Int(Double(n.tcpFsmWBkNs)  / Double(fsmSubTotal) * 100)
+        parts.append("fsmSub[dict=\(dictPct)% func=\(funcPct)% ack=\(ackPct)% wbk=\(wbkPct)%]")
     }
     let line = "[STATS] " + parts.joined(separator: " ")
     _ = line.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }

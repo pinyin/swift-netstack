@@ -19,10 +19,21 @@ HTTP_PORT=7779
 TCP_CLOSE_PORT=7780
 BIDI_PORT=7781
 IPERF_PORT=7782
+CHAOS_CMD=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --chaos)
+            CHAOS_LOSS=5; CHAOS_REORDER=10; CHAOS_DUP=3
+            if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+                IFS=',' read -r a b c <<< "$2"
+                CHAOS_LOSS="${a:-5}"; CHAOS_REORDER="${b:-10}"; CHAOS_DUP="${c:-3}"
+                shift
+            fi
+            CHAOS_CMD="chaos_loss=$CHAOS_LOSS chaos_reorder=$CHAOS_REORDER chaos_dup=$CHAOS_DUP"
+            shift
+            ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -112,7 +123,7 @@ echo "Starting demo with external networking (gvproxy)..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=/init loglevel=4 panic=10 $NAT_CMD $EXT_CMD" \
+    --cmdline "console=hvc0 init=/init loglevel=4 panic=10 $NAT_CMD $EXT_CMD $CHAOS_CMD" \
     --cpus 1 --memory 512 \
     --external-net "$VFKIT_SOCK" \
     >"$TMPLOG" 2>&1 &

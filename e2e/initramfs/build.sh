@@ -27,6 +27,10 @@ if [ -f "$SCRIPT_DIR/bin/tcpstress" ]; then
     cp "$SCRIPT_DIR/bin/tcpstress" "$BUILD_DIR/bin/tcpstress"
     chmod +x "$BUILD_DIR/bin/tcpstress"
 fi
+if [ -f "$SCRIPT_DIR/bin/netem-set" ]; then
+    cp "$SCRIPT_DIR/bin/netem-set" "$BUILD_DIR/bin/netem-set"
+    chmod +x "$BUILD_DIR/bin/netem-set"
+fi
 
 # Create symlinks for busybox applets
 BUSYBOX_APPLETS=(
@@ -39,6 +43,7 @@ BUSYBOX_APPLETS=(
     wget sha256sum md5sum base64 hexdump
     printf xargs split expr
     dd cmp seq kill
+    tc
 )
 for applet in "${BUSYBOX_APPLETS[@]}"; do
     ln -sf busybox "$BUILD_DIR/bin/$applet"

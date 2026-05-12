@@ -8,6 +8,7 @@
 #   ./run.sh                              # all tests (default)
 #   ./run.sh --host test.local:1.2.3.4   # with DNS hostname
 #   ./run.sh --timeout 30                 # custom timeout
+#   ./run.sh --ext-target 192.168.6.6     # external server for NAT tests
 #
 # Prerequisites:
 #   - Swift toolchain (swift build)
@@ -30,6 +31,9 @@ INIT="/init"
 HOST_ARGS=()
 PCAP_PATH=""
 MTU=""
+EXT_TARGET=""
+EXT_IPERF_PORT=7782
+EXT_HTTP_PORT=7783
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,6 +44,9 @@ while [ $# -gt 0 ]; do
             ;;
         --pcap) PCAP_PATH="$2"; shift 2 ;;
         --mtu) MTU="$2"; shift 2 ;;
+        --ext-target) EXT_TARGET="$2"; shift 2 ;;
+        --ext-iperf-port) EXT_IPERF_PORT="$2"; shift 2 ;;
+        --ext-http-port) EXT_HTTP_PORT="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -110,10 +117,41 @@ if [ -n "$HOST_IP" ] && command -v iperf3 &>/dev/null; then
     fi
 fi
 
+# ── External server services (for nat-external-* tests) ──
+
+EXT_IPERF_SSH_PID=""
+EXT_HTTP_SSH_PID=""
+EXT_CMD=""
+
+if [ -n "$EXT_TARGET" ]; then
+    echo "External target: $EXT_TARGET"
+    EXT_CMD="ext_target=$EXT_TARGET ext_iperf_port=$EXT_IPERF_PORT ext_http_port=$EXT_HTTP_PORT"
+
+    # Start iperf3 on external server if not already running
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "iperf3 -c 127.0.0.1 -p $EXT_IPERF_PORT -t 1 2>&1" >/dev/null 2>&1; then
+        echo "iperf3 already running on $EXT_TARGET:$EXT_IPERF_PORT"
+    else
+        ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "killall iperf3 2>/dev/null; nohup iperf3 -s -p $EXT_IPERF_PORT --daemon" 2>/dev/null &
+        EXT_IPERF_SSH_PID=$!
+        sleep 0.5
+        echo "Started iperf3 on $EXT_TARGET:$EXT_IPERF_PORT"
+    fi
+
+    # Start HTTP server on external server if not already running
+    if ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "curl -s http://127.0.0.1:$EXT_HTTP_PORT/ 2>&1" >/dev/null 2>&1; then
+        echo "HTTP already running on $EXT_TARGET:$EXT_HTTP_PORT"
+    else
+        ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "killall python3 2>/dev/null; mkdir -p /tmp/http-test; echo 'ext-http-ok' > /tmp/http-test/index.html; cd /tmp/http-test && nohup python3 -m http.server $EXT_HTTP_PORT --bind 0.0.0.0 > /tmp/http-server.log 2>&1 &" 2>/dev/null &
+        EXT_HTTP_SSH_PID=$!
+        sleep 1
+        echo "Started HTTP on $EXT_TARGET:$EXT_HTTP_PORT"
+    fi
+fi
+
 # ── Run test ──
 
 TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
-trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
+trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null; [ -n "$EXT_IPERF_SSH_PID" ] && kill "$EXT_IPERF_SSH_PID" 2>/dev/null; [ -n "$EXT_HTTP_SSH_PID" ] && kill "$EXT_HTTP_SSH_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
 
 echo "========================================="
 echo "SwiftNetStack E2E Test Suite"
@@ -131,7 +169,7 @@ echo "Starting demo..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD" \
+    --cmdline "console=hvc0 init=$INIT loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD $EXT_CMD" \
     --cpus 1 --memory 512 \
     ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
     ${PCAP_PATH:+--pcap "$PCAP_PATH"} \

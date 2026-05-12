@@ -106,12 +106,13 @@ fi
 # Gateway: 192.168.127.1, Device (VM): 192.168.127.2, Host: 192.168.127.254
 # hostIP (192.168.127.254) is NAT'd to 127.0.0.1, so VM tests connect to 192.168.127.254
 NAT_CMD="nat_target=192.168.127.254 nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT nat_tcp_bidi_port=$BIDI_PORT nat_iperf_port=$IPERF_PORT"
+EXT_CMD="ext_target=192.168.6.6 ext_iperf_port=7782 ext_http_port=7783"
 
 echo "Starting demo with external networking (gvproxy)..."
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
-    --cmdline "console=hvc0 init=/init loglevel=4 panic=10 $NAT_CMD" \
+    --cmdline "console=hvc0 init=/init loglevel=4 panic=10 $NAT_CMD $EXT_CMD" \
     --cpus 1 --memory 512 \
     --external-net "$VFKIT_SOCK" \
     >"$TMPLOG" 2>&1 &

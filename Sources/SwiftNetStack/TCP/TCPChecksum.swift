@@ -12,15 +12,8 @@ func computeTCPChecksum(
     tcpLen: Int
 ) -> UInt16 {
     // Stack-allocated pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + len(2) = 12 bytes
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue, UInt8(tcpLen >> 8), UInt8(tcpLen & 0xFF),
-    ]
-    pseudoSrcAddr.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-
-    var sum = pseudoSum(pseudo)
+    var sum = computePseudoHeaderSum(srcIP: pseudoSrcAddr, dstIP: pseudoDstAddr,
+                                     protocol: IPProtocol.tcp.rawValue, totalLen: tcpLen)
     sum = checksumAdd(sum, tcpData, tcpLen)
     return finalizeChecksum(sum)
 }
@@ -39,14 +32,8 @@ func computeTCPChecksumSG(
     payloadViews: [PacketBuffer.View],
     tcpLen: Int
 ) -> UInt16 {
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue, UInt8(tcpLen >> 8), UInt8(tcpLen & 0xFF),
-    ]
-    pseudoSrcAddr.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-    var sum = pseudoSum(pseudo)
+    var sum = computePseudoHeaderSum(srcIP: pseudoSrcAddr, dstIP: pseudoDstAddr,
+                                     protocol: IPProtocol.tcp.rawValue, totalLen: tcpLen)
     sum = checksumAdd(sum, tcpHeader, headerLen)
     sum = checksumAddViews(sum, payloadViews)
     return finalizeChecksum(sum)

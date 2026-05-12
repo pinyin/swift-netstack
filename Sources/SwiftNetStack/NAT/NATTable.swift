@@ -173,8 +173,8 @@ public struct NATTable {
         if var mapping = udpEntries[key] {
             mapping.lastActivity = nowSec
             udpEntries[key] = mapping
-            let data = [UInt8](UnsafeRawBufferPointer(start: io.inputBase.advanced(by: payloadOfs), count: payloadLen))
-            sendUDP(fd: mapping.fd, data: data, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
+            let ptr = UnsafeRawPointer(io.inputBase.advanced(by: payloadOfs))
+            sendUDP(fd: mapping.fd, ptr: ptr, len: payloadLen, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
             return
         }
 
@@ -206,8 +206,8 @@ public struct NATTable {
         udpFdToKey[fd] = key
         transport.registerFD(fd, events: Int16(POLLIN), kind: .datagram)
 
-        let data = [UInt8](UnsafeRawBufferPointer(start: io.inputBase.advanced(by: payloadOfs), count: payloadLen))
-        sendUDP(fd: fd, data: data, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
+        let ptr = UnsafeRawPointer(io.inputBase.advanced(by: payloadOfs))
+        sendUDP(fd: fd, ptr: ptr, len: payloadLen, dstIP: key.dstIP, dstPort: key.dstPort, transport: &transport)
     }
 
     // MARK: - Delayed ACK (RFC 1122 timer-based coalescing)
@@ -647,8 +647,6 @@ public struct NATTable {
         transport: inout PollingTransport,
         io: IOBuffer
     ) {
-        let sqBufBase = conn.sendQueue.buf.baseAddress!
-
         // ── Drain sendQueue (external→VM) with inline writes ──
         // Each frame is sent immediately via sendmsg. TCP state (snd.nxt,
         // sendQueueSent) advances only on successful delivery. On EAGAIN/
@@ -682,11 +680,11 @@ public struct NATTable {
                 let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
                 var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: 54)
                 var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: data.ptr), iov_len: data.len)
-                var iovs: [iovec] = [iov0, iov1]
+                var iovs = (iov0, iov1)
                 var savedErrno: Int32 = 0
-                let r = iovs.withUnsafeMutableBufferPointer { iovPtr in
+                let r = withUnsafeMutableBytes(of: &iovs) { buf in
                     var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                     msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                     msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
                                      msg_control: nil, msg_controllen: 0, msg_flags: 0)
                     let r = Darwin.sendmsg(epFD, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
                     if r < 0 { savedErrno = errno }
@@ -708,8 +706,7 @@ public struct NATTable {
         // ── Drain externalSendQueue (VM→external) ──
         while conn.externalSendQueued > 0 {
             guard let (ptr, len) = conn.externalSendQueue.peek(max: min(conn.externalSendQueued, 65536)) else { break }
-            let chunk = [UInt8](UnsafeRawBufferPointer(start: ptr, count: len))
-            let written = transport.writeStream(chunk, to: conn.posixFD)
+            let written = transport.writeStream(ptr, len, to: conn.posixFD)
             if written < 0 {
                 if errno == EAGAIN {
                     transport.setFDEvents(conn.posixFD, events: Int16(POLLIN | POLLOUT))
@@ -721,7 +718,7 @@ public struct NATTable {
             if written == 0 { break }
             debugLog("[NAT-TCP-EXT] flushed \(written)B to \(key.dstIP):\(key.dstPort)\n")
             if let pw = self.externalPcap {
-                let sentChunk = Array(chunk.prefix(written))
+                let sentChunk = [UInt8](UnsafeRawBufferPointer(start: ptr, count: written))
                 captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
                     conn: conn, flags: [.ack, .psh], payload: sentChunk,
                     hostMAC: hostMAC)
@@ -1228,11 +1225,11 @@ public struct NATTable {
                 let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
                 var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: 54)
                 var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: data.ptr), iov_len: data.len)
-                var iovs: [iovec] = [iov0, iov1]
+                var iovs = (iov0, iov1)
                 var savedErrno: Int32 = 0
-                let r = iovs.withUnsafeMutableBufferPointer { iovPtr in
+                let r = withUnsafeMutableBytes(of: &iovs) { buf in
                     var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                     msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                     msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
                                      msg_control: nil, msg_controllen: 0, msg_flags: 0)
                     let r = Darwin.sendmsg(epFD, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
                     if r < 0 { savedErrno = errno }
@@ -1305,13 +1302,13 @@ public struct NATTable {
         return (mac, ep)
     }
 
-    private func sendUDP(fd: Int32, data: [UInt8], dstIP: IPv4Address, dstPort: UInt16, transport: inout PollingTransport) {
+    private func sendUDP(fd: Int32, ptr: UnsafeRawPointer, len: Int, dstIP: IPv4Address, dstPort: UInt16, transport: inout PollingTransport) {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = dstPort.bigEndian
         withUnsafeMutableBytes(of: &addr.sin_addr) { dstIP.write(to: $0.baseAddress!) }
-        transport.writeDatagram(data, to: fd, addr: addr)
+        transport.writeDatagram(ptr, len, to: fd, addr: addr)
     }
 
     private mutating func cleanupTCP(fd: Int32, key: NATKey, transport: inout PollingTransport) {

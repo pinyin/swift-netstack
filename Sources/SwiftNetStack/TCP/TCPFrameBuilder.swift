@@ -106,16 +106,8 @@ public func finalizeTCPChecksumEx(
     let tcpPtr = io.output.baseAddress!.advanced(by: hdrOfs + ethHeaderLen + ipv4HeaderLen)
     let tcpTotalLen = tcpHdrLen + payloadLen
 
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue,
-        UInt8(tcpTotalLen >> 8), UInt8(tcpTotalLen & 0xFF),
-    ]
-    srcIP.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        dstIP.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-
-    var ckSum = pseudoSum(pseudo)
+    var ckSum = computePseudoHeaderSum(srcIP: srcIP, dstIP: dstIP,
+                                        protocol: IPProtocol.tcp.rawValue, totalLen: tcpTotalLen)
     ckSum = checksumAdd(ckSum, tcpPtr, tcpHdrLen)
     if let pp = payloadPtr, payloadLen > 0 {
         ckSum = checksumAdd(ckSum, pp, payloadLen)
@@ -137,16 +129,8 @@ public func finalizeTCPChecksum(
     let tcpTotalLen = tcpHdrLen + payloadLen
 
     // Pseudo-header
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.tcp.rawValue,
-        UInt8(tcpTotalLen >> 8), UInt8(tcpTotalLen & 0xFF),
-    ]
-    srcIP.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        dstIP.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-
-    var ckSum = pseudoSum(pseudo)
+    var ckSum = computePseudoHeaderSum(srcIP: srcIP, dstIP: dstIP,
+                                        protocol: IPProtocol.tcp.rawValue, totalLen: tcpTotalLen)
     ckSum = checksumAdd(ckSum, tcpPtr, tcpHdrLen)
     if let pp = payloadPtr, payloadLen > 0 {
         ckSum = checksumAdd(ckSum, pp, payloadLen)

@@ -48,6 +48,10 @@ public struct PollingTransport {
     public var pollTimeout: Int32
     public var stats: TransportStats
 
+    /// Reusable recv scratch buffer — allocated once, reused every round.
+    /// Avoids 64KB alloc+zero-fill per external recv() call.
+    private var recvScratch: [UInt8]
+
     // MARK: - Endpoint fd lookup
 
     public func fdForEndpoint(_ id: Int) -> Int32? {
@@ -69,6 +73,7 @@ public struct PollingTransport {
         self.onShutdown = onShutdown
         self.pollTimeout = pollTimeout
         self.stats = TransportStats()
+        self.recvScratch = [UInt8](repeating: 0, count: 65536)
     }
 
     // MARK: - External FD registration
@@ -170,14 +175,12 @@ public struct PollingTransport {
                 case .stream:
                     var isListener = false
                     while true {
-                        var buf = [UInt8](repeating: 0, count: 65536)
-                        stats.recvCalls += 1
-                        let n = buf.withUnsafeMutableBytes {
-                            Darwin.recv(fd, $0.baseAddress!, 65536, 0)
+                        let n = recvScratch.withUnsafeMutableBytes {
+                            stats.recvCalls += 1
+                            return Darwin.recv(fd, $0.baseAddress!, 65536, 0)
                         }
                         if n > 0 {
-                            buf.removeLast(65536 - n)
-                            result.streamReads.append((fd, buf))
+                            result.streamReads.append((fd, Array(recvScratch[0..<n])))
                         } else if n == 0 {
                             result.streamHangup.append(fd); break
                         } else {
@@ -207,20 +210,18 @@ public struct PollingTransport {
                     }
                 case .datagram:
                     while true {
-                        var buf = [UInt8](repeating: 0, count: 65536)
                         var srcAddr = sockaddr_in()
                         var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-                        stats.recvfromCalls += 1
-                        let n = buf.withUnsafeMutableBytes { ptr in
-                            withUnsafeMutablePointer(to: &srcAddr) {
+                        let n = recvScratch.withUnsafeMutableBytes { ptr in
+                            stats.recvfromCalls += 1
+                            return withUnsafeMutablePointer(to: &srcAddr) {
                                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                                     Darwin.recvfrom(fd, ptr.baseAddress!, 65536, 0, $0, &srcLen)
                                 }
                             }
                         }
                         if n > 0 {
-                            buf.removeLast(65536 - n)
-                            result.datagramReads.append((fd, buf, srcAddr))
+                            result.datagramReads.append((fd, Array(recvScratch[0..<n]), srcAddr))
                         } else {
                             if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
                                 result.deadFDs.append(fd)
@@ -230,13 +231,11 @@ public struct PollingTransport {
                     }
                 case .rawDatagram:
                     while true {
-                        var buf = [UInt8](repeating: 0, count: 4096)
-                        let n = buf.withUnsafeMutableBytes {
+                        let n = recvScratch.withUnsafeMutableBytes {
                             Darwin.recvfrom(fd, $0.baseAddress!, 4096, 0, nil, nil)
                         }
                         if n > 0 {
-                            buf.removeLast(4096 - n)
-                            result.rawDatagramReads.append((fd, buf))
+                            result.rawDatagramReads.append((fd, Array(recvScratch[0..<n])))
                         } else {
                             if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
                                 result.deadFDs.append(fd)
@@ -295,10 +294,10 @@ public struct PollingTransport {
                 let payBase = batch.payBase[i] ?? io.input.baseAddress!
                 let payPtr = payBase + batch.payOfs[i]
                 var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: batch.payLen[i])
-                var iovs: [iovec] = [iov0, iov1]
-                _ = iovs.withUnsafeMutableBufferPointer { iovPtr in
+                var iovs = (iov0, iov1)
+                _ = withUnsafeMutableBytes(of: &iovs) { buf in
                     var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                     msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                     msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
                                      msg_control: nil, msg_controllen: 0, msg_flags: 0)
                     stats.sendmsgCalls += 1
                     stats.sendBytes += UInt64(hdrLen + batch.payLen[i])
@@ -337,11 +336,11 @@ public struct PollingTransport {
         if let payPtr, payLen > 0 {
             var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
             var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: payLen)
-            var iovs: [iovec] = [iov0, iov1]
+            var iovs = (iov0, iov1)
             var ok = false
-            _ = iovs.withUnsafeMutableBufferPointer { iovPtr in
+            _ = withUnsafeMutableBytes(of: &iovs) { buf in
                 var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                 msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                 msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
                                  msg_control: nil, msg_controllen: 0, msg_flags: 0)
                 stats.sendmsgCalls += 1
                 stats.sendBytes += UInt64(hdrLen + payLen)
@@ -362,39 +361,33 @@ public struct PollingTransport {
     // MARK: - Write (external FDs)
 
     @discardableResult
-    public mutating func writeStream(_ data: [UInt8], to fd: Int32) -> Int {
-        guard !data.isEmpty else { return 0 }
+    public mutating func writeStream(_ ptr: UnsafeRawPointer, _ len: Int, to fd: Int32) -> Int {
+        guard len > 0 else { return 0 }
         stats.sendmsgCalls += 1
-        stats.sendBytes += UInt64(data.count)
-        return data.withUnsafeBytes { ptr in
-            Darwin.send(fd, ptr.baseAddress!, data.count, Int32(MSG_NOSIGNAL))
-        }
+        stats.sendBytes += UInt64(len)
+        return Darwin.send(fd, ptr, len, Int32(MSG_NOSIGNAL))
     }
 
     @discardableResult
-    public mutating func writeDatagram(_ data: [UInt8], to fd: Int32, addr: sockaddr_in) -> Int {
-        guard !data.isEmpty else { return 0 }
+    public mutating func writeDatagram(_ ptr: UnsafeRawPointer, _ len: Int, to fd: Int32, addr: sockaddr_in) -> Int {
+        guard len > 0 else { return 0 }
         var sa = addr
         stats.sendmsgCalls += 1
-        stats.sendBytes += UInt64(data.count)
-        return data.withUnsafeBytes { ptr in
-            var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: ptr.baseAddress!), iov_len: data.count)
-            var msg = msghdr(
-                msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
-                msg_iov: &iov, msg_iovlen: 1,
-                msg_control: nil, msg_controllen: 0, msg_flags: 0
-            )
-            return Darwin.sendmsg(fd, &msg, 0)
-        }
+        stats.sendBytes += UInt64(len)
+        var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: ptr), iov_len: len)
+        var msg = msghdr(
+            msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
+            msg_iov: &iov, msg_iovlen: 1,
+            msg_control: nil, msg_controllen: 0, msg_flags: 0
+        )
+        return Darwin.sendmsg(fd, &msg, 0)
     }
 
     @discardableResult
-    public mutating func writeDatagram(_ data: [UInt8], to fd: Int32) -> Int {
-        guard !data.isEmpty else { return 0 }
+    public mutating func writeDatagram(_ ptr: UnsafeRawPointer, _ len: Int, to fd: Int32) -> Int {
+        guard len > 0 else { return 0 }
         stats.sendmsgCalls += 1
-        stats.sendBytes += UInt64(data.count)
-        return data.withUnsafeBytes { ptr in
-            Darwin.send(fd, ptr.baseAddress!, data.count, 0)
-        }
+        stats.sendBytes += UInt64(len)
+        return Darwin.send(fd, ptr, len, 0)
     }
 }

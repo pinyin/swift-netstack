@@ -55,16 +55,9 @@ public struct UDPEchoSocket: SocketHandler {
         writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
         writeUInt16BE(0, to: udpPtr.advanced(by: 6))  // checksum placeholder
 
-        // UDP checksum
-        var pseudo: [UInt8] = [
-            0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.udp.rawValue,
-            UInt8(udpTotalLen >> 8), UInt8(udpTotalLen & 0xFF),
-        ]
-        dstIP.write(to: &pseudo)
-        pseudo.withUnsafeMutableBytes { buf in
-            srcIP.write(to: buf.baseAddress!.advanced(by: 4))
-        }
-        var ckSum = pseudoSum(pseudo)
+        // UDP checksum — src/dst are swapped for echo reply
+        var ckSum = computePseudoHeaderSum(srcIP: dstIP, dstIP: srcIP,
+                                            protocol: IPProtocol.udp.rawValue, totalLen: udpTotalLen)
         ckSum = checksumAdd(ckSum, udpPtr, 8)
         ckSum = checksumAdd(ckSum, UnsafeRawPointer(payloadPtr), payloadLen)
         let ck = finalizeChecksum(ckSum)

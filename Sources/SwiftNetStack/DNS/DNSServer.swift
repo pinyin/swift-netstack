@@ -240,7 +240,9 @@ public struct DNSServer {
         )
 
         let queryBytes = DNSPacket.buildQuery(txID: ourTxID, question: question)
-        transport.writeDatagram(queryBytes, to: fd, addr: upstream)
+        queryBytes.withUnsafeBytes { buf in
+            transport.writeDatagram(buf.baseAddress!, buf.count, to: fd, addr: upstream)
+        }
         return true
     }
 

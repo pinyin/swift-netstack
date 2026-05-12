@@ -96,17 +96,8 @@ func computeUDPChecksum(
     udpData: UnsafeRawPointer,
     udpLen: Int
 ) -> UInt16 {
-    // Stack-allocated pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + len(2) = 12 bytes
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.udp.rawValue, UInt8(udpLen >> 8), UInt8(udpLen & 0xFF),
-    ]
-    pseudoSrcAddr.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-
-    // Compute checksum in two passes: pseudo-header then UDP segment
-    var sum = pseudoSum(pseudo)
+    var sum = computePseudoHeaderSum(srcIP: pseudoSrcAddr, dstIP: pseudoDstAddr,
+                                     protocol: IPProtocol.udp.rawValue, totalLen: udpLen)
     sum = checksumAdd(sum, udpData, udpLen)
     let ck = finalizeChecksum(sum)
     return ck == 0 ? 0xFFFF : ck
@@ -123,14 +114,8 @@ func computeUDPChecksumSG(
     payloadViews: [PacketBuffer.View],
     udpLen: Int
 ) -> UInt16 {
-    var pseudo: [UInt8] = [
-        0, 0, 0, 0,  0, 0, 0, 0,  0, IPProtocol.udp.rawValue, UInt8(udpLen >> 8), UInt8(udpLen & 0xFF),
-    ]
-    pseudoSrcAddr.write(to: &pseudo)
-    pseudo.withUnsafeMutableBytes { buf in
-        pseudoDstAddr.write(to: buf.baseAddress!.advanced(by: 4))
-    }
-    var sum = pseudoSum(pseudo)
+    var sum = computePseudoHeaderSum(srcIP: pseudoSrcAddr, dstIP: pseudoDstAddr,
+                                     protocol: IPProtocol.udp.rawValue, totalLen: udpLen)
     sum = checksumAdd(sum, udpHeader, 8)
     sum = checksumAddViews(sum, payloadViews)
     let ck = finalizeChecksum(sum)

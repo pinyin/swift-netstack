@@ -260,6 +260,98 @@ func computeACKFullChecksum(
 }
 #endif
 
+// MARK: - RFC 7323 TSopt option builder
+
+/// Build 12-byte TSopt option: NOP+NOP+kind=8+len=10+TSval+TSecr.
+/// One allocation per handshake — not in the hot path.
+public func buildTSoptOption(tsval: UInt32, tsecr: UInt32) -> [UInt8] {
+    var opt = [UInt8](repeating: 0, count: 12)
+    opt[0] = 1; opt[1] = 1   // NOP, NOP
+    opt[2] = 8; opt[3] = 10  // TSopt kind, len
+    writeUInt32BE(tsval, to: &opt[4])
+    writeUInt32BE(tsecr, to: &opt[8])
+    return opt
+}
+
+// MARK: - Extended ACK template (66-byte, with TSopt)
+
+/// Build a 66-byte ACK template (Ethernet+IPv4+TCP+NOP+NOP+TSopt).
+/// TCP header = 32 bytes (20 base + 12 options). Data offset = 8.
+public func makeAckTemplateWithTSopt(
+    hostMAC: MACAddress, vmMAC: MACAddress,
+    srcIP: IPv4Address, dstIP: IPv4Address,
+    srcPort: UInt16, dstPort: UInt16,
+    window: UInt16
+) -> [UInt8] {
+    var t = [UInt8](repeating: 0, count: 66)
+
+    // Ethernet
+    vmMAC.write(to: &t)
+    hostMAC.write(to: &t[6])
+    writeUInt16BE(EtherType.ipv4.rawValue, to: &t[12])
+
+    // IPv4 — totalLength = 20 + 32 = 52
+    writeIPv4Header(to: &t[14], totalLength: 52, protocol: .tcp,
+                    srcIP: srcIP, dstIP: dstIP)
+
+    // TCP base header (20 bytes at offset 34)
+    let tcpOfs = 34
+    writeUInt16BE(srcPort, to: &t[tcpOfs])
+    writeUInt16BE(dstPort, to: &t[tcpOfs + 2])
+    // seq(38-41), ack(42-45) — zero placeholder
+    t[tcpOfs + 12] = 0x80  // data offset = 8 (32/4)
+    t[tcpOfs + 13] = TCPFlags.ack.rawValue
+    writeUInt16BE(window, to: &t[tcpOfs + 14])
+    // checksum(50-51), urgent(52-53) — zero
+
+    // TCP options: NOP+NOP+TSopt(8,10,TSval,Tsecr) = 12 bytes at offset 54
+    t[54] = 1; t[55] = 1    // NOP, NOP
+    t[56] = 8; t[57] = 10   // TSopt kind, len
+    // TSval(58-61), TSecr(62-65) — zero placeholder
+
+    return t
+}
+
+/// Write ACK from 66-byte TSopt template. Always uses full checksum
+/// (TSval changes every ACK, making incremental checksum pointless).
+/// Returns output offset, writes final checksum to `outCK`.
+public func writeAckFromTemplateExt(
+    io: IOBuffer,
+    template: [UInt8],
+    seq: UInt32, ack: UInt32,
+    srcIP: IPv4Address, dstIP: IPv4Address,
+    window: UInt16,
+    tsval: UInt32, tsecr: UInt32,
+    outCK: inout UInt16
+) -> Int {
+    guard let ptr = io.allocOutput(66) else { return -1 }
+    let ofs = ptr - io.output.baseAddress!
+
+    template.withUnsafeBytes { tBuf in
+        ptr.copyMemory(from: tBuf.baseAddress!, byteCount: 66)
+    }
+
+    // Overwrite dynamic fields
+    writeUInt32BE(seq, to: ptr.advanced(by: 38))
+    writeUInt32BE(ack, to: ptr.advanced(by: 42))
+    if window != 65535 {
+        writeUInt16BE(window, to: ptr.advanced(by: 48))
+    }
+    writeUInt32BE(tsval, to: ptr.advanced(by: 58))
+    writeUInt32BE(tsecr, to: ptr.advanced(by: 62))
+
+    // Full checksum over 32-byte TCP header
+    writeUInt16BE(0, to: ptr.advanced(by: 50))
+    let ck = computeTCPChecksum(
+        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
+        tcpData: ptr.advanced(by: 34), tcpLen: 32
+    )
+    outCK = ck
+    writeUInt16BE(ck, to: ptr.advanced(by: 50))
+
+    return ofs
+}
+
 // MARK: - RFC 1146 incremental TCP checksum
 
 func computeIncrementalTCPChecksum(

@@ -59,6 +59,18 @@ public struct TCPSegmentInfo {
     public var window: UInt16
     /// Window scale shift from SYN option (RFC 1323). 0 if not present.
     public var peerWindowScale: UInt8
+
+    // RFC 2018 SACK — parsed from SACK option (kind=5)
+    public var sackOK: Bool = false
+    public var sackBlockCount: UInt8 = 0
+    public var sackL0: UInt32 = 0; public var sackL1: UInt32 = 0; public var sackL2: UInt32 = 0; public var sackL3: UInt32 = 0
+    public var sackR0: UInt32 = 0; public var sackR1: UInt32 = 0; public var sackR2: UInt32 = 0; public var sackR3: UInt32 = 0
+
+    // RFC 7323 Timestamps — parsed from TSopt (kind=8)
+    public var tsOK: Bool = false
+    public var tsval: UInt32 = 0
+    public var tsecr: UInt32 = 0
+
     public init(seq: UInt32, ack: UInt32, flags: TCPFlags, window: UInt16,
                 peerWindowScale: UInt8 = 0) {
         self.seq = seq; self.ack = ack; self.flags = flags; self.window = window

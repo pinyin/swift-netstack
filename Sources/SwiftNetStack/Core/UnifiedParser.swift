@@ -191,20 +191,68 @@ private func parseOneTCP(
     let flags = TCPFlags(rawValue: tcpBuf[13])
     let window = readUInt16BE(ptr, 14)
 
-    // Extract WSCALE option from SYN segments (RFC 1323)
+    // Parse TCP options on ALL segments (handshake + post-handshake).
+    // Previously only parsed WSCALE on SYN-only; now also parses
+    // SACK-Permitted(4), SACK(5), TSopt(8) as appropriate.
     var peerWindowScale: UInt8 = 0
-    if flags.isSyn && !flags.isAck && tcpHeaderLen > 20 {
+    var sackOK = false
+    var tsOK = false
+    var tsval: UInt32 = 0
+    var tsecr: UInt32 = 0
+    var sackCount: UInt8 = 0
+    var sackL0: UInt32 = 0, sackL1: UInt32 = 0, sackL2: UInt32 = 0, sackL3: UInt32 = 0
+    var sackR0: UInt32 = 0, sackR1: UInt32 = 0, sackR2: UInt32 = 0, sackR3: UInt32 = 0
+
+    if tcpHeaderLen > 20 {
         var optOfs = 20
         while optOfs < tcpHeaderLen {
             let kind = tcpBuf[optOfs]
-            if kind == 0 { break }  // End of options
-            if kind == 1 { optOfs += 1; continue }  // NOP
+            if kind == 0 { break }
+            if kind == 1 { optOfs += 1; continue }
             if optOfs + 1 >= tcpHeaderLen { break }
             let optLen = Int(tcpBuf[optOfs + 1])
             if optLen < 2 || optOfs + optLen > tcpHeaderLen { break }
-            if kind == 3, optLen == 3, optOfs + 2 < tcpHeaderLen {
-                peerWindowScale = min(tcpBuf[optOfs + 2], 14)
+
+            if flags.isSyn {
+                // Handshake options (SYN / SYN-ACK)
+                switch kind {
+                case 3 where optLen == 3:  // WSCALE
+                    peerWindowScale = min(tcpBuf[optOfs + 2], 14)
+                case 4 where optLen == 2:  // SACK-Permitted
+                    sackOK = true
+                case 8 where optLen == 10:  // TSopt
+                    tsOK = true
+                    tsval = readUInt32BE(ptr, optOfs + 2)
+                    tsecr = readUInt32BE(ptr, optOfs + 6)
+                default: break
+                }
+            } else {
+                // Post-handshake options (non-SYN)
+                switch kind {
+                case 5 where optLen >= 10:  // SACK (kind=5, len>=2+8)
+                    let numBlocks = (optLen - 2) / 8
+                    for b in 0..<min(numBlocks, 4) {
+                        let bo = optOfs + 2 + b * 8
+                        guard bo + 8 <= tcpHeaderLen else { break }
+                        let l = readUInt32BE(ptr, bo)
+                        let r = readUInt32BE(ptr, bo + 4)
+                        switch b {
+                        case 0: sackL0 = l; sackR0 = r
+                        case 1: sackL1 = l; sackR1 = r
+                        case 2: sackL2 = l; sackR2 = r
+                        case 3: sackL3 = l; sackR3 = r
+                        default: break
+                        }
+                        sackCount = UInt8(b + 1)
+                    }
+                case 8 where optLen == 10:  // TSopt
+                    tsOK = true
+                    tsval = readUInt32BE(ptr, optOfs + 2)
+                    tsecr = readUInt32BE(ptr, optOfs + 6)
+                default: break
+                }
             }
+
             optOfs += optLen
         }
     }
@@ -214,9 +262,17 @@ private func parseOneTCP(
 
     out.tcpKeys[idx] = NATKey(vmIP: srcIP, vmPort: srcPort,
                                dstIP: dstIP, dstPort: dstPort, protocol: .tcp)
-    out.tcpSegs[idx] = TCPSegmentInfo(seq: seqNum, ack: ackNum,
-                                       flags: flags, window: window,
-                                       peerWindowScale: peerWindowScale)
+    var seg = TCPSegmentInfo(seq: seqNum, ack: ackNum,
+                              flags: flags, window: window,
+                              peerWindowScale: peerWindowScale)
+    seg.sackOK = sackOK
+    seg.tsOK = tsOK
+    seg.tsval = tsval
+    seg.tsecr = tsecr
+    seg.sackBlockCount = sackCount
+    seg.sackL0 = sackL0; seg.sackL1 = sackL1; seg.sackL2 = sackL2; seg.sackL3 = sackL3
+    seg.sackR0 = sackR0; seg.sackR1 = sackR1; seg.sackR2 = sackR2; seg.sackR3 = sackR3
+    out.tcpSegs[idx] = seg
     out.tcpPayloadOfs[idx] = baseOfs + ipPayloadOfs + tcpHeaderLen
     out.tcpPayloadLen[idx] = len - tcpHeaderLen
     out.tcpEndpointIDs[idx] = epID

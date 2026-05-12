@@ -53,6 +53,12 @@ public struct NATTable {
     private var _nextID: UInt64 = 0
     private let mss: Int
 
+    /// Gateway endpoint IPs — TCP connections to these IPs on port 53 are
+    /// redirected to `upstreamDNS` (if configured).
+    public var localIPs: Set<IPv4Address> = []
+    /// Upstream DNS server for TCP DNS redirect (NAT-based, non-blocking).
+    public var upstreamDNS: IPv4Address? = nil
+
     public init(portForwards: [PortForwardEntry] = [], mss: Int = 1400) {
         self.mss = mss
         self.stats = NATStats()
@@ -234,8 +240,52 @@ public struct NATTable {
     ) -> Bool {
         var outCK: UInt16 = 0
         let hdrOfs: Int
+        let hdrLen: Int
 
-        if let tmpl = conn.ackTemplate {
+        // SACK path: scoreboard has blocks and peer supports SACK.
+        // Variable-length frame — template-based paths cannot be used.
+        if conn.sackOK, conn.sackBlocks.count > 0 {
+            stats.ackChecksumFull += 1
+            var opts: [UInt8] = []
+            if conn.tsOK {
+                let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
+                let tsecr = conn.tsRecent
+                opts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: tsecr))
+            }
+            opts.append(contentsOf: conn.sackBlocks.buildSACKOption())
+            while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
+
+            let tcpHdrLen = 20 + opts.count
+            hdrLen = 14 + 20 + tcpHdrLen
+            hdrOfs = buildTCPHeaderWithOptions(
+                io: io, hostMAC: conn.hostMAC, dstMAC: conn.vmMAC,
+                srcIP: conn.dstIP, dstIP: conn.vmIP,
+                srcPort: conn.dstPort, dstPort: conn.vmPort,
+                seqNumber: seq, ackNumber: ack,
+                flags: .ack, window: window,
+                options: opts
+            )
+            if hdrOfs >= 0 {
+                finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
+                    srcIP: conn.dstIP, dstIP: conn.vmIP,
+                    tcpHdrLen: tcpHdrLen,
+                    payloadPtr: nil, payloadLen: 0)
+            }
+            // SACK blocks change every ACK — checksum caching is useless
+            conn.ackChecksumValid = false
+        } else if let tmpl = conn.ackTemplateExt {
+            // 66-byte template with TSopt — always full checksum
+            stats.ackTemplateUsed += 1
+            stats.ackChecksumFull += 1
+            let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
+            let tsecr = conn.tsRecent
+            hdrOfs = writeAckFromTemplateExt(io: io, template: tmpl,
+                seq: seq, ack: ack,
+                srcIP: conn.dstIP, dstIP: conn.vmIP,
+                window: window, tsval: tsval, tsecr: tsecr, outCK: &outCK)
+            hdrLen = 66
+        } else if let tmpl = conn.ackTemplate {
+            // 54-byte template — incremental checksum when possible
             stats.ackTemplateUsed += 1
             let incCK: UInt16?
             if conn.ackChecksumValid && conn.lastACKWindow == window {
@@ -252,14 +302,15 @@ public struct NATTable {
             hdrOfs = writeAckFromTemplate(io: io, template: tmpl, seq: seq, ack: ack,
                                           srcIP: conn.dstIP, dstIP: conn.vmIP,
                                           window: window, checksum: incCK, outCK: &outCK)
-#if DEBUG
+            hdrLen = 54
+    #if DEBUG
             if incCK != nil, hdrOfs >= 0 {
                 let fullCK = computeACKFullChecksum(tmpl: tmpl, seq: seq, ack: ack,
                                                     srcIP: conn.dstIP, dstIP: conn.vmIP)
                 assert(outCK == fullCK,
                        "Incremental checksum mismatch: inc=\(outCK) full=\(fullCK) oldCK=\(conn.lastACKChecksum) oldSeq=\(conn.lastACKSeq)→\(seq) oldAck=\(conn.lastACKAck)→\(ack)")
             }
-#endif
+    #endif
         } else {
             stats.ackTemplateFallback += 1
             stats.ackChecksumFull += 1
@@ -267,6 +318,7 @@ public struct NATTable {
                 srcIP: conn.dstIP, dstIP: conn.vmIP,
                 srcPort: conn.dstPort, dstPort: conn.vmPort,
                 seqNumber: seq, ackNumber: ack, flags: .ack, window: window)
+            hdrLen = 54
             if hdrOfs >= 0 {
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
@@ -279,17 +331,23 @@ public struct NATTable {
         conn.lastACKSeq = seq
         conn.lastACKAck = ack
         conn.lastACKWindow = window
-        conn.ackChecksumValid = true
-        if conn.ackTemplate != nil {
+        // Only cache checksum for 54-byte template (incremental reuse).
+        // SACK and TSopt paths are excluded — they use full checksum.
+        if conn.ackChecksumValid {
+            // still valid — maintained by 54-byte template path
+        } else if conn.sackBlocks.count == 0,
+                  conn.ackTemplateExt == nil,
+                  conn.ackTemplate != nil {
+            conn.ackChecksumValid = true
             conn.lastACKChecksum = outCK
         }
 
         if let pw = self.externalPcap {
             let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
-            pw.writeRaw(framePtr: hdrPtr, len: 54)
+            pw.writeRaw(framePtr: hdrPtr, len: hdrLen)
         }
         return transport.writeSingleFrame(endpointID: conn.endpointID, io: io,
-                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          hdrOfs: hdrOfs, hdrLen: hdrLen,
                                           payPtr: nil, payLen: 0)
     }
 
@@ -423,12 +481,17 @@ public struct NATTable {
 
             // New outbound connection
             if seg.flags.isSyn, !seg.flags.isAck {
+                // DNS TCP redirect: VM→gateway:53 → upstream DNS:53 (non-blocking, via NAT)
+                var redirectIP: IPv4Address? = nil
+                if key.dstPort == 53, let upstream = upstreamDNS, localIPs.contains(key.dstIP) {
+                    redirectIP = upstream
+                }
                 handleOutboundSYN(
                     key: key, srcMAC: srcMAC, seg: seg,
                     payloadPtr: payloadPtr, payloadLen: payloadLen,
                     endpointID: ep,
                     hostMAC: hostMAC, transport: &transport,
-                    io: io
+                    io: io, redirectIP: redirectIP
                 )
                 dirtyConnections.insert(key)
                 continue
@@ -461,8 +524,25 @@ public struct NATTable {
                 }
             }
 
+            // PAWS check (RFC 7323 §4.2.1): drop if TSval is too old.
+            if entry.connection.tsOK, seg.tsOK,
+               entry.connection.tsRecent != 0,
+               seg.tsval < entry.connection.tsRecent {
+                continue
+            }
+
+            // Backpressure: skip data-bearing segments when external send
+            // queue is full. If we process (advance rcv.nxt) but can't
+            // queue the data, it's silently lost — VM thinks it was
+            // delivered. By skipping, the VM gets no ACK and retransmits.
+            if payloadLen > 0,
+               entry.connection.externalSendQueued + payloadLen > TCPConnection.maxQueueBytes {
+                continue
+            }
+
             let oldState = entry.connection.state
             let oldUna = entry.connection.snd.una
+            let oldRcvNxt = entry.connection.rcv.nxt
             let (newState, toSend, dataPtr, dataLen) = tcpProcess(
                 state: entry.connection.state, seg: seg,
                 payloadPtr: payloadPtr, payloadLen: payloadLen,
@@ -471,16 +551,46 @@ public struct NATTable {
             entry.connection.state = newState
             // Apply peer window scaling (FSM stores raw wire window from seg.window)
             entry.connection.snd.wnd = UInt32(seg.window) << entry.connection.peerWindowScale
+
+            // Record TSval for next PAWS check
+            if entry.connection.tsOK, seg.tsOK {
+                entry.connection.tsRecent = seg.tsval
+                entry.connection.tsRecentAge = nowUs
+            }
+
+            // Record out-of-order data in SACK scoreboard
+            if payloadLen > 0, seg.seq > oldRcvNxt {
+                entry.connection.sackBlocks.record(seg.seq, seg.seq &+ UInt32(payloadLen))
+            }
+
             if newState == .established && entry.connection.ackTemplate == nil {
+                // For inbound connections, learn VM capabilities from SYN-ACK
+                if entry.isInbound, seg.flags.isSyn {
+                    entry.connection.peerWindowScale = seg.peerWindowScale
+                    entry.connection.sackOK = seg.sackOK
+                    entry.connection.tsOK = seg.tsOK && entry.connection.ourTSOK
+                }
                 entry.connection.ackTemplate = makeAckTemplate(
                     hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
                     srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
                     window: wireWindow(262144, scale: entry.connection.ourWindowScale)
                 )
+                if entry.connection.tsOK {
+                    entry.connection.ackTemplateExt = makeAckTemplateWithTSopt(
+                        hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
+                        srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
+                        srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
+                        window: wireWindow(262144, scale: entry.connection.ourWindowScale)
+                    )
+                }
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
             if unaDelta > 0 { entry.connection.ackSendBuf(delta: unaDelta) }
+            // Advance SACK scoreboard past acknowledged data
+            if entry.connection.rcv.nxt != oldRcvNxt {
+                entry.connection.sackBlocks.ackThrough(entry.connection.rcv.nxt)
+            }
             // Resume external reads if backpressure cleared
             if entry.connection.sendQueueBlocked, entry.connection.totalQueuedBytes < TCPConnection.maxQueueBytes / 2 {
                 entry.connection.sendQueueBlocked = false
@@ -497,7 +607,12 @@ public struct NATTable {
             }
             if dataLen > 0, let ptr = dataPtr {
                 debugLog("[NAT-TCP-PROC] buffering \(dataLen)B for external \(key.dstIP):\(key.dstPort)\n")
-                entry.connection.appendExternalSend(ptr, dataLen)
+                let queued = entry.connection.appendExternalSend(ptr, dataLen)
+                if queued == 0, payloadLen > 0 {
+                    // Safety net — should be rare with backpressure pre-check.
+                    // Data was ACKed to VM but not queued for external send.
+                    debugLog("[NAT-TCP-ERR] external send queue full, \(dataLen)B dropped for \(key.dstIP):\(key.dstPort)\n")
+                }
             }
 
             if newState == .closeWait {
@@ -979,19 +1094,31 @@ public struct NATTable {
         transport.registerFD(newFD, events: Int16(POLLIN), kind: .stream)
 
         let wireWin = UInt16(min(synSeg.window >> conn.ourWindowScale, 65535))
-        let wscaleOpt: [UInt8] = [3, 3, conn.ourWindowScale, 1]
+        // SYN options: WSCALE + SACK-Permitted [+ TSopt]
+        var synOpts: [UInt8] = [
+            3, 3, conn.ourWindowScale,  // WSCALE (3)
+            4, 2,                        // SACK-Permitted (2)
+        ]
+        if conn.ourTSOK {
+            synOpts.append(1)  // NOP before TSopt
+            let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
+            synOpts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: 0))
+        }
+        while synOpts.count % 4 != 0 { synOpts.append(1) }  // NOP padding
+        let synTcpHdrLen = 20 + synOpts.count
+        let synHdrLen = 14 + 20 + synTcpHdrLen
         let hdrOfs = buildTCPHeaderWithOptions(
             io: io, hostMAC: hostMAC, dstMAC: vmMAC,
             srcIP: externalIP, dstIP: pf.vmIP,
             srcPort: externalPort, dstPort: pf.vmPort,
             seqNumber: synSeg.seq, ackNumber: synSeg.ack,
             flags: synSeg.flags, window: wireWin,
-            options: wscaleOpt)
+            options: synOpts)
         if hdrOfs >= 0 {
             finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
                 srcIP: externalIP, dstIP: pf.vmIP,
-                tcpHdrLen: 24, payloadPtr: nil, payloadLen: 0)
-            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, io: io, transport: &transport, hdrLen: 58)
+                tcpHdrLen: synTcpHdrLen, payloadPtr: nil, payloadLen: 0)
+            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, io: io, transport: &transport, hdrLen: synHdrLen)
         }
     }
 
@@ -1088,7 +1215,8 @@ public struct NATTable {
         payloadPtr: UnsafeRawPointer?, payloadLen: Int,
         endpointID: Int, hostMAC: MACAddress,
         transport: inout PollingTransport,
-        io: IOBuffer
+        io: IOBuffer,
+        redirectIP: IPv4Address? = nil
     ) {
         if tcpEntries.count >= maxTCPConnections {
             let hdrOfs = buildTCPHeader(
@@ -1105,30 +1233,38 @@ public struct NATTable {
             }
             return
         }
-        debugLog("[NAT-TCP-OUT] outbound SYN to \(key.dstIP):\(key.dstPort) from VM \(key.vmIP):\(key.vmPort)\n")
+        let connectIP = redirectIP ?? key.dstIP
+        debugLog("[NAT-TCP-OUT] outbound SYN to \(key.dstIP):\(key.dstPort) from VM \(key.vmIP):\(key.vmPort)")
+
+        if redirectIP != nil {
+            debugLog(" → redirect to \(connectIP):\(key.dstPort)")
+        }
+        debugLog("\n")
 
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { debugLog("[NAT-TCP-OUT] socket() failed for \(key.dstIP):\(key.dstPort)\n"); return }
+        guard fd >= 0 else { debugLog("[NAT-TCP-OUT] socket() failed for \(connectIP):\(key.dstPort)\n"); return }
         setNonBlocking(fd)
         setNoDelay(fd)
 
-        let connectOK = withSockAddr(ip: key.dstIP, port: key.dstPort) { sa, saLen in
+        let connectOK = withSockAddr(ip: connectIP, port: key.dstPort) { sa, saLen in
             Darwin.connect(fd, sa, saLen)
         }
         if connectOK < 0 && errno != EINPROGRESS {
-            debugLog("[NAT-TCP-OUT] connect() to \(key.dstIP):\(key.dstPort) failed: errno=\(errno)\n")
+            debugLog("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) failed: errno=\(errno)\n")
             close(fd); return
         }
-        debugLog("[NAT-TCP-OUT] connect() to \(key.dstIP):\(key.dstPort) OK (fd=\(fd), errno=\(errno))\n")
+        debugLog("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) OK (fd=\(fd), errno=\(errno))\n")
 
         var conn = TCPConnection(
             connectionID: nextID(), posixFD: fd, state: .listen,
             vmMAC: srcMAC, vmIP: key.vmIP, vmPort: key.vmPort,
-            dstIP: key.dstIP, dstPort: key.dstPort, endpointID: endpointID,
+            dstIP: connectIP, dstPort: key.dstPort, endpointID: endpointID,
             hostMAC: hostMAC
         )
         conn.externalConnecting = true
         conn.peerWindowScale = seg.peerWindowScale
+        conn.sackOK = seg.sackOK
+        conn.tsOK = seg.tsOK && conn.ourTSOK
 
         let (newState, toSend, _, _) = tcpProcess(
             state: .listen, seg: seg,
@@ -1151,16 +1287,29 @@ public struct NATTable {
             let isSynAck = segToSend.flags.contains(.syn) && segToSend.flags.contains(.ack)
             let hdrOfs: Int
             let hdrLen: Int
+            var synAckTcpHdrLen: Int = 20
             if isSynAck {
-                let wscaleOpt: [UInt8] = [3, 3, conn.ourWindowScale, 1]  // kind=3, len=3, shift, NOP
-                hdrLen = 14 + 20 + 20 + wscaleOpt.count  // eth + ip + tcp base + options
+                // SYN-ACK options: WSCALE + SACK-Permitted [+ TSopt]
+                var opts: [UInt8] = [
+                    3, 3, conn.ourWindowScale,  // WSCALE (3)
+                    4, 2,                        // SACK-Permitted (2)
+                ]
+                if conn.ourTSOK {
+                    opts.append(1)  // NOP before TSopt
+                    let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
+                    let tsecr = seg.tsval
+                    opts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: tsecr))
+                }
+                while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
+                synAckTcpHdrLen = 20 + opts.count
+                hdrLen = 14 + 20 + synAckTcpHdrLen
                 hdrOfs = buildTCPHeaderWithOptions(
                     io: io, hostMAC: hostMAC, dstMAC: srcMAC,
                     srcIP: key.dstIP, dstIP: key.vmIP,
                     srcPort: key.dstPort, dstPort: key.vmPort,
                     seqNumber: segToSend.seq, ackNumber: segToSend.ack,
                     flags: segToSend.flags, window: wireWin,
-                    options: wscaleOpt)
+                    options: opts)
             } else {
                 hdrLen = 54
                 hdrOfs = buildTCPHeader(
@@ -1174,7 +1323,7 @@ public struct NATTable {
                 if isSynAck {
                     finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
                         srcIP: key.dstIP, dstIP: key.vmIP,
-                        tcpHdrLen: 24, payloadPtr: nil, payloadLen: 0)
+                        tcpHdrLen: synAckTcpHdrLen, payloadPtr: nil, payloadLen: 0)
                 } else {
                     finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                         srcIP: key.dstIP, dstIP: key.vmIP,

@@ -45,6 +45,8 @@ public struct DeliberationLoop {
         self.socketRegistry = SocketRegistry()
         let mss = (endpoints.map { $0.mtu }.min() ?? 1500) - 40
         self.natTable = NATTable(portForwards: portForwards, mss: mss)
+        natTable.localIPs = Set(endpoints.map { $0.gateway })
+        natTable.upstreamDNS = upstreamDNS
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
         self.pcapWriter = pcapWriter
 

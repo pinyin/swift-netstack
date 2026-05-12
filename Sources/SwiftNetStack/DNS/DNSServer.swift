@@ -59,6 +59,7 @@ public struct DNSServer {
             self.upstreamFD = nil
             self.upstreamAddr = nil
         }
+
     }
 
     private static func detectSystemDNS() -> IPv4Address? {
@@ -83,6 +84,23 @@ public struct DNSServer {
               let a = UInt8(parts[0]), let b = UInt8(parts[1]),
               let c = UInt8(parts[2]), let d = UInt8(parts[3]) else { return nil }
         return IPv4Address(a, b, c, d)
+    }
+
+    // MARK: - Resolution
+
+    /// Shared DNS resolution: parse query, check hosts file, return A-record reply.
+    /// Returns nil when the hostname is not in the hosts file — caller decides
+    /// whether to forward upstream or reply with NXDOMAIN.
+    /// Zero-copy: works directly from raw pointer.
+    private func resolveLocal(_ ptr: UnsafeRawPointer, _ len: Int) -> [UInt8]? {
+        guard let (txID, question) = DNSPacket.parse(from: ptr, len: len) else { return nil }
+        if question.type == 1 || question.type == 255 {
+            let normalised = Self.normaliseHost(question.name)
+            if let ip = hosts[normalised] {
+                return DNSPacket.buildAReply(txID: txID, question: question, ip: ip)
+            }
+        }
+        return nil
     }
 
     /// The upstream socket fd, if configured.
@@ -110,20 +128,18 @@ public struct DNSServer {
         transport: inout PollingTransport,
         outBatch: OutBatch, io: IOBuffer
     ) {
-        guard let (txID, question) = DNSPacket.parse(from: payloadPtr, len: payloadLen) else { return }
-
-        if question.type == 1 || question.type == 255 {  // A or ANY
-            let normalised = DNSServer.normaliseHost(question.name)
-            if let ip = hosts[normalised] {
-                let replyBytes = DNSPacket.buildAReply(txID: txID, question: question, ip: ip)
-                buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: srcMAC,
-                                  srcIP: dstIP, dstIP: srcIP,
-                                  srcPort: dstPort, dstPort: srcPort,
-                                  payload: replyBytes, endpointID: endpointID,
-                                  io: io, outBatch: outBatch)
-                return
-            }
+        // Shared local resolution (hosts file lookup).
+        if let reply = resolveLocal(payloadPtr, payloadLen) {
+            buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: srcMAC,
+                              srcIP: dstIP, dstIP: srcIP,
+                              srcPort: dstPort, dstPort: srcPort,
+                              payload: reply, endpointID: endpointID,
+                              io: io, outBatch: outBatch)
+            return
         }
+
+        // Hostname not in hosts — parse for upstream/NXDOMAIN.
+        guard let (txID, question) = DNSPacket.parse(from: payloadPtr, len: payloadLen) else { return }
 
         // Try upstream forwarding
         if let _ = upstreamFD, let _ = upstreamAddr {
@@ -146,10 +162,6 @@ public struct DNSServer {
                           payload: nxBytes, endpointID: endpointID,
                           io: io, outBatch: outBatch)
     }
-
-    // MARK: - Upstream poll
-
-    public var upstreamPollFD: Int32? { upstreamFD }
 
     /// Expire pending upstream queries older than 5 seconds, replying NXDOMAIN.
     public mutating func expireQueries(

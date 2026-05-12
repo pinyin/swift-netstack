@@ -57,6 +57,11 @@ public struct NATStats {
     public var ackChecksumIncremental: UInt64 = 0
     /// Number of ACK frames whose checksum was computed from scratch.
     public var ackChecksumFull: UInt64 = 0
+    /// Sub-phase CPU timing for TCP hot-spot analysis.
+    public var tcpAckFlushNs: UInt64 = 0
+    public var tcpFsmNs: UInt64 = 0
+    public var tcpExtReadNs: UInt64 = 0
+    public var tcpFlushNs: UInt64 = 0
 
     /// Snapshot and reset. Returns previous values.
     public mutating func snap() -> NATStats {
@@ -188,6 +193,16 @@ public func printStats(
     }
     if n.ackChecksumIncremental + n.ackChecksumFull > 0 {
         parts.append("ackCKinc=\(n.ackChecksumIncremental)/\(n.ackChecksumIncremental + n.ackChecksumFull)")
+    }
+    // ── TCP sub-phase timing ──
+    let subTotal = n.tcpAckFlushNs + n.tcpFsmNs + n.tcpExtReadNs + n.tcpFlushNs
+    if subTotal > 0 {
+        let base = phase?.tcp ?? subTotal
+        let ackFlushPct = Int(Double(n.tcpAckFlushNs) / Double(base) * 100)
+        let fsmPct      = Int(Double(n.tcpFsmNs)      / Double(base) * 100)
+        let extPct      = Int(Double(n.tcpExtReadNs)  / Double(base) * 100)
+        let flushPct    = Int(Double(n.tcpFlushNs)    / Double(base) * 100)
+        parts.append("tcpSub[ackFlush=\(ackFlushPct)% fsm=\(fsmPct)% ext=\(extPct)% flush=\(flushPct)%]")
     }
     let line = "[STATS] " + parts.joined(separator: " ")
     _ = line.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }

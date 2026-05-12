@@ -170,7 +170,6 @@ public struct DeliberationLoop {
 
         // ── Phase 11: TCP ──
         let tTCP = cpuNanos()
-        outBatch.reset()
         natTable.processTCPRound(
             out: parseOutput, io: io,
             streamReads: result.streamReads,
@@ -179,35 +178,18 @@ public struct DeliberationLoop {
             transport: &transport,
             hostMAC: hostMAC,
             arpMapping: arpMapping,
-            outBatch: outBatch,
             nowSec: nowSec,
             nowUs: nowUs
         )
-        if outBatch.count > 0 {
-            let tW = cpuNanos()
-            //fputs("[DL-WRITE] TCP phase writing outBatch.count=\(outBatch.count)\n", stderr)
-            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
-            transport.writeBatch(outBatch, io: io)
-            phaseTiming.write &+= cpuNanos() - tW
-            totalWritten += outBatch.count
-        }
         phaseTiming.tcp &+= cpuNanos() - tTCP
 
         // ── Phase 12: Non-TCP transport results ──
         let tNATResult = cpuNanos()
-        outBatch.reset()
         natTable.processTransportResult(
             result, transport: &transport,
             hostMAC: hostMAC, arpMapping: arpMapping,
-            io: io, outBatch: outBatch
+            io: io
         )
-        if outBatch.count > 0 {
-            let tW = cpuNanos()
-            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
-            transport.writeBatch(outBatch, io: io)
-            phaseTiming.write &+= cpuNanos() - tW
-            totalWritten += outBatch.count
-        }
         phaseTiming.natResult &+= cpuNanos() - tNATResult
 
         // ── Phase 13: DNS upstream ──
@@ -348,7 +330,7 @@ public struct DeliberationLoop {
                     endpointID: epID,
                     hostMAC: hostMAC,
                     transport: &transport,
-                    outBatch: outBatch, io: io,
+                    io: io,
                     nowSec: nowSec
                 )
             }

@@ -165,7 +165,7 @@ public struct NATTable {
         endpointID: Int,
         hostMAC: MACAddress,
         transport: inout PollingTransport,
-        outBatch: OutBatch, io: IOBuffer,
+        io: IOBuffer,
         nowSec: UInt64
     ) {
         let key = NATKey(vmIP: srcIP, vmPort: srcPort, dstIP: dstIP, dstPort: dstPort, protocol: .udp)
@@ -226,10 +226,11 @@ public struct NATTable {
 
     /// Build a pure ACK frame into IOBuffer and add to outBatch.
     /// Uses the pre-built template and incremental checksum (RFC 1146) when available.
+    /// Writes directly via transport — no outBatch intermediate.
     @discardableResult
     private mutating func buildAckFrame(
         conn: inout TCPConnection, seq: UInt32, ack: UInt32, window: UInt16,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer, transport: inout PollingTransport
     ) -> Bool {
         var outCK: UInt16 = 0
         let hdrOfs: Int
@@ -283,21 +284,18 @@ public struct NATTable {
             conn.lastACKChecksum = outCK
         }
 
-        let idx = outBatch.count
-        guard idx < outBatch.maxFrames else { return false }
-        outBatch.hdrOfs[idx] = hdrOfs
-        outBatch.hdrLen[idx] = 54
-        outBatch.payOfs[idx] = -1
-        outBatch.payLen[idx] = 0
-        outBatch.epIDs[idx] = conn.endpointID
-        outBatch.payBase[idx] = nil
-        outBatch.count += 1
-        return true
+        if let pw = self.externalPcap {
+            let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
+            pw.writeRaw(framePtr: hdrPtr, len: 54)
+        }
+        return transport.writeSingleFrame(endpointID: conn.endpointID, io: io,
+                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          payPtr: nil, payLen: 0)
     }
 
     /// Flush expired delayed ACKs for all connections.
     private mutating func flushExpiredDelayedACKs(
-        io: IOBuffer, outBatch: OutBatch, nowUs: UInt64
+        io: IOBuffer, transport: inout PollingTransport, nowUs: UInt64
     ) {
         for (key, var entry) in tcpEntries {
             guard entry.connection.pendingDelayedACK else { continue }
@@ -306,7 +304,7 @@ public struct NATTable {
                 conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                 ack: entry.connection.delayedACKAck,
                 window: entry.connection.delayedACKWindow,
-                io: io, outBatch: outBatch
+                io: io, transport: &transport
             ) {
                 stats.ackFlushedTimer += 1
             }
@@ -315,41 +313,35 @@ public struct NATTable {
         }
     }
 
-    // MARK: - Helper: add a TCP output frame to outBatch
+    // MARK: - Helper: write a TCP output frame directly (no OutBatch)
 
     @discardableResult
     private func addTCPOutput(
-        hdrOfs: Int, endpointID: Int, outBatch: OutBatch
+        hdrOfs: Int, endpointID: Int, io: IOBuffer,
+        transport: inout PollingTransport
     ) -> Bool {
-        let idx = outBatch.count
-        guard idx < outBatch.maxFrames else { return false }
-        outBatch.hdrOfs[idx] = hdrOfs
-        outBatch.hdrLen[idx] = 54
-        outBatch.payOfs[idx] = -1
-        outBatch.payLen[idx] = 0
-        outBatch.epIDs[idx] = endpointID
-        outBatch.payBase[idx] = nil
-        outBatch.count += 1
-        return true
+        if let pw = self.externalPcap {
+            let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
+            pw.writeRaw(framePtr: hdrPtr, len: 54)
+        }
+        return transport.writeSingleFrame(endpointID: endpointID, io: io,
+                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          payPtr: nil, payLen: 0)
     }
 
-    /// Add a TCP output frame with payload from an alternate buffer (e.g. SendQueue).
     @discardableResult
-    private func addTCPOutputWithPayload(
-        hdrOfs: Int, endpointID: Int, payBase: UnsafeMutableRawPointer,
-        payOfs: Int, payLen: Int, outBatch: OutBatch
+    private func addTCPOutput(
+        hdrOfs: Int, endpointID: Int, payPtr: UnsafeRawPointer, payLen: Int,
+        io: IOBuffer, transport: inout PollingTransport
     ) -> Bool {
-        let idx = outBatch.count
-        guard idx < outBatch.maxFrames else { return false }
-        outBatch.hdrOfs[idx] = hdrOfs
-        outBatch.hdrLen[idx] = 54
-        outBatch.payOfs[idx] = payOfs
-        outBatch.payLen[idx] = payLen
-        outBatch.epIDs[idx] = endpointID
-        outBatch.payBase[idx] = payBase
-        outBatch.count += 1
-        debugLog("[NAT-TCP-OBATCH] addTCPOutputWithPayload idx=\(idx) epID=\(endpointID) hdrOfs=\(hdrOfs) payOfs=\(payOfs) payLen=\(payLen) count=\(outBatch.count)\n")
-        return true
+        if let pw = self.externalPcap {
+            let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
+            pw.writeRawSplit(hdr: hdrPtr, hdrLen: 54,
+                             pay: UnsafeMutableRawPointer(mutating: payPtr), payLen: payLen)
+        }
+        return transport.writeSingleFrame(endpointID: endpointID, io: io,
+                                          hdrOfs: hdrOfs, hdrLen: 54,
+                                          payPtr: payPtr, payLen: payLen)
     }
 
     // MARK: - Phase 11: Unified TCP processing (VM ↔ external)
@@ -364,7 +356,6 @@ public struct NATTable {
         transport: inout PollingTransport,
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
-        outBatch: OutBatch,
         nowSec: UInt64,
         nowUs: UInt64
     ) {
@@ -373,7 +364,9 @@ public struct NATTable {
 #endif
 
         // ── Step 0: Flush expired delayed ACKs ──
-        flushExpiredDelayedACKs(io: io, outBatch: outBatch, nowUs: nowUs)
+        let tAckFlush = cpuNanos()
+        flushExpiredDelayedACKs(io: io, transport: &transport, nowUs: nowUs)
+        stats.tcpAckFlushNs &+= cpuNanos() - tAckFlush
 
         // ── Step 1: Complete non-blocking connects ──
         for fd in streamConnects {
@@ -412,6 +405,7 @@ public struct NATTable {
         }
 
         // ── Step 2: Process VM→external segments ──
+        let tFSM = cpuNanos()
         for i in 0..<out.tcpCount {
             let key = out.tcpKeys[i]
             let seg = out.tcpSegs[i]
@@ -428,7 +422,7 @@ public struct NATTable {
                     payloadPtr: payloadPtr, payloadLen: payloadLen,
                     endpointID: ep,
                     hostMAC: hostMAC, transport: &transport,
-                    io: io, outBatch: outBatch
+                    io: io
                 )
                 dirtyConnections.insert(key)
                 continue
@@ -509,7 +503,7 @@ public struct NATTable {
                             conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                             ack: entry.connection.delayedACKAck,
                             window: entry.connection.delayedACKWindow,
-                            io: io, outBatch: outBatch
+                            io: io, transport: &transport
                         )
                         stats.ackFlushedImmediate += 1
                     }
@@ -526,7 +520,7 @@ public struct NATTable {
                             conn: &entry.connection, seq: entry.connection.delayedACKSeq,
                             ack: entry.connection.delayedACKAck,
                             window: entry.connection.delayedACKWindow,
-                            io: io, outBatch: outBatch
+                            io: io, transport: &transport
                         )
                         stats.ackFlushedImmediate += 1
                         entry.connection.pendingDelayedACK = false
@@ -541,7 +535,7 @@ public struct NATTable {
                         finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                             srcIP: key.dstIP, dstIP: key.vmIP,
                             payloadPtr: nil, payloadLen: 0)
-                        _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: ep, outBatch: outBatch)
+                        _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: ep, io: io, transport: &transport)
                     }
                 }
             }
@@ -554,7 +548,10 @@ public struct NATTable {
             }
         }
 
+        stats.tcpFsmNs &+= cpuNanos() - tFSM
+
         // ── Step 3: Process external→VM reads ──
+        let tExtR = cpuNanos()
         if !streamReads.isEmpty {
             debugLog("[NAT-TCP-RD-RAW] streamReads count=\(streamReads.count), fds=\(streamReads.map { $0.fd }), tcpFdToKey=\(tcpFdToKey.keys.sorted())\n")
         }
@@ -597,7 +594,7 @@ public struct NATTable {
                     tcpEntries[key] = entry
                     dirtyConnections.insert(key)
                     handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
-                                         io: io, outBatch: outBatch)
+                                         io: io)
                     continue
                 }
                 cleanupTCP(fd: entry.connection.posixFD, key: key, transport: &transport)
@@ -611,10 +608,13 @@ public struct NATTable {
             tcpEntries[key] = entry
             dirtyConnections.insert(key)
             handleTCPExternalFIN(key: key, hostMAC: hostMAC, transport: &transport,
-                                 io: io, outBatch: outBatch)
+                                 io: io)
         }
 
+        stats.tcpExtReadNs &+= cpuNanos() - tExtR
+
         // ── Step 5: Flush dirty connections (drain queues, forward FIN) ──
+        let tFlush = cpuNanos()
         for key in dirtyConnections {
             guard var entry = tcpEntries[key] else { continue }
             guard entry.connection.state == .established || entry.connection.state == .closeWait
@@ -622,9 +622,10 @@ public struct NATTable {
                   || entry.connection.state == .lastAck else { continue }
 
             flushOneConnection(key: key, conn: &entry.connection, hostMAC: hostMAC,
-                               transport: &transport, io: io, outBatch: outBatch)
+                               transport: &transport, io: io)
             tcpEntries[key] = entry
         }
+        stats.tcpFlushNs &+= cpuNanos() - tFlush
         dirtyConnections.removeAll(keepingCapacity: true)
     }
 
@@ -634,7 +635,7 @@ public struct NATTable {
         key: NATKey, conn: inout TCPConnection,
         hostMAC: MACAddress,
         transport: inout PollingTransport,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer
     ) {
         let sqBufBase = conn.sendQueue.buf.baseAddress!
 
@@ -758,7 +759,7 @@ public struct NATTable {
                     finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                         srcIP: conn.dstIP, dstIP: conn.vmIP,
                         payloadPtr: nil, payloadLen: 0)
-                    _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: conn.endpointID, outBatch: outBatch)
+                    _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: conn.endpointID, io: io, transport: &transport)
                 }
             }
             conn.pendingFinToVM = false
@@ -874,7 +875,7 @@ public struct NATTable {
         transport: inout PollingTransport,
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer
     ) {
         let now = currentTime()
         if now - lastCleanupTime >= 1 {
@@ -902,7 +903,7 @@ public struct NATTable {
         for (listenerFD, newFD, remoteAddr) in result.streamAccepts {
             pollTCPAccept(listenerFd: listenerFD, newFD: newFD, clientAddr: remoteAddr,
                           hostMAC: hostMAC, arpMapping: arpMapping,
-                          transport: &transport, io: io, outBatch: outBatch)
+                          transport: &transport, io: io)
         }
 
         // Datagram reads → UDP data from external
@@ -910,10 +911,10 @@ public struct NATTable {
             if udpListeners.contains(where: { $0.fd == fd }) {
                 pollUDPAccept(fd: fd, data: data, from: from,
                               hostMAC: hostMAC, arpMapping: arpMapping,
-                              io: io, outBatch: outBatch)
+                              io: io, transport: &transport)
             } else if let key = udpFdToKey[fd] {
                 pollUDPReadable(key: key, data: data, hostMAC: hostMAC,
-                                arpMapping: arpMapping, io: io, outBatch: outBatch)
+                                arpMapping: arpMapping, io: io, transport: &transport)
             }
         }
     }
@@ -938,7 +939,7 @@ public struct NATTable {
     private mutating func pollTCPAccept(
         listenerFd: Int32, newFD: Int32, clientAddr: sockaddr_in,
         hostMAC: MACAddress, arpMapping: ARPMapping, transport: inout PollingTransport,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer
     ) {
         guard tcpEntries.count < maxTCPConnections else { close(newFD); return }
         setNoDelay(newFD)
@@ -977,7 +978,7 @@ public struct NATTable {
             finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                 srcIP: externalIP, dstIP: pf.vmIP,
                 payloadPtr: nil, payloadLen: 0)
-            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, outBatch: outBatch)
+            _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: vmEp, io: io, transport: &transport)
         }
     }
 
@@ -986,7 +987,7 @@ public struct NATTable {
     private mutating func pollUDPAccept(
         fd: Int32, data: [UInt8], from srcAddr: sockaddr_in,
         hostMAC: MACAddress, arpMapping: ARPMapping,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer, transport: inout PollingTransport
     ) {
         guard let pf = findUDPListener(fd: fd) else { return }
         let externalIP = IPv4Address(addr: srcAddr.sin_addr.s_addr.bigEndian)
@@ -997,13 +998,13 @@ public struct NATTable {
                      srcIP: externalIP, dstIP: pf.vmIP,
                      srcPort: externalPort, dstPort: pf.vmPort,
                      payload: data, endpointID: vmEp,
-                     io: io, outBatch: outBatch)
+                     io: io, transport: &transport)
     }
 
     private mutating func pollUDPReadable(
         key: NATKey, data: [UInt8],
         hostMAC: MACAddress, arpMapping: ARPMapping,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer, transport: inout PollingTransport
     ) {
         guard var mapping = udpEntries[key] else { return }
         mapping.lastActivity = currentTime()
@@ -1014,17 +1015,17 @@ public struct NATTable {
                      srcIP: key.dstIP, dstIP: key.vmIP,
                      srcPort: key.dstPort, dstPort: key.vmPort,
                      payload: data, endpointID: vmEp,
-                     io: io, outBatch: outBatch)
+                     io: io, transport: &transport)
     }
 
     /// Build a complete Ethernet+IPv4+UDP+payload frame into IOBuffer.output and
-    /// add to outBatch. Used by pollUDPAccept and pollUDPReadable.
+    /// write directly via transport. Used by pollUDPAccept and pollUDPReadable.
     private func buildUDPToVM(
         hostMAC: MACAddress, dstMAC: MACAddress,
         srcIP: IPv4Address, dstIP: IPv4Address,
         srcPort: UInt16, dstPort: UInt16,
         payload: [UInt8], endpointID: Int,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer, transport: inout PollingTransport
     ) {
         let udpTotalLen = 8 + payload.count
         let ipTotalLen = 20 + udpTotalLen
@@ -1062,15 +1063,9 @@ public struct NATTable {
         )
         writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
 
-        let idx = outBatch.count
-        guard idx < outBatch.maxFrames else { return }
-        outBatch.hdrOfs[idx] = ofs
-        outBatch.hdrLen[idx] = frameLen
-        outBatch.payOfs[idx] = -1
-        outBatch.payLen[idx] = 0
-        outBatch.epIDs[idx] = endpointID
-        outBatch.payBase[idx] = nil
-        outBatch.count += 1
+        _ = transport.writeSingleFrame(endpointID: endpointID, io: io,
+                                        hdrOfs: ofs, hdrLen: frameLen,
+                                        payPtr: nil, payLen: 0)
     }
 
     // MARK: ── TCP outbound SYN ──
@@ -1080,7 +1075,7 @@ public struct NATTable {
         payloadPtr: UnsafeRawPointer?, payloadLen: Int,
         endpointID: Int, hostMAC: MACAddress,
         transport: inout PollingTransport,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer
     ) {
         if tcpEntries.count >= maxTCPConnections {
             let hdrOfs = buildTCPHeader(
@@ -1093,7 +1088,7 @@ public struct NATTable {
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: key.dstIP, dstIP: key.vmIP,
                     payloadPtr: nil, payloadLen: 0)
-                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, outBatch: outBatch)
+                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, io: io, transport: &transport)
             }
             return
         }
@@ -1146,7 +1141,7 @@ public struct NATTable {
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: key.dstIP, dstIP: key.vmIP,
                     payloadPtr: nil, payloadLen: 0)
-                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, outBatch: outBatch)
+                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: endpointID, io: io, transport: &transport)
             }
         }
     }
@@ -1155,7 +1150,7 @@ public struct NATTable {
 
     private mutating func handleTCPExternalFIN(
         key: NATKey, hostMAC: MACAddress, transport: inout PollingTransport,
-        io: IOBuffer, outBatch: OutBatch
+        io: IOBuffer
     ) {
         guard var entry = tcpEntries[key] else { return }
 
@@ -1247,7 +1242,7 @@ public struct NATTable {
                 finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
                     srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
                     payloadPtr: nil, payloadLen: 0)
-                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: entry.connection.endpointID, outBatch: outBatch)
+                _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: entry.connection.endpointID, io: io, transport: &transport)
             }
         }
 

@@ -324,6 +324,41 @@ public struct PollingTransport {
         }
     }
 
+    /// Write a single TCP frame directly (no OutBatch intermediate).
+    /// Called from NATTable for inline writes during processTCPRound.
+    @discardableResult
+    public mutating func writeSingleFrame(
+        endpointID: Int, io: IOBuffer,
+        hdrOfs: Int, hdrLen: Int,
+        payPtr: UnsafeRawPointer?, payLen: Int
+    ) -> Bool {
+        guard let fd = fdByEndpointID[endpointID] else { return false }
+        let hdrPtr = io.output.baseAddress! + hdrOfs
+        if let payPtr, payLen > 0 {
+            var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+            var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: payLen)
+            var iovs: [iovec] = [iov0, iov1]
+            var ok = false
+            _ = iovs.withUnsafeMutableBufferPointer { iovPtr in
+                var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                 msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                stats.sendmsgCalls += 1
+                stats.sendBytes += UInt64(hdrLen + payLen)
+                ok = Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL)) >= 0
+            }
+            return ok
+        } else {
+            var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+            var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                             msg_iov: &iov, msg_iovlen: 1,
+                             msg_control: nil, msg_controllen: 0, msg_flags: 0)
+            stats.sendmsgCalls += 1
+            stats.sendBytes += UInt64(hdrLen)
+            return Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL)) >= 0
+        }
+    }
+
     // MARK: - Write (external FDs)
 
     @discardableResult

@@ -76,17 +76,16 @@ public struct ARPMapping {
 
     // MARK: - Proxy ARP
 
-    /// Process an incoming ARP request.
-    /// - targetIP known → generate a proxy ARP reply (Ethernet + ARP frame) with hostMAC
-    /// - targetIP unknown → return nil (silently ignore)
+    /// Process an incoming ARP request, writing the reply into IOBuffer.output.
+    /// Returns (header offset, header length) or nil if output is full or no reply needed.
     public func processARPRequest(
-        _ arp: ARPFrame, round: RoundContext
-    ) -> PacketBuffer? {
+        _ arp: ARPFrame, io: IOBuffer
+    ) -> (hdrOfs: Int, hdrLen: Int)? {
         guard arp.operation == .request else { return nil }
         guard isKnown(arp.targetIP) else { return nil }
 
-        var reply = round.allocate(capacity: 64, headroom: 0)
-        guard let ptr = reply.appendPointer(count: 42) else { return nil }
+        guard let ptr = io.allocOutput(42) else { return nil }
+        let ofs = ptr - io.output.baseAddress!
 
         // Ethernet header (14 bytes)
         arp.senderMAC.write(to: ptr)                             // dst = sender
@@ -104,6 +103,35 @@ public struct ARPMapping {
         arp.targetIP.write(to: arpPtr.advanced(by: 14))            // sender IP = target
         arp.senderMAC.write(to: arpPtr.advanced(by: 18))           // target MAC = requester
         arp.senderIP.write(to: arpPtr.advanced(by: 24))            // target IP = requester
+
+        return (ofs, 42)
+    }
+
+    /// Legacy PacketBuffer-based processARPRequest (kept for source compatibility).
+    @available(*, deprecated, message: "Use IOBuffer-based processARPRequest")
+    public func processARPRequest(
+        _ arp: ARPFrame, round: RoundContext
+    ) -> PacketBuffer? {
+        guard arp.operation == .request else { return nil }
+        guard isKnown(arp.targetIP) else { return nil }
+
+        var reply = round.allocate(capacity: 64, headroom: 0)
+        guard let ptr = reply.appendPointer(count: 42) else { return nil }
+
+        arp.senderMAC.write(to: ptr)
+        hostMAC.write(to: ptr.advanced(by: 6))
+        writeUInt16BE(0x0806, to: ptr.advanced(by: 12))
+
+        let arpPtr = ptr.advanced(by: 14)
+        writeUInt16BE(1, to: arpPtr)
+        writeUInt16BE(0x0800, to: arpPtr.advanced(by: 2))
+        arpPtr.advanced(by: 4).storeBytes(of: UInt8(6), as: UInt8.self)
+        arpPtr.advanced(by: 5).storeBytes(of: UInt8(4), as: UInt8.self)
+        writeUInt16BE(ARPOperation.reply.rawValue, to: arpPtr.advanced(by: 6))
+        hostMAC.write(to: arpPtr.advanced(by: 8))
+        arp.targetIP.write(to: arpPtr.advanced(by: 14))
+        arp.senderMAC.write(to: arpPtr.advanced(by: 18))
+        arp.senderIP.write(to: arpPtr.advanced(by: 24))
 
         return reply
     }

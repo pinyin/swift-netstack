@@ -30,6 +30,29 @@ public struct ARPFrame {
         self.targetMAC = targetMAC; self.targetIP = targetIP
     }
 
+    /// Parse an ARP frame from raw bytes (Ethernet payload).
+    /// Returns nil if the buffer is too short or fields don't match Ethernet/IPv4 ARP.
+    public static func parse(from ptr: UnsafeRawPointer, len: Int) -> ARPFrame? {
+        guard len >= 28 else { return nil }
+        let hwType   = readUInt16BE(ptr, 0)
+        let protoType = readUInt16BE(ptr, 2)
+        let hwSize   = ptr.assumingMemoryBound(to: UInt8.self)[4]
+        let protoSize = ptr.assumingMemoryBound(to: UInt8.self)[5]
+        let rawOp    = readUInt16BE(ptr, 6)
+        guard hwType == 1, protoType == 0x0800,
+              hwSize == 6, protoSize == 4,
+              let op = ARPOperation(rawValue: rawOp) else { return nil }
+        return ARPFrame(
+            hardwareType: hwType, protocolType: protoType,
+            hardwareSize: hwSize, protocolSize: protoSize,
+            operation: op,
+            senderMAC: MACAddress(UnsafeRawBufferPointer(start: ptr.advanced(by: 8), count: 6)),
+            senderIP: IPv4Address(UnsafeRawBufferPointer(start: ptr.advanced(by: 14), count: 4)),
+            targetMAC: MACAddress(UnsafeRawBufferPointer(start: ptr.advanced(by: 18), count: 6)),
+            targetIP: IPv4Address(UnsafeRawBufferPointer(start: ptr.advanced(by: 24), count: 4))
+        )
+    }
+
     /// Parse an ARP frame from a PacketBuffer (Ethernet payload).
     /// Returns nil if the buffer is too short or fields don't match Ethernet/IPv4 ARP.
     public static func parse(from pkt: PacketBuffer) -> ARPFrame? {

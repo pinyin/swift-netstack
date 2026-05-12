@@ -14,9 +14,6 @@ public struct DNSServer {
     private var nextTxID: UInt16 = 1
 
     /// Create a DNS server with the given hosts-file mappings and optional upstream.
-    /// - Parameter hosts: hostname-to-IP mappings (keys are normalised at init).
-    /// - Parameter upstream: upstream DNS server address. When nil, the first
-    ///   nameserver from /etc/resolv.conf is used automatically.
     public init(hosts: [String: IPv4Address], upstream: IPv4Address? = nil) {
         var normalised: [String: IPv4Address] = [:]
         for (name, ip) in hosts {
@@ -64,7 +61,6 @@ public struct DNSServer {
         }
     }
 
-    /// Read /etc/resolv.conf and return the first nameserver as an IPv4Address.
     private static func detectSystemDNS() -> IPv4Address? {
         guard let content = try? String(contentsOfFile: "/etc/resolv.conf", encoding: .utf8) else {
             return nil
@@ -81,7 +77,6 @@ public struct DNSServer {
         return nil
     }
 
-    /// Parse "a.b.c.d" into an IPv4Address, or nil.
     private static func parseIPv4String(_ s: String) -> IPv4Address? {
         let parts = s.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4,
@@ -101,10 +96,10 @@ public struct DNSServer {
 
     /// Process a single DNS query datagram.
     ///
-    /// Called from BDP Phase 9a for every UDP datagram destined to port 53
-    /// that is not a DHCP packet.
+    /// Called from BDP Phase 10 for every UDP datagram destined to port 53.
     public mutating func processQuery(
-        payload: PacketBuffer,
+        payloadPtr: UnsafeMutableRawPointer,
+        payloadLen: Int,
         srcIP: IPv4Address,
         dstIP: IPv4Address,
         srcPort: UInt16,
@@ -113,26 +108,19 @@ public struct DNSServer {
         endpointID: Int,
         hostMAC: MACAddress,
         transport: inout PollingTransport,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        outBatch: OutBatch, io: IOBuffer
     ) {
-        guard let (txID, question) = DNSPacket.parse(from: payload) else { return }
+        guard let (txID, question) = DNSPacket.parse(from: payloadPtr, len: payloadLen) else { return }
 
         if question.type == 1 || question.type == 255 {  // A or ANY
             let normalised = DNSServer.normaliseHost(question.name)
             if let ip = hosts[normalised] {
-                if let replyPayload = DNSPacket.buildAReply(
-                    txID: txID, question: question, ip: ip, round: round
-                ) {
-                    if let frame = buildUDPFrame(
-                        hostMAC: hostMAC, dstMAC: srcMAC,
-                        srcIP: dstIP, dstIP: srcIP,
-                        srcPort: dstPort, dstPort: srcPort,
-                        payload: replyPayload, round: round
-                    ) {
-                        replies.append((endpointID, frame))
-                    }
-                }
+                let replyBytes = DNSPacket.buildAReply(txID: txID, question: question, ip: ip)
+                buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: srcMAC,
+                                  srcIP: dstIP, dstIP: srcIP,
+                                  srcPort: dstPort, dstPort: srcPort,
+                                  payload: replyBytes, endpointID: endpointID,
+                                  io: io, outBatch: outBatch)
                 return
             }
         }
@@ -144,85 +132,68 @@ public struct DNSServer {
                 srcIP: srcIP, dstIP: dstIP,
                 srcPort: srcPort, dstPort: dstPort,
                 srcMAC: srcMAC, endpointID: endpointID,
-                transport: &transport,
-                round: round
+                transport: &transport
             ) {
-                return  // pending — reply will come via pollUpstream
+                return
             }
         }
 
         // NXDOMAIN for anything we cannot resolve
-        if let replyPayload = DNSPacket.buildNXDOMAIN(
-            txID: txID, question: question, round: round
-        ) {
-            if let frame = buildUDPFrame(
-                hostMAC: hostMAC, dstMAC: srcMAC,
-                srcIP: dstIP, dstIP: srcIP,
-                srcPort: dstPort, dstPort: srcPort,
-                payload: replyPayload, round: round
-            ) {
-                replies.append((endpointID, frame))
-            }
-        }
+        let nxBytes = DNSPacket.buildNXDOMAIN(txID: txID, question: question)
+        buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: srcMAC,
+                          srcIP: dstIP, dstIP: srcIP,
+                          srcPort: dstPort, dstPort: srcPort,
+                          payload: nxBytes, endpointID: endpointID,
+                          io: io, outBatch: outBatch)
     }
 
-    // MARK: - Upstream poll (I/O + processing)
+    // MARK: - Upstream poll
 
-    /// Drain upstream DNS responses and immediately build VM reply frames.
-    /// The upstream DNS socket fd, for inclusion in the unified transport poll.
     public var upstreamPollFD: Int32? { upstreamFD }
 
     /// Expire pending upstream queries older than 5 seconds, replying NXDOMAIN.
     public mutating func expireQueries(
         hostMAC: MACAddress,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        outBatch: OutBatch, io: IOBuffer
     ) {
         let now = UInt64(Darwin.time(nil))
         let expiredKeys = pendingQueries.filter { now - $0.value.createdAt > 5 }.map { $0.key }
         for key in expiredKeys {
             guard let pending = pendingQueries.removeValue(forKey: key) else { continue }
-            if let replyPayload = DNSPacket.buildNXDOMAIN(
-                txID: pending.originalTxID, question: pending.question, round: round
-            ) {
-                if let frame = buildUDPFrame(
-                    hostMAC: hostMAC, dstMAC: pending.srcMAC,
-                    srcIP: pending.dstIP, dstIP: pending.srcIP,
-                    srcPort: pending.dstPort, dstPort: pending.srcPort,
-                    payload: replyPayload, round: round
-                ) {
-                    replies.append((pending.endpointID, frame))
-                }
-            }
+            let nxBytes = DNSPacket.buildNXDOMAIN(txID: pending.originalTxID, question: pending.question)
+            buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: pending.srcMAC,
+                              srcIP: pending.dstIP, dstIP: pending.srcIP,
+                              srcPort: pending.dstPort, dstPort: pending.srcPort,
+                              payload: nxBytes, endpointID: pending.endpointID,
+                              io: io, outBatch: outBatch)
         }
     }
 
     /// Process upstream DNS responses already read by Transport.
     /// Relays the upstream response to the VM with only the transaction ID
-    /// swapped back to the original — the answer records (A, AAAA, CNAME,
-    /// etc.) are forwarded as-is.
+    /// swapped back to the original.
     public mutating func processUpstreamReady(
-        data rawDatagramReads: [(fd: Int32, data: PacketBuffer)],
+        data rawDatagramReads: [(fd: Int32, data: [UInt8])],
         hostMAC: MACAddress,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        outBatch: OutBatch, io: IOBuffer
     ) {
         guard let fd = upstreamFD else { return }
 
-        for (rfd, pkt) in rawDatagramReads where rfd == fd {
-            guard let (rxID, _) = DNSPacket.parseResponse(from: pkt) else { continue }
+        for (rfd, data) in rawDatagramReads where rfd == fd {
+            guard let (rxID, _) = data.withUnsafeBytes({ buf in
+                DNSPacket.parseResponse(from: buf.baseAddress!, len: data.count)
+            }) else { continue }
             guard let pending = pendingQueries.removeValue(forKey: rxID) else { continue }
 
-            guard let relayed = DNSPacket.relayResponse(pkt, originalTxID: pending.originalTxID,
-                                                        round: round) else { continue }
-            if let frame = buildUDPFrame(
-                hostMAC: hostMAC, dstMAC: pending.srcMAC,
-                srcIP: pending.dstIP, dstIP: pending.srcIP,
-                srcPort: pending.dstPort, dstPort: pending.srcPort,
-                payload: relayed, round: round
-            ) {
-                replies.append((pending.endpointID, frame))
+            let relayed = data.withUnsafeBytes { buf in
+                DNSPacket.relayResponse(from: buf.baseAddress!, len: data.count,
+                                        originalTxID: pending.originalTxID)
             }
+            buildUDPFrameInIO(hostMAC: hostMAC, dstMAC: pending.srcMAC,
+                              srcIP: pending.dstIP, dstIP: pending.srcIP,
+                              srcPort: pending.dstPort, dstPort: pending.srcPort,
+                              payload: relayed, endpointID: pending.endpointID,
+                              io: io, outBatch: outBatch)
         }
     }
 
@@ -251,8 +222,7 @@ public struct DNSServer {
         dstPort: UInt16,
         srcMAC: MACAddress,
         endpointID: Int,
-        transport: inout PollingTransport,
-        round: RoundContext
+        transport: inout PollingTransport
     ) -> Bool {
         guard let fd = upstreamFD, let upstream = upstreamAddr else { return false }
 
@@ -269,13 +239,8 @@ public struct DNSServer {
             createdAt: UInt64(Darwin.time(nil))
         )
 
-        // Rebuild the query with our transaction ID
-        guard let queryPkt = DNSPacket.buildQuery(txID: ourTxID, question: question, round: round) else {
-            pendingQueries.removeValue(forKey: ourTxID)
-            return false
-        }
-
-        transport.writeDatagram(queryPkt, to: fd, addr: upstream)
+        let queryBytes = DNSPacket.buildQuery(txID: ourTxID, question: question)
+        transport.writeDatagram(queryBytes, to: fd, addr: upstream)
         return true
     }
 
@@ -287,11 +252,60 @@ public struct DNSServer {
     }
 }
 
-// MARK: - Helpers
+// MARK: - UDP frame builder (IOBuffer-based)
 
-private func makePacketBuffer(_ data: [UInt8], count: Int, round: RoundContext) -> PacketBuffer {
-    var pkt = round.allocate(capacity: count, headroom: 0)
-    guard let ptr = pkt.appendPointer(count: count) else { return pkt }
-    data.withUnsafeBufferPointer { ptr.copyMemory(from: $0.baseAddress!, byteCount: count) }
-    return pkt
+/// Build a complete Ethernet+IPv4+UDP+payload frame in IOBuffer.output and
+/// add to outBatch. Used by DNSServer for all DNS reply paths.
+private func buildUDPFrameInIO(
+    hostMAC: MACAddress, dstMAC: MACAddress,
+    srcIP: IPv4Address, dstIP: IPv4Address,
+    srcPort: UInt16, dstPort: UInt16,
+    payload: [UInt8], endpointID: Int,
+    io: IOBuffer, outBatch: OutBatch
+) {
+    let udpTotalLen = 8 + payload.count
+    let ipTotalLen = 20 + udpTotalLen
+    let frameLen = 14 + ipTotalLen
+
+    guard let ptr = io.allocOutput(frameLen) else { return }
+    let ofs = ptr - io.output.baseAddress!
+
+    // Ethernet
+    dstMAC.write(to: ptr)
+    hostMAC.write(to: ptr.advanced(by: 6))
+    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+    // IPv4
+    let ipPtr = ptr.advanced(by: ethHeaderLen)
+    writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
+                    srcIP: srcIP, dstIP: dstIP)
+
+    // UDP
+    let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
+    writeUInt16BE(srcPort, to: udpPtr)
+    writeUInt16BE(dstPort, to: udpPtr.advanced(by: 2))
+    writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
+    writeUInt16BE(0, to: udpPtr.advanced(by: 6))
+
+    // Payload
+    payload.withUnsafeBytes { buf in
+        udpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: buf.count)
+    }
+
+    // UDP checksum
+    let ck = computeUDPChecksum(
+        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
+        udpData: udpPtr, udpLen: udpTotalLen
+    )
+    writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
+
+    let idx = outBatch.count
+    guard idx < outBatch.maxFrames else { return }
+    outBatch.hdrOfs[idx] = ofs
+    outBatch.hdrLen[idx] = frameLen
+    outBatch.payOfs[idx] = -1
+    outBatch.payLen[idx] = 0
+    outBatch.epIDs[idx] = endpointID
+    outBatch.payBase[idx] = nil
+    outBatch.count += 1
 }

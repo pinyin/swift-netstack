@@ -28,8 +28,32 @@ public final class PCAPWriter {
         return true
     }
 
-    /// Append one raw Ethernet frame (including the 14-byte Ethernet header)
-    /// to the capture.
+    /// Write a single contiguous Ethernet frame to the capture.
+    public func writeRaw(framePtr: UnsafeMutableRawPointer, len: Int) {
+        guard fd >= 0, len > 0 else { return }
+        write(raw: framePtr.assumingMemoryBound(to: UInt8.self), length: len)
+    }
+
+    /// Write a split frame (header + payload from separate buffers) to the capture.
+    /// Copies both parts into a stack buffer then writes as a single record.
+    public func writeRawSplit(hdr: UnsafeMutableRawPointer, hdrLen: Int,
+                               pay: UnsafeMutableRawPointer, payLen: Int) {
+        guard fd >= 0 else { return }
+        let total = hdrLen + payLen
+        guard total > 0 else { return }
+        // Stack-allocate for small frames (typical MTU is 1500)
+        var buf = [UInt8](repeating: 0, count: total)
+        buf.withUnsafeMutableBytes { ptr in
+            ptr.baseAddress!.copyMemory(from: hdr, byteCount: hdrLen)
+            ptr.baseAddress!.advanced(by: hdrLen).copyMemory(from: pay, byteCount: payLen)
+        }
+        buf.withUnsafeBytes { ptr in
+            write(raw: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self), length: total)
+        }
+    }
+
+    /// Legacy PacketBuffer-based write (kept for source compatibility).
+    @available(*, deprecated, message: "Use writeRaw or writeRawSplit")
     public func write(packet: PacketBuffer) {
         guard fd >= 0 else { return }
         packet.withUnsafeReadableBytes { ptr in

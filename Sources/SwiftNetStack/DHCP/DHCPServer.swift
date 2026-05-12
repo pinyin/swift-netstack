@@ -18,122 +18,109 @@ public struct DHCPServer {
         self.pools = pools
     }
 
-    /// Process a DHCP packet. Returns nil if no response is needed,
-    /// or a fully-built Ethernet frame (Ethernet + IPv4 + UDP + DHCP) to write back.
+    /// Process a DHCP packet, writing the complete reply frame into IOBuffer.output.
+    /// Returns (header offset, header length, endpointID) or nil if no reply needed.
     public mutating func process(
         packet: DHCPPacket,
         srcMAC: MACAddress,
         endpointID: Int,
         hostMAC: MACAddress,
         arpMapping: inout ARPMapping,
-        round: RoundContext
-    ) -> (PacketBuffer, endpointID: Int)? {
-        guard var pool = pools[endpointID] else {
-            return nil
-        }
+        io: IOBuffer
+    ) -> (hdrOfs: Int, hdrLen: Int, epID: Int)? {
+        guard var pool = pools[endpointID] else { return nil }
 
-        let result: (dhcpPayload: PacketBuffer, yiaddr: IPv4Address)?
+        let result: (dhcpBytes: [UInt8], yiaddr: IPv4Address)?
         switch packet.messageType {
         case .discover:
-            result = handleDiscover(
-                packet: packet, srcMAC: srcMAC,
-                endpointID: endpointID, pool: &pool, round: round
-            )
+            result = handleDiscover(packet: packet, srcMAC: srcMAC, pool: &pool)
         case .request:
-            result = handleRequest(
-                packet: packet, srcMAC: srcMAC,
-                endpointID: endpointID, pool: &pool,
-                arpMapping: &arpMapping, round: round
-            )
+            result = handleRequest(packet: packet, srcMAC: srcMAC, pool: &pool,
+                                   arpMapping: &arpMapping, endpointID: endpointID)
         case .release:
-            handleRelease(packet: packet, srcMAC: srcMAC,
-                          endpointID: endpointID, pool: &pool,
-                          arpMapping: &arpMapping)
+            handleRelease(packet: packet, srcMAC: srcMAC, pool: &pool, arpMapping: &arpMapping)
             result = nil
         default:
             result = nil
         }
 
         pools[endpointID] = pool
-        if let (dhcpPayload, yiaddr) = result,
-           let frame = buildDHCPFrame(
-               hostMAC: hostMAC, clientMAC: srcMAC,
-               gatewayIP: pool.gateway, yiaddr: yiaddr,
-               dhcpPayload: dhcpPayload, round: round
-           ) {
-            return (frame, endpointID)
+        guard let (dhcpBytes, yiaddr) = result else { return nil }
+
+        // Build complete Ethernet+IPv4+UDP+DHCP frame in IOBuffer.output
+        let udpTotalLen = 8 + dhcpBytes.count
+        let ipTotalLen = 20 + udpTotalLen
+        let frameLen = 14 + ipTotalLen
+
+        guard let ptr = io.allocOutput(frameLen) else { return nil }
+        let ofs = ptr - io.output.baseAddress!
+
+        // Ethernet
+        srcMAC.write(to: ptr)
+        hostMAC.write(to: ptr.advanced(by: 6))
+        writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
+
+        // IPv4
+        let ipPtr = ptr.advanced(by: ethHeaderLen)
+        writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
+                        srcIP: pool.gateway, dstIP: yiaddr)
+
+        // UDP
+        let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
+        writeUInt16BE(67, to: udpPtr)
+        writeUInt16BE(68, to: udpPtr.advanced(by: 2))
+        writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
+        writeUInt16BE(0, to: udpPtr.advanced(by: 6))
+
+        // DHCP payload
+        dhcpBytes.withUnsafeBytes { buf in
+            udpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: buf.count)
         }
-        return nil
+
+        // UDP checksum
+        let ck = computeUDPChecksum(
+            pseudoSrcAddr: pool.gateway, pseudoDstAddr: yiaddr,
+            udpData: udpPtr, udpLen: udpTotalLen
+        )
+        writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
+
+        return (ofs, frameLen, endpointID)
     }
 
     // MARK: - DISCOVER
 
     private mutating func handleDiscover(
-        packet: DHCPPacket, srcMAC: MACAddress,
-        endpointID: Int, pool: inout DHCPPool, round: RoundContext
-    ) -> (PacketBuffer, IPv4Address)? {
-        guard let offeredIP = pool.allocate(clientMAC: srcMAC) else {
-            return nil
-        }
-        guard let pkt = buildDHCPReply(
-            messageType: .offer,
-            xid: packet.xid,
-            chaddr: srcMAC,
-            yiaddr: offeredIP,
-            pool: pool,
-            round: round
-        ) else {
-            return nil
-        }
+        packet: DHCPPacket, srcMAC: MACAddress, pool: inout DHCPPool
+    ) -> ([UInt8], IPv4Address)? {
+        guard let offeredIP = pool.allocate(clientMAC: srcMAC) else { return nil }
+        let pkt = buildDHCPReply(messageType: .offer, xid: packet.xid,
+                                  chaddr: srcMAC, yiaddr: offeredIP, pool: pool)
         return (pkt, offeredIP)
     }
 
     // MARK: - REQUEST
 
     private mutating func handleRequest(
-        packet: DHCPPacket, srcMAC: MACAddress,
-        endpointID: Int, pool: inout DHCPPool,
-        arpMapping: inout ARPMapping, round: RoundContext
-    ) -> (PacketBuffer, IPv4Address)? {
-        // Determine the requested IP: use option 50 if present, else ciaddr
+        packet: DHCPPacket, srcMAC: MACAddress, pool: inout DHCPPool,
+        arpMapping: inout ARPMapping, endpointID: Int
+    ) -> ([UInt8], IPv4Address)? {
         let requestedIP: IPv4Address
         if let opt50 = packet.requestedIP, opt50 != .zero {
             requestedIP = opt50
         } else {
-            return nil // cannot determine requested IP
-        }
-
-        // If serverIdentifier is set and not ours, this REQUEST is not for us
-        if let sid = packet.serverIdentifier, sid != pool.gateway {
             return nil
         }
-
-        // Validate requested IP belongs to this pool's subnet
+        if let sid = packet.serverIdentifier, sid != pool.gateway { return nil }
         guard pool.subnet.contains(requestedIP) else { return nil }
+        if let existingMAC = pool.macForIP(requestedIP), existingMAC != srcMAC { return nil }
+        if let pendingMAC = pool.pendingOfferMAC(for: requestedIP), pendingMAC != srcMAC { return nil }
 
-        // Reject if requested IP is already leased to a different MAC
-        if let existingMAC = pool.macForIP(requestedIP), existingMAC != srcMAC {
-            return nil
-        }
-
-        // Reject if requested IP is pending-offer to a different MAC (audit #1)
-        if let pendingMAC = pool.pendingOfferMAC(for: requestedIP), pendingMAC != srcMAC {
-            return nil
-        }
-
-        // Confirm the lease
         pool.confirm(requestedIP, mac: srcMAC)
         pool.removePendingOffer(requestedIP)
         arpMapping.add(ip: requestedIP, mac: srcMAC, endpointID: endpointID)
 
-        guard let pkt = buildDHCPReply(
-            messageType: .ack,
-            xid: packet.xid,
-            chaddr: srcMAC,
-            yiaddr: requestedIP,
-            pool: pool,
-            round: round
-        ) else { return nil }
+        let pkt = buildDHCPReply(messageType: .ack, xid: packet.xid,
+                                  chaddr: srcMAC, yiaddr: requestedIP, pool: pool)
         return (pkt, requestedIP)
     }
 
@@ -141,7 +128,7 @@ public struct DHCPServer {
 
     private mutating func handleRelease(
         packet: DHCPPacket, srcMAC: MACAddress,
-        endpointID: Int, pool: inout DHCPPool,
+        pool: inout DHCPPool,
         arpMapping: inout ARPMapping
     ) {
         // RFC 2131: RELEASE uses ciaddr to identify the IP being released.
@@ -161,19 +148,14 @@ public struct DHCPServer {
 
     // MARK: - Packet construction
 
-    /// Build raw DHCP payload (BOOTREPLY + magic cookie + options) only.
-    /// The caller (`process()`) wraps the payload in Ethernet/IPv4/UDP headers.
+    /// Build raw DHCP payload bytes (BOOTREPLY + magic cookie + options).
     private func buildDHCPReply(
         messageType: DHCPMessageType,
         xid: UInt32,
         chaddr: MACAddress,
         yiaddr: IPv4Address,
-        pool: DHCPPool,
-        round: RoundContext
-    ) -> PacketBuffer? {
-        // Calculate total DHCP reply length from option sizes so addition/removal
-        // of options cannot cause buffer overrun. The option sizes below must
-        // match the writeOption calls that follow.
+        pool: DHCPPool
+    ) -> [UInt8] {
         let optionsLen =
             (2 + 1) +  // option 53: message type
             (2 + 4) +  // option 1: subnet mask
@@ -186,42 +168,34 @@ public struct DHCPServer {
         let headerLen = 236
         let dhcpLen = headerLen + magicLen + optionsLen
 
-        var pkt = round.allocate(capacity: dhcpLen, headroom: 0)
-        guard let ptr = pkt.appendPointer(count: dhcpLen) else { return nil }
-        ptr.initializeMemory(as: UInt8.self, repeating: 0, count: dhcpLen)
+        var buf = [UInt8](repeating: 0, count: dhcpLen)
+        buf.withUnsafeMutableBytes { ptr in
+            let p = ptr.baseAddress!
+            p.storeBytes(of: UInt8(2), as: UInt8.self)                     // op = BOOTREPLY
+            p.advanced(by: 1).storeBytes(of: UInt8(1), as: UInt8.self)   // htype = Ethernet
+            p.advanced(by: 2).storeBytes(of: UInt8(6), as: UInt8.self)   // hlen
+            writeUInt32BE(xid, to: p.advanced(by: 4))
+            yiaddr.write(to: p.advanced(by: 16))
+            pool.gateway.write(to: p.advanced(by: 20))
+            chaddr.write(to: p.advanced(by: 28))
 
-        // DHCP header
-        ptr.storeBytes(of: UInt8(2), as: UInt8.self)                     // op = BOOTREPLY
-        ptr.advanced(by: 1).storeBytes(of: UInt8(1), as: UInt8.self)   // htype = Ethernet
-        ptr.advanced(by: 2).storeBytes(of: UInt8(6), as: UInt8.self)   // hlen
-        writeUInt32BE(xid, to: ptr.advanced(by: 4))                     // xid
-        yiaddr.write(to: ptr.advanced(by: 16))                          // yiaddr
-        pool.gateway.write(to: ptr.advanced(by: 20))                    // siaddr
-        chaddr.write(to: ptr.advanced(by: 28))                          // chaddr
+            p.advanced(by: 236).storeBytes(of: UInt8(99), as: UInt8.self)
+            p.advanced(by: 237).storeBytes(of: UInt8(130), as: UInt8.self)
+            p.advanced(by: 238).storeBytes(of: UInt8(83), as: UInt8.self)
+            p.advanced(by: 239).storeBytes(of: UInt8(99), as: UInt8.self)
 
-        // Magic cookie
-        ptr.advanced(by: 236).storeBytes(of: UInt8(99), as: UInt8.self)
-        ptr.advanced(by: 237).storeBytes(of: UInt8(130), as: UInt8.self)
-        ptr.advanced(by: 238).storeBytes(of: UInt8(83), as: UInt8.self)
-        ptr.advanced(by: 239).storeBytes(of: UInt8(99), as: UInt8.self)
-
-        // Options
-        var optOff = 240
-        writeOption(53, value: [messageType.rawValue], ptr: ptr, offset: &optOff)
-        writeOption(1, value: subnetMaskBytes(pool.subnet.mask), ptr: ptr, offset: &optOff)
-        writeOption(3, value: pool.gateway, ptr: ptr, offset: &optOff)
-        writeOption(6, value: pool.gateway, ptr: ptr, offset: &optOff)
-        writeOption(51, value: pool.leaseTime, ptr: ptr, offset: &optOff)
-        writeOption(54, value: pool.gateway, ptr: ptr, offset: &optOff)
-        // Option 255: End
-        ptr.advanced(by: optOff).storeBytes(of: UInt8(255), as: UInt8.self)
-
-        // Verify option size computation matched actual writes.
-        // Compiled out in release; catches stale dhcpLen when options are changed.
-        assert(optOff + 1 == dhcpLen,
-            "DHCP option length mismatch: wrote \(optOff + 1 - 244) bytes, computed \(optionsLen)")
-
-        return pkt
+            var optOff = 240
+            writeOption(53, value: [messageType.rawValue], ptr: p, offset: &optOff)
+            writeOption(1, value: subnetMaskBytes(pool.subnet.mask), ptr: p, offset: &optOff)
+            writeOption(3, value: pool.gateway, ptr: p, offset: &optOff)
+            writeOption(6, value: pool.gateway, ptr: p, offset: &optOff)
+            writeOption(51, value: pool.leaseTime, ptr: p, offset: &optOff)
+            writeOption(54, value: pool.gateway, ptr: p, offset: &optOff)
+            p.advanced(by: optOff).storeBytes(of: UInt8(255), as: UInt8.self)
+            assert(optOff + 1 == dhcpLen,
+                "DHCP option length mismatch: wrote \(optOff + 1 - 244) bytes, computed \(optionsLen)")
+        }
+        return buf
     }
 
     private func writeOption(_ code: UInt8, value: [UInt8], ptr: UnsafeMutableRawPointer, offset: inout Int) {
@@ -252,28 +226,6 @@ public struct DHCPServer {
          UInt8((mask >> 8) & 0xFF),  UInt8(mask & 0xFF)]
     }
 
-    // MARK: - Frame construction
-
-    /// Wrap a raw DHCP payload in Ethernet/IPv4/UDP headers.
-    ///
-    /// Constructs a complete L2 frame: Ethernet (14) + IPv4 (20) + UDP (8) + DHCP payload.
-    /// Uses `writeIPv4Header` for the IPv4 header and computes a valid UDP pseudo-header
-    /// checksum per RFC 768.
-    private func buildDHCPFrame(
-        hostMAC: MACAddress,
-        clientMAC: MACAddress,
-        gatewayIP: IPv4Address,
-        yiaddr: IPv4Address,
-        dhcpPayload: PacketBuffer,
-        round: RoundContext
-    ) -> PacketBuffer? {
-        buildUDPFrame(
-            hostMAC: hostMAC, dstMAC: clientMAC,
-            srcIP: gatewayIP, dstIP: yiaddr,
-            srcPort: 67, dstPort: 68,
-            payload: dhcpPayload, round: round
-        )
-    }
 }
 
 // MARK: - DHCPPool

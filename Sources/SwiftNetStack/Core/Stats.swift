@@ -178,9 +178,9 @@ public func printStats(
 
     // ── NAT counters ──
     if n.ackDeferred > 0 {
-        let coalesce = n.ackDeferred > 0
-            ? Int(Double(n.ackDeferred - n.ackFlushedTimer - n.ackFlushedImmediate) / Double(n.ackDeferred) * 100)
-            : 0
+        let flushed = n.ackFlushedTimer + n.ackFlushedImmediate
+        let remaining = flushed >= n.ackDeferred ? UInt64(0) : n.ackDeferred - flushed
+        let coalesce = Int(Double(remaining) / Double(n.ackDeferred) * 100)
         parts.append("ackDef=\(n.ackDeferred) ovrw=\(n.ackOverwritten) timer=\(n.ackFlushedTimer) imm=\(n.ackFlushedImmediate) coalesce=\(coalesce)%")
     }
     if n.ackTemplateUsed + n.ackTemplateFallback > 0 {

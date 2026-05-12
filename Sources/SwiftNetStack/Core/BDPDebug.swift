@@ -681,31 +681,18 @@ func debugValidateNATPoll(
 /// chunks in checksum field, etc.). These are DEBUG-only regression checks
 /// that run inline with the deliberation loop — no separate test target.
 func debugRunTCPFSMTests() {
-    // Helper: create a minimal TCP segment for FSM testing
-    func makeSeg(flags: TCPFlags, seq: UInt32, ack: UInt32, dataLen: Int = 0) -> (TCPHeader, SendSequence, RecvSequence) {
-        var pkt = PacketBuffer(capacity: dataLen, headroom: 0)
-        if dataLen > 0 {
-            _ = pkt.appendPointer(count: dataLen)
-        }
-        let hdr = TCPHeader(
-            srcPort: 0, dstPort: 0,
-            sequenceNumber: seq, acknowledgmentNumber: ack,
-            dataOffset: 5, flags: flags,
-            window: 65535, checksum: 0, urgentPointer: 0,
-            payload: pkt,
-            pseudoSrcAddr: IPv4Address(1, 0, 0, 1),
-            pseudoDstAddr: IPv4Address(1, 0, 0, 2),
-            checksumValid: true
-        )
+    // Helper: create a minimal TCPSegmentInfo for FSM testing
+    func makeSeg(flags: TCPFlags, seq: UInt32, ack: UInt32) -> (TCPSegmentInfo, SendSequence, RecvSequence) {
+        let seg = TCPSegmentInfo(seq: seq, ack: ack, flags: flags, window: 65535)
         let snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
         let rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
-        return (hdr, snd, rcv)
+        return (seg, snd, rcv)
     }
 
     // LISTEN + SYN → synReceived
     do {
         var (seg, snd, rcv) = makeSeg(flags: .syn, seq: 2000, ack: 0)
-        let (newState, toSend, _) = _tcpProcessImpl(state: .listen, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, toSend, _, _) = _tcpProcessImpl(state: .listen, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .synReceived, "TCP FSM: LISTEN + SYN → \(newState), expected .synReceived")
         precondition(toSend.count == 1, "TCP FSM: LISTEN + SYN → \(toSend.count) toSend, expected 1")
         precondition(toSend[0].flags == [.syn, .ack], "TCP FSM: LISTEN + SYN flag mismatch")
@@ -714,7 +701,7 @@ func debugRunTCPFSMTests() {
     // LISTEN + non-SYN (no state change)
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 0)
-        let (newState, toSend, _) = _tcpProcessImpl(state: .listen, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, toSend, _, _) = _tcpProcessImpl(state: .listen, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .listen, "TCP FSM: LISTEN + ACK → \(newState), expected .listen")
         precondition(toSend.isEmpty, "TCP FSM: LISTEN + ACK → toSend not empty")
     }
@@ -723,7 +710,7 @@ func debugRunTCPFSMTests() {
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2001, ack: 1001)
         snd.nxt = 1001
-        let (newState, _, _) = _tcpProcessImpl(state: .synReceived, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .synReceived, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .established, "TCP FSM: synReceived + ACK → \(newState), expected .established")
     }
 
@@ -731,43 +718,36 @@ func debugRunTCPFSMTests() {
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2001, ack: 999)
         snd.nxt = 1001
-        let (newState, _, _) = _tcpProcessImpl(state: .synReceived, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .synReceived, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .synReceived, "TCP FSM: synReceived + bad ACK → \(newState), expected .synReceived")
     }
 
     // ESTABLISHED + FIN → closeWait
     do {
         var (seg, snd, rcv) = makeSeg(flags: .fin, seq: 2000, ack: 1000)
-        let (newState, toSend, _) = _tcpProcessImpl(state: .established, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, toSend, _, _) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .closeWait, "TCP FSM: ESTABLISHED + FIN → \(newState), expected .closeWait")
         precondition(!toSend.isEmpty, "TCP FSM: ESTABLISHED + FIN → no ACK toSend")
     }
 
     // ESTABLISHED + data → returns dataToExternal
     do {
-        var segPkt = PacketBuffer(capacity: 10, headroom: 0)
-        _ = segPkt.appendPointer(count: 10)
-        let seg = TCPHeader(
-            srcPort: 0, dstPort: 0,
-            sequenceNumber: 2000, acknowledgmentNumber: 1000,
-            dataOffset: 5, flags: .ack,
-            window: 65535, checksum: 0, urgentPointer: 0,
-            payload: segPkt,
-            pseudoSrcAddr: .zero, pseudoDstAddr: .zero,
-            checksumValid: true
-        )
+        let dataBuf = UnsafeMutableRawBufferPointer.allocate(byteCount: 10, alignment: 8)
+        dataBuf.initializeMemory(as: UInt8.self, repeating: 0x41)
+        defer { dataBuf.deallocate() }
+        let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .ack, window: 65535)
         var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
         var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
-        let (newState, _, data) = _tcpProcessImpl(state: .established, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, dataPtr, dataLen) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: UnsafeRawPointer(dataBuf.baseAddress!), payloadLen: 10, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .established, "TCP FSM: ESTABLISHED + data → \(newState)")
-        precondition(data != nil && data!.totalLength == 10, "TCP FSM: ESTABLISHED + data → no dataToExternal")
+        precondition(dataPtr != nil && dataLen == 10, "TCP FSM: ESTABLISHED + data → no dataToExternal")
         precondition(rcv.nxt == 2010, "TCP FSM: ESTABLISHED + data → rcv.nxt not advanced")
     }
 
     // ESTABLISHED + appClose → finWait1
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
-        let (newState, toSend, _) = _tcpProcessImpl(state: .established, segment: seg, snd: &snd, rcv: &rcv, appClose: true)
+        let (newState, toSend, _, _) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: true)
         precondition(newState == .finWait1, "TCP FSM: ESTABLISHED + appClose → \(newState), expected .finWait1")
         precondition(!toSend.isEmpty && toSend[0].flags.isFin, "TCP FSM: ESTABLISHED + appClose → no FIN sent")
     }
@@ -776,21 +756,21 @@ func debugRunTCPFSMTests() {
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1001)
         snd.nxt = 1001
-        let (newState, _, _) = _tcpProcessImpl(state: .finWait1, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .finWait1, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .finWait2, "TCP FSM: FIN_WAIT1 + ACK → \(newState), expected .finWait2")
     }
 
     // FIN_WAIT2 + FIN → closed
     do {
         var (seg, snd, rcv) = makeSeg(flags: .fin, seq: 2000, ack: 1000)
-        let (newState, _, _) = _tcpProcessImpl(state: .finWait2, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .finWait2, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .closed, "TCP FSM: FIN_WAIT2 + FIN → \(newState), expected .closed")
     }
 
     // closeWait + appClose → lastAck
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
-        let (newState, _, _) = _tcpProcessImpl(state: .closeWait, segment: seg, snd: &snd, rcv: &rcv, appClose: true)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .closeWait, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: true)
         precondition(newState == .lastAck, "TCP FSM: closeWait + appClose → \(newState), expected .lastAck")
     }
 
@@ -798,21 +778,21 @@ func debugRunTCPFSMTests() {
     do {
         var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1001)
         snd.nxt = 1001
-        let (newState, _, _) = _tcpProcessImpl(state: .lastAck, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .lastAck, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .closed, "TCP FSM: lastAck + ACK → \(newState), expected .closed")
     }
 
     // Any state + RST → closed
     do {
         var (seg, snd, rcv) = makeSeg(flags: .rst, seq: 0, ack: 0)
-        let (newState, _, _) = _tcpProcessImpl(state: .established, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .closed, "TCP FSM: ESTABLISHED + RST → \(newState), expected .closed")
     }
 
     // CLOSED + anything → closed
     do {
         var (seg, snd, rcv) = makeSeg(flags: .syn, seq: 2000, ack: 0)
-        let (newState, _, _) = _tcpProcessImpl(state: .closed, segment: seg, snd: &snd, rcv: &rcv, appClose: false)
+        let (newState, _, _, _) = _tcpProcessImpl(state: .closed, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv, appClose: false)
         precondition(newState == .closed, "TCP FSM: CLOSED + SYN → \(newState), expected .closed")
     }
 }

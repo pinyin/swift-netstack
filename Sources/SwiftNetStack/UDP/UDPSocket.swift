@@ -1,10 +1,14 @@
-/// Protocol for socket handler implementations.
+/// Protocol for socket handler implementations (SoA-compatible).
 ///
 /// Each registered handler processes transport-layer data addressed to its port.
-/// Handlers produce outbound frames by appending to `replies`.
+/// Handlers write outbound frames directly into IOBuffer.output and track them
+/// via OutBatch.
 public protocol SocketHandler {
+    /// SoA-compatible handler. Implementations write headers to IOBuffer.output
+    /// and add entries to `outBatch` for sending.
     func handleDatagram(
-        payload: PacketBuffer,
+        payloadPtr: UnsafeMutableRawPointer,
+        payloadLen: Int,
         srcIP: IPv4Address,
         dstIP: IPv4Address,
         srcPort: UInt16,
@@ -12,8 +16,8 @@ public protocol SocketHandler {
         srcMAC: MACAddress,
         endpointID: Int,
         hostMAC: MACAddress,
-        replies: inout [(endpointID: Int, packet: PacketBuffer)],
-        round: RoundContext
+        outBatch: OutBatch,
+        io: IOBuffer
     )
 }
 

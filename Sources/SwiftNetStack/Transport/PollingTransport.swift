@@ -4,8 +4,6 @@ import Darwin
 
 private let kSocketSendBufferSize: Int = 1 * 1024 * 1024
 private let kSocketRecvBufferSize: Int = 4 * kSocketSendBufferSize
-private let kMaxPacketsPerRead: Int = 256
-private let kMaxPendingWrites: Int = 1024
 
 private func configureNetworkFD(_ fd: Int32) {
     let flags = fcntl(fd, F_GETFL, 0)
@@ -14,52 +12,50 @@ private func configureNetworkFD(_ fd: Int32) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndSize, socklen_t(MemoryLayout<Int>.size))
     var rcvSize = kSocketRecvBufferSize
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvSize, socklen_t(MemoryLayout<Int>.size))
+    var one: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
 }
 
 // MARK: - External FD kind
 
-/// How Transport should read data from an external FD when poll reports it ready.
 public enum ExternalFDKind {
-    case stream        // TCP: recv() into buffer
-    case datagram      // UDP: recvfrom() with source address
-    case rawDatagram   // DNS upstream: recvfrom() without source
+    case stream
+    case datagram
+    case rawDatagram
 }
 
 // MARK: - Transport result
 
-/// All data read by a single Transport.readPackets() call.
+/// All data read by a single readPackets() call.
 public struct TransportResult {
-    public var vmFrames: [(endpointID: Int, packet: PacketBuffer)] = []
-    public var streamReads: [(fd: Int32, data: PacketBuffer)] = []
+    public var streamReads: [(fd: Int32, data: [UInt8])] = []
     public var streamAccepts: [(listenerFD: Int32, newFD: Int32, remoteAddr: sockaddr_in)] = []
     public var streamHangup: [Int32] = []
-    public var datagramReads: [(fd: Int32, data: PacketBuffer, from: sockaddr_in)] = []
-    public var rawDatagramReads: [(fd: Int32, data: PacketBuffer)] = []
     public var streamConnects: [Int32] = []
+    public var datagramReads: [(fd: Int32, data: [UInt8], from: sockaddr_in)] = []
+    public var rawDatagramReads: [(fd: Int32, data: [UInt8])] = []
     public var deadFDs: [Int32] = []
 }
 
 // MARK: - PollingTransport
 
-/// Complete I/O layer — polls, reads, and writes ALL file descriptors.
-///
-/// VM endpoints are fixed at init. External FDs (NAT, DNS) are registered
-/// at runtime via `registerFD` / `unregisterFD`. Transport owns the full
-/// pollfd set — `readPackets` needs no external parameters.
-///
-/// Write methods cover all FD types: VM frames go through `writePackets` with
-/// pending-write retry; external writes go through `writeStream` / `writeDatagram`.
 public struct PollingTransport {
     private var endpointsByFD: [Int32: VMEndpoint]
     private var fdByEndpointID: [Int: Int32]
-    private var pendingWrites: [(endpointID: Int, packet: PacketBuffer)] = []
     private var externalFDs: [(fd: Int32, events: Int16, kind: ExternalFDKind)] = []
     private let shutdownFD: Int32?
     private let onShutdown: (() -> Void)?
     public var pollTimeout: Int32
     public var stats: TransportStats
 
-    public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil, onShutdown: (() -> Void)? = nil, pollTimeout: Int32 = 100) {
+    // MARK: - Endpoint fd lookup
+
+    public func fdForEndpoint(_ id: Int) -> Int32? {
+        fdByEndpointID[id]
+    }
+
+    public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil,
+                onShutdown: (() -> Void)? = nil, pollTimeout: Int32 = 100) {
         var byFD: [Int32: VMEndpoint] = [:]
         var fdByEP: [Int: Int32] = [:]
         for ep in endpoints {
@@ -77,8 +73,6 @@ public struct PollingTransport {
 
     // MARK: - External FD registration
 
-    /// Register an external FD for polling. Safe to call multiple times
-    /// with updated events — replaces any previous registration for this fd.
     public mutating func registerFD(_ fd: Int32, events: Int16, kind: ExternalFDKind) {
         if let idx = externalFDs.firstIndex(where: { $0.fd == fd }) {
             externalFDs[idx] = (fd, events, kind)
@@ -87,42 +81,33 @@ public struct PollingTransport {
         }
     }
 
-    /// Remove an external FD from the poll set.
     public mutating func unregisterFD(_ fd: Int32) {
         externalFDs.removeAll { $0.fd == fd }
     }
 
-    /// Update poll events for an already-registered external FD.
-    /// Preserves the existing FD kind. No-op if the FD is not registered.
     public mutating func setFDEvents(_ fd: Int32, events: Int16) {
         guard let idx = externalFDs.firstIndex(where: { $0.fd == fd }) else { return }
         externalFDs[idx].events = events
     }
 
-    /// Bulk-register external FDs (used for initial sync of listener FDs).
     public mutating func registerFDs(_ fds: [(fd: Int32, events: Int16, kind: ExternalFDKind)]) {
-        for (fd, events, kind) in fds {
-            registerFD(fd, events: events, kind: kind)
-        }
+        for (fd, events, kind) in fds { registerFD(fd, events: events, kind: kind) }
     }
 
     // MARK: - Read (unified poll + read all)
 
-    /// Single poll() over ALL FDs, then read data from every ready FD.
-    /// VM FDs → Ethernet frames. External FDs → typed data based on their kind.
-    public mutating func readPackets(round: RoundContext) -> TransportResult {
+    public mutating func readPackets(io: IOBuffer) -> TransportResult {
         var result = TransportResult()
+        io.frameCount = 0
 
-        // ── Build pollfd array: VM endpoints → external FDs → shutdown ──
+        // ── Build pollfd array ──
         var fds: [Int32] = []
         var pollfds: [pollfd] = []
         let endpointCount = endpointsByFD.count
-        let pendingEndpointIDs = Set(pendingWrites.map { $0.endpointID })
-        for (fd, ep) in endpointsByFD {
+
+        for (fd, _) in endpointsByFD {
             fds.append(fd)
-            var events = Int16(POLLIN)
-            if pendingEndpointIDs.contains(ep.id) { events |= Int16(POLLOUT) }
-            pollfds.append(pollfd(fd: fd, events: events, revents: 0))
+            pollfds.append(pollfd(fd: fd, events: Int16(POLLIN), revents: 0))
         }
 
         for (fd, ev, _) in externalFDs {
@@ -161,53 +146,44 @@ public struct PollingTransport {
             }
         }
 
-        // ── Retry pending writes on writable VM fds ──
-        retryPendingWrites(pollfds: pollfds, fds: fds)
-
-        // ── Read from ready external FDs ──
+        // ── Read external FDs ──
         for i in endpointCount..<(endpointCount + externalFDs.count) {
             let rev = pollfds[i].revents
             guard rev != 0 else { continue }
             let fd = fds[i]
             let kind = externalFDs[i - endpointCount].kind
 
-            // Errors
             if rev & Int16(POLLERR | POLLNVAL) != 0 {
-                result.deadFDs.append(fd)
-                continue
+                result.deadFDs.append(fd); continue
             }
             if rev & Int16(POLLHUP) != 0 && rev & Int16(POLLIN) == 0 {
                 if kind == .stream { result.streamHangup.append(fd) }
                 else { result.deadFDs.append(fd) }
                 continue
             }
-
-            // POLLOUT on stream sockets → connect completed
             if kind == .stream && rev & Int16(POLLOUT) != 0 {
                 result.streamConnects.append(fd)
             }
 
-            // Read data
             if rev & Int16(POLLIN) != 0 {
                 switch kind {
                 case .stream:
                     var isListener = false
                     while true {
-                        var buf = round.allocate(capacity: 65536, headroom: 0)
-                        guard let ptr = buf.appendPointer(count: 65536) else { break }
+                        var buf = [UInt8](repeating: 0, count: 65536)
                         stats.recvCalls += 1
-                        let n = Darwin.recv(fd, ptr, 65536, 0)
+                        let n = buf.withUnsafeMutableBytes {
+                            Darwin.recv(fd, $0.baseAddress!, 65536, 0)
+                        }
                         if n > 0 {
-                            buf.trimBack(65536 - n)
+                            buf.removeLast(65536 - n)
                             result.streamReads.append((fd, buf))
                         } else if n == 0 {
-                            result.streamHangup.append(fd)
-                            break
+                            result.streamHangup.append(fd); break
                         } else {
                             if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { break }
                             if errno == ENOTCONN { isListener = true; break }
-                            result.deadFDs.append(fd)
-                            break
+                            result.deadFDs.append(fd); break
                         }
                     }
                     if isListener {
@@ -231,18 +207,19 @@ public struct PollingTransport {
                     }
                 case .datagram:
                     while true {
-                        var buf = round.allocate(capacity: 65536, headroom: 0)
-                        guard let ptr = buf.appendPointer(count: 65536) else { break }
+                        var buf = [UInt8](repeating: 0, count: 65536)
                         var srcAddr = sockaddr_in()
                         var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
                         stats.recvfromCalls += 1
-                        let n = withUnsafeMutablePointer(to: &srcAddr) {
-                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                                Darwin.recvfrom(fd, ptr, 65536, 0, $0, &srcLen)
+                        let n = buf.withUnsafeMutableBytes { ptr in
+                            withUnsafeMutablePointer(to: &srcAddr) {
+                                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                    Darwin.recvfrom(fd, ptr.baseAddress!, 65536, 0, $0, &srcLen)
+                                }
                             }
                         }
                         if n > 0 {
-                            buf.trimBack(65536 - n)
+                            buf.removeLast(65536 - n)
                             result.datagramReads.append((fd, buf, srcAddr))
                         } else {
                             if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
@@ -253,11 +230,12 @@ public struct PollingTransport {
                     }
                 case .rawDatagram:
                     while true {
-                        var buf = round.allocate(capacity: 4096, headroom: 0)
-                        guard let ptr = buf.appendPointer(count: 4096) else { break }
-                        let n = Darwin.recvfrom(fd, ptr, 4096, 0, nil, nil)
+                        var buf = [UInt8](repeating: 0, count: 4096)
+                        let n = buf.withUnsafeMutableBytes {
+                            Darwin.recvfrom(fd, $0.baseAddress!, 4096, 0, nil, nil)
+                        }
                         if n > 0 {
-                            buf.trimBack(4096 - n)
+                            buf.removeLast(4096 - n)
                             result.rawDatagramReads.append((fd, buf))
                         } else {
                             if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
@@ -276,22 +254,26 @@ public struct PollingTransport {
             externalFDs.removeAll { deadSet.contains($0.fd) }
         }
 
-        // ── Read from readable VM fds ──
+        // ── Read VM fds directly into IOBuffer.input ──
+        let mtu = io.mtu
         for i in 0..<endpointCount where pollfds[i].revents & Int16(POLLIN) != 0 {
             let fd = fds[i]
             guard let ep = endpointsByFD[fd] else { continue }
 
-            while result.vmFrames.count < kMaxPacketsPerRead {
-                var pkt = round.allocate(capacity: ep.mtu, headroom: 0)
-                guard let ptr = pkt.appendPointer(count: ep.mtu) else { break }
-                var iov = iovec(iov_base: ptr, iov_len: ep.mtu)
-                var msg = msghdr(msg_name: nil, msg_namelen: 0, msg_iov: &iov, msg_iovlen: 1, msg_control: nil, msg_controllen: 0, msg_flags: 0)
+            while io.frameCount < io.maxFrames {
+                let idx = io.frameCount
+                let ptr = io.framePtr(idx)
+                var iov = iovec(iov_base: ptr, iov_len: mtu)
+                var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                 msg_iov: &iov, msg_iovlen: 1,
+                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
                 stats.recvmsgCalls += 1
                 let n = Darwin.recvmsg(fd, &msg, 0)
                 if n <= 0 { break }
                 if msg.msg_flags & Int32(MSG_TRUNC) != 0 { continue }
-                if n < ep.mtu { pkt.trimBack(ep.mtu - n) }
-                result.vmFrames.append((ep.id, pkt))
+                io.frameLengths[idx] = n
+                io.frameEndpointIDs[idx] = ep.id
+                io.frameCount += 1
             }
         }
 
@@ -300,40 +282,68 @@ public struct PollingTransport {
 
     // MARK: - Write (VM endpoints)
 
-    public mutating func writePackets(_ packets: [(endpointID: Int, packet: PacketBuffer)]) {
-        for (epID, pkt) in packets {
-            guard let fd = fdByEndpointID[epID] else { continue }
-            if sendPacket(pkt, to: fd, flags: Int32(MSG_DONTWAIT)) < 0 {
-                if errno == EAGAIN {
-                    pendingWrites.append((epID, pkt))
-                    if pendingWrites.count > kMaxPendingWrites {
-                        pendingWrites.removeFirst(pendingWrites.count - kMaxPendingWrites)
+    /// Write output frames from an OutBatch. Iterates by subscript, constructing
+    /// iovecs from IOBuffer.output header area + IOBuffer.input payload area.
+    public mutating func writeBatch(_ batch: OutBatch, io: IOBuffer) {
+        for i in 0..<batch.count {
+            guard let fd = fdByEndpointID[batch.epIDs[i]] else { continue }
+            let hdrPtr = io.output.baseAddress! + batch.hdrOfs[i]
+            let hdrLen = batch.hdrLen[i]
+
+            if batch.payOfs[i] >= 0, batch.payLen[i] > 0 {
+                var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+                let payBase = batch.payBase[i] ?? io.input.baseAddress!
+                let payPtr = payBase + batch.payOfs[i]
+                var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: batch.payLen[i])
+                var iovs: [iovec] = [iov0, iov1]
+                _ = iovs.withUnsafeMutableBufferPointer { iovPtr in
+                    var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                     msg_iov: iovPtr.baseAddress, msg_iovlen: 2,
+                                     msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                    stats.sendmsgCalls += 1
+                    stats.sendBytes += UInt64(hdrLen + batch.payLen[i])
+                    let r = Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
+                    if r < 0, errno != EAGAIN, errno != ENOBUFS {
+                        fputs("[POLL-WRITE] sendmsg(iov) fd=\(fd) failed: errno=\(errno) hdrLen=\(hdrLen) payLen=\(batch.payLen[i])\n", stderr)
                     }
-                } else {
-                    logWriteError("writePackets", fd: fd, epID: epID)
+                    return r
                 }
+            } else {
+                var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+                var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                 msg_iov: &iov, msg_iovlen: 1,
+                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                stats.sendmsgCalls += 1
+                stats.sendBytes += UInt64(hdrLen)
+                let r = Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
+                if r < 0, errno != EAGAIN, errno != ENOBUFS {
+                    fputs("[POLL-WRITE] sendmsg fd=\(fd) failed: errno=\(errno) hdrLen=\(hdrLen)\n", stderr)
+                }
+                _ = r
             }
         }
     }
 
     // MARK: - Write (external FDs)
 
-    /// Send data on a stream (TCP) socket. Returns bytes written or -1.
     @discardableResult
-    public mutating func writeStream(_ data: PacketBuffer, to fd: Int32) -> Int {
-        sendPacket(data, to: fd, flags: 0)
+    public mutating func writeStream(_ data: [UInt8], to fd: Int32) -> Int {
+        guard !data.isEmpty else { return 0 }
+        stats.sendmsgCalls += 1
+        stats.sendBytes += UInt64(data.count)
+        return data.withUnsafeBytes { ptr in
+            Darwin.send(fd, ptr.baseAddress!, data.count, Int32(MSG_NOSIGNAL))
+        }
     }
 
-    /// Send a datagram on a UDP socket. Returns bytes written or -1.
     @discardableResult
-    public mutating func writeDatagram(_ data: PacketBuffer, to fd: Int32, addr: sockaddr_in) -> Int {
-        guard data.totalLength > 0 else { return 0 }
+    public mutating func writeDatagram(_ data: [UInt8], to fd: Int32, addr: sockaddr_in) -> Int {
+        guard !data.isEmpty else { return 0 }
         var sa = addr
-
-        // Fast path: single-view buffers avoid the iovecs() heap allocation.
-        if data.viewCount == 1 {
-            let v = data._views[0]
-            var iov = iovec(iov_base: v.storage.data.advanced(by: v.offset), iov_len: v.length)
+        stats.sendmsgCalls += 1
+        stats.sendBytes += UInt64(data.count)
+        return data.withUnsafeBytes { ptr in
+            var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: ptr.baseAddress!), iov_len: data.count)
             var msg = msghdr(
                 msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
                 msg_iov: &iov, msg_iovlen: 1,
@@ -341,82 +351,15 @@ public struct PollingTransport {
             )
             return Darwin.sendmsg(fd, &msg, 0)
         }
-
-        var iov = data.iovecs()
-        guard !iov.isEmpty else { return 0 }
-        return iov.withUnsafeMutableBufferPointer { iovPtr in
-            var msg = msghdr(
-                msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
-                msg_iov: iovPtr.baseAddress, msg_iovlen: Int32(iovPtr.count),
-                msg_control: nil, msg_controllen: 0, msg_flags: 0
-            )
-            return Darwin.sendmsg(fd, &msg, 0)
-        }
     }
 
-    /// Send a datagram on a connected socket (no destination address).
     @discardableResult
-    public mutating func writeDatagram(_ data: PacketBuffer, to fd: Int32) -> Int {
-        sendPacket(data, to: fd, flags: 0)
-    }
-
-    // MARK: - Internal scatter-gather send
-
-    private mutating func sendPacket(_ pkt: PacketBuffer, to fd: Int32, flags: Int32) -> Int {
-        guard pkt.totalLength > 0 else { return 0 }
+    public mutating func writeDatagram(_ data: [UInt8], to fd: Int32) -> Int {
+        guard !data.isEmpty else { return 0 }
         stats.sendmsgCalls += 1
-        stats.sendBytes += UInt64(pkt.totalLength)
-
-        // Fast path: single-view buffers (ACK frames, most writes) use a
-        // stack iovec to avoid the heap allocation from iovecs().compactMap.
-        if pkt.viewCount == 1 {
-            let v = pkt._views[0]
-            var iov = iovec(iov_base: v.storage.data.advanced(by: v.offset), iov_len: v.length)
-            var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                             msg_iov: &iov, msg_iovlen: 1,
-                             msg_control: nil, msg_controllen: 0, msg_flags: 0)
-            return Darwin.sendmsg(fd, &msg, flags)
-        }
-
-        var iov = pkt.iovecs()
-        guard !iov.isEmpty else { return 0 }
-        return iov.withUnsafeMutableBufferPointer { iovPtr in
-            var msg = msghdr(
-                msg_name: nil, msg_namelen: 0,
-                msg_iov: iovPtr.baseAddress, msg_iovlen: Int32(iovPtr.count),
-                msg_control: nil, msg_controllen: 0, msg_flags: 0
-            )
-            return Darwin.sendmsg(fd, &msg, flags)
+        stats.sendBytes += UInt64(data.count)
+        return data.withUnsafeBytes { ptr in
+            Darwin.send(fd, ptr.baseAddress!, data.count, 0)
         }
     }
-
-    // MARK: - Pending write retry
-
-    private mutating func retryPendingWrites(pollfds: [pollfd], fds: [Int32]) {
-        guard !pendingWrites.isEmpty else { return }
-        var writableFDs = Set<Int32>()
-        for (i, pfd) in pollfds.enumerated() where pfd.revents & Int16(POLLOUT) != 0 {
-            writableFDs.insert(fds[i])
-        }
-        var remaining: [(endpointID: Int, packet: PacketBuffer)] = []
-        for (epID, pkt) in pendingWrites {
-            guard let fd = fdByEndpointID[epID], writableFDs.contains(fd) else {
-                remaining.append((epID, pkt)); continue
-            }
-            if sendPacket(pkt, to: fd, flags: Int32(MSG_DONTWAIT)) < 0 {
-                if errno == EAGAIN { remaining.append((epID, pkt)) }
-                else { logWriteError("retryPendingWrites", fd: fd, epID: epID) }
-            }
-        }
-        pendingWrites = remaining
-    }
-}
-
-// MARK: - Debug
-
-private func logWriteError(_ context: String, fd: Int32, epID: Int) {
-    #if DEBUG
-    let msg = "\(context): sendmsg(fd=\(fd), ep=\(epID)) failed (\(errno)) — packet silently dropped\n"
-    _ = msg.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }
-    #endif
 }

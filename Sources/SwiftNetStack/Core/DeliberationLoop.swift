@@ -5,15 +5,10 @@ import Darwin
 /// Owns long-lived protocol state (ARP table, DHCP leases, NAT connections)
 /// and exposes two levels of control:
 /// - `run(transport:while:)` — continuous loop with a caller-provided condition
-/// - `runOneRound(transport:)` — single 14-phase cycle for caller-driven pacing
+/// - `runOneRound(transport:)` — single cycle for caller-driven pacing
 ///
 /// DeliberationLoop never creates fds and runs entirely within sandbox constraints.
 /// The caller owns all file descriptors and thread management.
-///
-/// Usage:
-///   var loop = DeliberationLoop(endpoints: [vm1], hostMAC: myMAC)
-///   var transport = PollingTransport(endpoints: [vm1])
-///   loop.run(transport: &transport, while: { !shutdown })
 public struct DeliberationLoop {
     public let hostMAC: MACAddress
     public var arpMapping: ARPMapping
@@ -24,11 +19,16 @@ public struct DeliberationLoop {
     public var natTable: NATTable
 
     /// Optional pcap writer for capturing VM↔NAT Ethernet frames.
-    /// Set before calling run() to record traffic for Wireshark/tcpdump analysis.
     public var pcapWriter: PCAPWriter?
 
     /// Per-phase cumulative CPU time for hotspot analysis.
     public var phaseTiming = PhaseTiming()
+
+    // ── Pre-allocated SoA infrastructure ──
+    private let io: IOBuffer
+    private let parseOutput: ParseOutput
+    private var fwdBatch: OutBatch
+    private var outBatch: OutBatch
 
     public init(
         endpoints: [VMEndpoint],
@@ -47,6 +47,13 @@ public struct DeliberationLoop {
         self.natTable = NATTable(portForwards: portForwards, mss: mss)
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
         self.pcapWriter = pcapWriter
+
+        let maxFrames = 256
+        let mtu = endpoints.map { $0.mtu }.max() ?? 1500
+        self.io = IOBuffer(maxFrames: maxFrames, mtu: mtu)
+        self.parseOutput = ParseOutput(maxFrames: maxFrames)
+        self.fwdBatch = OutBatch(maxFrames: maxFrames)
+        self.outBatch = OutBatch(maxFrames: maxFrames)
 
 #if DEBUG
         debugRunTCPFSMTests()
@@ -67,17 +74,14 @@ public struct DeliberationLoop {
 
     // MARK: - Main loop
 
-    /// Execute one BDP deliberation round (16 phases).
-    ///
-    /// Returns the number of packets written to the transport.
     @discardableResult
     public mutating func runOneRound(transport: inout PollingTransport, roundNumber: UInt64) -> Int {
-        let round = RoundContext()
-        round.roundNumber = roundNumber
-
         var totalWritten = 0
 
-        // ── Dynamic poll timeout for delayed ACK coalescing ──
+        // Reset output arena — readPackets resets frameCount, but not outputUsed.
+        io.reset()
+
+        // ── Dynamic poll timeout ──
         let nowSec = UInt64(Darwin.time(nil))
         let nowUs = monotonicMicros()
         if let deadline = natTable.nextDelayedACKDeadline() {
@@ -87,317 +91,349 @@ public struct DeliberationLoop {
             transport.pollTimeout = 100
         }
 
-        // ── Phase 1: Unified poll — all FDs treated equally ──
+        // ── Phase 1: Poll ──
         let tPoll = cpuNanos()
-        let result = transport.readPackets(round: round)
-
-        // Capture VM→NAT frames for pcap debugging
+        let result = transport.readPackets(io: io)
+        // pcap capture for VM→NAT frames
         if let pw = pcapWriter {
-            for (_, pkt) in result.vmFrames {
-                pw.write(packet: pkt)
+            for i in 0..<io.frameCount {
+                let ptr = io.framePtr(i)
+                let len = io.frameLengths[i]
+                pw.writeRaw(framePtr: ptr, len: len)
             }
         }
         phaseTiming.pollRead &+= cpuNanos() - tPoll
 
-        // ── Phase 2-6: Parse ALL headers ──
+        // ── Phase 2-6: Unified parse ──
         let tParse = cpuNanos()
-
-        // ── Phase 2: Parse ALL Ethernet headers ──
-        var ethParsed: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
-        ethParsed.reserveCapacity(result.vmFrames.count)
-        for (ep, pkt) in result.vmFrames {
-            if let eth = EthernetFrame.parse(from: pkt) {
-                ethParsed.append((ep, pkt, eth))
-            }
-        }
-
-        // ── Phase 3: MAC filter + EtherType dispatch + L2 forward ──
-        var arpPkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
-        var ipv4Pkts: [(ep: Int, pkt: PacketBuffer, eth: EthernetFrame)] = []
-        let ethCount = ethParsed.count
-        arpPkts.reserveCapacity(ethCount)
-        ipv4Pkts.reserveCapacity(ethCount)
-        for (ep, pkt, eth) in ethParsed {
-            if eth.dstMAC == arpMapping.hostMAC || eth.dstMAC == .broadcast {
-                switch eth.etherType {
-                case .arp:  arpPkts.append((ep, pkt, eth))
-                case .ipv4: ipv4Pkts.append((ep, pkt, eth))
-                @unknown default: break
-                }
-            } else if let dstEp = arpMapping.lookupEndpoint(mac: eth.dstMAC), dstEp != ep {
-                totalWritten &+= writeReplies([(dstEp, pkt)], transport: &transport)
-            }
-        }
-
-        // ── Phase 4: Parse ALL IPv4 headers ──
-        var ipv4Parsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
-        ipv4Parsed.reserveCapacity(ipv4Pkts.count)
-        for (ep, _, eth) in ipv4Pkts {
-            guard let ip = IPv4Header.parse(from: eth.payload) else { continue }
-            ipv4Parsed.append((ep, eth, ip))
-        }
-
-        // ── Phase 5: Parse ALL ARP frames ──
-        var arpParsed: [(ep: Int, eth: EthernetFrame, arp: ARPFrame)] = []
-        arpParsed.reserveCapacity(arpPkts.count)
-        for (ep, _, eth) in arpPkts {
-            if let arp = ARPFrame.parse(from: eth.payload) {
-                arpParsed.append((ep, eth, arp))
-            }
-        }
-
-        // ── Phase 6: Parse ALL transport headers ──
-        var icmpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, icmp: ICMPHeader)] = []
-        var udpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
-        var dhcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, dhcp: DHCPPacket)] = []
-        var dnsParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, udp: UDPHeader)] = []
-        var tcpParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header, tcp: TCPHeader)] = []
-        var unreachableParsed: [(ep: Int, eth: EthernetFrame, ip: IPv4Header)] = []
-        let ipv4Count = ipv4Parsed.count
-        icmpParsed.reserveCapacity(ipv4Count)
-        udpParsed.reserveCapacity(ipv4Count)
-        dhcpParsed.reserveCapacity(ipv4Count)
-        dnsParsed.reserveCapacity(ipv4Count)
-        tcpParsed.reserveCapacity(ipv4Count)
-        unreachableParsed.reserveCapacity(ipv4Count)
-        for (ep, eth, ip) in ipv4Parsed {
-            switch ip.protocol {
-            case .icmp:
-                if let icmp = ICMPHeader.parse(from: ip.payload) {
-                    icmpParsed.append((ep, eth, ip, icmp))
-                }
-            case .udp:
-                guard let udp = UDPHeader.parse(
-                    from: ip.payload,
-                    pseudoSrcAddr: ip.srcAddr,
-                    pseudoDstAddr: ip.dstAddr
-                ) else { break }
-                if udp.dstPort == 67 || udp.srcPort == 67 {
-                    if let dhcp = DHCPPacket.parse(from: udp.payload) {
-                        dhcpParsed.append((ep, eth, ip, dhcp))
-                    }
-                } else if udp.dstPort == 53 {
-                    dnsParsed.append((ep, eth, ip, udp))
-                } else {
-                    udpParsed.append((ep, eth, ip, udp))
-                }
-            case .tcp:
-                guard let tcp = TCPHeader.parse(
-                    from: ip.payload,
-                    pseudoSrcAddr: ip.srcAddr,
-                    pseudoDstAddr: ip.dstAddr
-                ) else { break }
-                tcpParsed.append((ep, eth, ip, tcp))
-            @unknown default:
-                unreachableParsed.append((ep, eth, ip))
-            }
-        }
+        parseAllFrames(io: io, out: parseOutput, hostMAC: hostMAC,
+                       arpMapping: arpMapping, fwdBatch: fwdBatch)
         phaseTiming.parse &+= cpuNanos() - tParse
 
-        // ── Phase 7-8: Process ALL ICMP ──
+        // Write L2 forwarded frames
+        if fwdBatch.count > 0 {
+            let tW = cpuNanos()
+            transport.writeBatch(fwdBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += fwdBatch.count
+        }
+
+        // ── Phase 7: ICMP Echo ──
         let tICMP = cpuNanos()
-
-        // ── Phase 7: Process ALL ICMP Echo ──
-        for (ep, eth, ip, icmp) in icmpParsed {
-            guard icmp.type == 8, icmp.code == 0 else { continue }
-            if let reply = buildICMPEchoReply(
-                hostMAC: arpMapping.hostMAC, eth: eth, ip: ip, icmp: icmp, round: round
-            ) {
-                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
-            }
+        outBatch.reset()
+        processICMPEcho(outBatch: outBatch)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
 
-        // ── Phase 8: Process ALL ICMP Protocol Unreachable ──
-        for (ep, eth, ip) in unreachableParsed {
-            if let reply = buildICMPProtocolUnreachable(
-                hostMAC: arpMapping.hostMAC,
-                clientMAC: eth.srcMAC,
-                gatewayIP: ip.dstAddr,
-                clientIP: ip.srcAddr,
-                rawIPPacket: eth.payload,
-                round: round
-            ) {
-                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
-            }
+        // ── Phase 8: ICMP Unreachable ──
+        outBatch.reset()
+        processICMPUnreachable(outBatch: outBatch)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
-
         phaseTiming.icmp &+= cpuNanos() - tICMP
 
-        // ── Phase 9: Process ALL UDP ──
+        // ── Phase 9: UDP ──
         let tUDP = cpuNanos()
-        for (ep, eth, ip, udp) in udpParsed {
-            var phaseReplies: [(endpointID: Int, packet: PacketBuffer)] = []
-            if let socket = socketRegistry.lookup(port: udp.dstPort) {
-                socket.handleDatagram(
-                    payload: udp.payload,
-                    srcIP: ip.srcAddr, dstIP: ip.dstAddr,
-                    srcPort: udp.srcPort, dstPort: udp.dstPort,
-                    srcMAC: eth.srcMAC,
-                    endpointID: ep,
-                    hostMAC: arpMapping.hostMAC,
-                    replies: &phaseReplies,
-                    round: round
-                )
-            } else {
-                natTable.processUDP(
-                    eth: eth, ip: ip, udp: udp, endpointID: ep,
-                    hostMAC: arpMapping.hostMAC,
-                    transport: &transport,
-                    replies: &phaseReplies, round: round,
-                    nowSec: nowSec
-                )
-            }
-            totalWritten &+= writeReplies(phaseReplies, transport: &transport)
+        outBatch.reset()
+        processUDP(outBatch: outBatch, transport: &transport, nowSec: nowSec)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
-
         phaseTiming.udp &+= cpuNanos() - tUDP
 
-        // ── Phase 10: Process ALL DNS ──
+        // ── Phase 10: DNS ──
         let tDNS = cpuNanos()
-        var dnsReplies: [(endpointID: Int, packet: PacketBuffer)] = []
-        for (ep, eth, ip, udp) in dnsParsed {
-            dnsServer.processQuery(
-                payload: udp.payload,
-                srcIP: ip.srcAddr, dstIP: ip.dstAddr,
-                srcPort: udp.srcPort, dstPort: udp.dstPort,
-                srcMAC: eth.srcMAC,
-                endpointID: ep,
-                hostMAC: arpMapping.hostMAC,
-                transport: &transport,
-                replies: &dnsReplies,
-                round: round
-            )
+        outBatch.reset()
+        processDNS(outBatch: outBatch, transport: &transport)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
-        totalWritten &+= writeReplies(dnsReplies, transport: &transport)
-
         phaseTiming.dns &+= cpuNanos() - tDNS
 
-        // ── Phase 11: Unified TCP processing (VM ↔ external) ──
+        // ── Phase 11: TCP ──
         let tTCP = cpuNanos()
-        // Handles all TCP work in one method: connect completion, VM segment
-        // processing, external reads/hangups, and queue draining.  Eliminates
-        // the old 4-phase design and its "manual updated flag" anti-pattern.
-        var tcpReplies: [(endpointID: Int, packet: PacketBuffer)] = []
-        tcpReplies.reserveCapacity(tcpParsed.count * 2 + result.streamReads.count + result.streamHangup.count)
+        outBatch.reset()
         natTable.processTCPRound(
-            vmSegments: tcpParsed,
+            out: parseOutput, io: io,
             streamReads: result.streamReads,
             streamHangup: result.streamHangup,
             streamConnects: result.streamConnects,
             transport: &transport,
-            hostMAC: arpMapping.hostMAC,
+            hostMAC: hostMAC,
             arpMapping: arpMapping,
-            replies: &tcpReplies,
-            round: round,
+            outBatch: outBatch,
             nowSec: nowSec,
             nowUs: nowUs
         )
-        totalWritten &+= writeReplies(tcpReplies, transport: &transport)
-
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            //fputs("[DL-WRITE] TCP phase writing outBatch.count=\(outBatch.count)\n", stderr)
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
+        }
         phaseTiming.tcp &+= cpuNanos() - tTCP
 
         // ── Phase 12: Non-TCP transport results ──
         let tNATResult = cpuNanos()
-        // Handles dead FDs, stream accepts, and UDP reads only.
-        // TCP reads/hangups/connects are handled by processTCPRound above.
-        var natReplies: [(endpointID: Int, packet: PacketBuffer)] = []
+        outBatch.reset()
         natTable.processTransportResult(
-            result,
-            transport: &transport,
-            hostMAC: arpMapping.hostMAC,
-            arpMapping: arpMapping,
-            replies: &natReplies,
-            round: round
+            result, transport: &transport,
+            hostMAC: hostMAC, arpMapping: arpMapping,
+            io: io, outBatch: outBatch
         )
-        totalWritten &+= writeReplies(natReplies, transport: &transport)
-
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
+        }
         phaseTiming.natResult &+= cpuNanos() - tNATResult
 
-        // ── Phase 13: DNS upstream — expire + process ──
+        // ── Phase 13: DNS upstream ──
         let tDNSUp = cpuNanos()
-        var dnsUpReplies: [(endpointID: Int, packet: PacketBuffer)] = []
+        outBatch.reset()
         dnsServer.expireQueries(
-            hostMAC: arpMapping.hostMAC,
-            replies: &dnsUpReplies,
-            round: round
+            hostMAC: hostMAC, outBatch: outBatch, io: io
         )
-        totalWritten &+= writeReplies(dnsUpReplies, transport: &transport)
-        dnsUpReplies.removeAll(keepingCapacity: true)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
+        }
+        outBatch.reset()
         dnsServer.processUpstreamReady(
             data: result.rawDatagramReads,
-            hostMAC: arpMapping.hostMAC,
-            replies: &dnsUpReplies,
-            round: round
+            hostMAC: hostMAC, outBatch: outBatch, io: io
         )
-        totalWritten &+= writeReplies(dnsUpReplies, transport: &transport)
-
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
+        }
         phaseTiming.dnsUpstream &+= cpuNanos() - tDNSUp
 
-        // ── Phase 14-15: Process DHCP + ARP ──
+        // ── Phase 14-15: DHCP + ARP ──
         let tDHCPARP = cpuNanos()
-
-        // ── Phase 14: Process ALL DHCP ──
-        for (ep, eth, _, dhcp) in dhcpParsed {
-            guard dhcp.op == 1 else { continue }
-            if let (frame, targetEp) = dhcpServer.process(
-                packet: dhcp, srcMAC: eth.srcMAC,
-                endpointID: ep, hostMAC: arpMapping.hostMAC,
-                arpMapping: &arpMapping, round: round
-            ) {
-                totalWritten &+= writeReplies([(targetEp, frame)], transport: &transport)
-            }
+        outBatch.reset()
+        processDHCP(outBatch: outBatch)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
 
-        // ── Phase 15: Process ALL ARP ──
-        for (ep, _, arp) in arpParsed {
-            if let reply = arpMapping.processARPRequest(arp, round: round) {
-                totalWritten &+= writeReplies([(ep, reply)], transport: &transport)
-            }
+        outBatch.reset()
+        processARP(outBatch: outBatch)
+        if outBatch.count > 0 {
+            let tW = cpuNanos()
+            if let pw = pcapWriter { writeBatchToPcap(batch: outBatch, pcap: pw) }
+            transport.writeBatch(outBatch, io: io)
+            phaseTiming.write &+= cpuNanos() - tW
+            totalWritten += outBatch.count
         }
-
         phaseTiming.dhcpArp &+= cpuNanos() - tDHCPARP
 
         // ── Cleanup ──
-        ethParsed.removeAll()
-        arpPkts.removeAll()
-        ipv4Pkts.removeAll()
-        ipv4Parsed.removeAll()
-        arpParsed.removeAll()
-        icmpParsed.removeAll()
-        udpParsed.removeAll()
-        dhcpParsed.removeAll()
-        dnsParsed.removeAll()
-        tcpParsed.removeAll()
-        unreachableParsed.removeAll()
-
-        round.endRound()
         phaseTiming.totalRounds += 1
         let wallEnd = monotonicMicros()
         phaseTiming.wallNanos &+= (wallEnd - nowUs) * 1000
         return totalWritten
     }
 
-    // MARK: - Inline write helper
+    // MARK: - Protocol processing (inline for simple protocols)
 
-    /// Write packets to the transport immediately and capture to pcap.
-    /// Returns the number of packets written.
-    private mutating func writeReplies(
-        _ packets: [(endpointID: Int, packet: PacketBuffer)],
-        transport: inout PollingTransport
-    ) -> Int {
-        guard !packets.isEmpty else { return 0 }
-        let t = cpuNanos()
-        if let pw = pcapWriter {
-            for (_, pkt) in packets { pw.write(packet: pkt) }
+    private mutating func processICMPEcho(outBatch: OutBatch) {
+        for i in 0..<parseOutput.icmpEchoCount {
+            let hdrOfs = buildICMPEchoReplyHeader(
+                io: io,
+                hostMAC: hostMAC,
+                dstMAC: parseOutput.icmpEchoSrcMACs[i],
+                srcIP: parseOutput.icmpEchoDstIPs[i],
+                dstIP: parseOutput.icmpEchoSrcIPs[i],
+                identifier: parseOutput.icmpEchoIDs[i],
+                sequenceNumber: parseOutput.icmpEchoSeqNums[i],
+                payloadLen: parseOutput.icmpEchoPayloadLen[i]
+            )
+            guard hdrOfs >= 0 else { break }
+            let idx = outBatch.count
+            guard idx < outBatch.maxFrames else { break }
+            outBatch.hdrOfs[idx] = hdrOfs
+            outBatch.hdrLen[idx] = ethHeaderLen + ipv4HeaderLen + 8  // 42
+            outBatch.payOfs[idx] = parseOutput.icmpEchoPayloadOfs[i]
+            outBatch.payLen[idx] = parseOutput.icmpEchoPayloadLen[i]
+            outBatch.epIDs[idx] = parseOutput.icmpEchoEndpointIDs[i]
+            outBatch.payBase[idx] = nil
+            outBatch.count += 1
         }
-        transport.writePackets(packets)
-        phaseTiming.write &+= cpuNanos() - t
-        return packets.count
     }
 
-    /// Run the BDP loop continuously until `shouldContinue` returns false.
-    ///
-    /// Returns the total number of rounds executed.
+    private mutating func processICMPUnreachable(outBatch: OutBatch) {
+        for i in 0..<parseOutput.unreachCount {
+            let hdrOfs = buildICMPUnreachableHeader(
+                io: io,
+                hostMAC: hostMAC,
+                clientMAC: parseOutput.unreachSrcMACs[i],
+                gatewayIP: parseOutput.unreachGatewayIPs[i],
+                clientIP: parseOutput.unreachClientIPs[i]
+            )
+            guard hdrOfs >= 0 else { break }
+            let idx = outBatch.count
+            guard idx < outBatch.maxFrames else { break }
+            // Payload is the original IP header + first 8 bytes of transport
+            let copyLen = min(28, parseOutput.unreachRawLen[i])
+            outBatch.hdrOfs[idx] = hdrOfs
+            outBatch.hdrLen[idx] = ethHeaderLen + ipv4HeaderLen + 8  // 42
+            outBatch.payOfs[idx] = parseOutput.unreachRawOfs[i]
+            outBatch.payLen[idx] = copyLen
+            outBatch.epIDs[idx] = parseOutput.unreachEndpointIDs[i]
+            outBatch.payBase[idx] = nil
+            outBatch.count += 1
+        }
+    }
+
+    private mutating func processUDP(outBatch: OutBatch,
+                                      transport: inout PollingTransport,
+                                      nowSec: UInt64) {
+        for i in 0..<parseOutput.udpCount {
+            let srcMAC = parseOutput.udpSrcMACs[i]
+            let srcIP = parseOutput.udpSrcIPs[i]
+            let dstIP = parseOutput.udpDstIPs[i]
+            let srcPort = parseOutput.udpSrcPorts[i]
+            let dstPort = parseOutput.udpDstPorts[i]
+            let payloadOfs = parseOutput.udpPayloadOfs[i]
+            let payloadLen = parseOutput.udpPayloadLen[i]
+            let epID = parseOutput.udpEndpointIDs[i]
+
+            if let socket = socketRegistry.lookup(port: dstPort) {
+                socket.handleDatagram(
+                    payloadPtr: io.inputBase.advanced(by: payloadOfs),
+                    payloadLen: payloadLen,
+                    srcIP: srcIP, dstIP: dstIP,
+                    srcPort: srcPort, dstPort: dstPort,
+                    srcMAC: srcMAC,
+                    endpointID: epID,
+                    hostMAC: hostMAC,
+                    outBatch: outBatch, io: io
+                )
+            } else {
+                natTable.processUDP(
+                    srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
+                    srcPort: srcPort, dstPort: dstPort,
+                    payloadOfs: payloadOfs, payloadLen: payloadLen,
+                    endpointID: epID,
+                    hostMAC: hostMAC,
+                    transport: &transport,
+                    outBatch: outBatch, io: io,
+                    nowSec: nowSec
+                )
+            }
+        }
+    }
+
+    private mutating func processDNS(outBatch: OutBatch,
+                                      transport: inout PollingTransport) {
+        for i in 0..<parseOutput.dnsCount {
+            dnsServer.processQuery(
+                payloadPtr: io.inputBase.advanced(by: parseOutput.dnsPayloadOfs[i]),
+                payloadLen: parseOutput.dnsPayloadLen[i],
+                srcIP: parseOutput.dnsSrcIPs[i],
+                dstIP: parseOutput.dnsDstIPs[i],
+                srcPort: parseOutput.dnsSrcPorts[i],
+                dstPort: 53,
+                srcMAC: parseOutput.dnsSrcMACs[i],
+                endpointID: parseOutput.dnsEndpointIDs[i],
+                hostMAC: hostMAC,
+                transport: &transport,
+                outBatch: outBatch, io: io
+            )
+        }
+    }
+
+    private mutating func processDHCP(outBatch: OutBatch) {
+        for i in 0..<parseOutput.dhcpCount {
+            guard parseOutput.dhcpPackets[i].op == 1 else { continue }
+            if let (hdrOfs, hdrLen, epID) = dhcpServer.process(
+                packet: parseOutput.dhcpPackets[i],
+                srcMAC: parseOutput.dhcpSrcMACs[i],
+                endpointID: parseOutput.dhcpEndpointIDs[i],
+                hostMAC: hostMAC,
+                arpMapping: &arpMapping,
+                io: io
+            ) {
+                let idx = outBatch.count
+                guard idx < outBatch.maxFrames else { break }
+                outBatch.hdrOfs[idx] = hdrOfs
+                outBatch.hdrLen[idx] = hdrLen
+                outBatch.payOfs[idx] = -1
+                outBatch.payLen[idx] = 0
+                outBatch.epIDs[idx] = epID
+                outBatch.payBase[idx] = nil
+                outBatch.count += 1
+            }
+        }
+    }
+
+    private mutating func processARP(outBatch: OutBatch) {
+        for i in 0..<parseOutput.arpCount {
+            guard let (hdrOfs, hdrLen) = arpMapping.processARPRequest(
+                parseOutput.arpFrames[i], io: io
+            ) else { continue }
+            let idx = outBatch.count
+            guard idx < outBatch.maxFrames else { break }
+            outBatch.hdrOfs[idx] = hdrOfs
+            outBatch.hdrLen[idx] = hdrLen
+            outBatch.payOfs[idx] = -1
+            outBatch.payLen[idx] = 0
+            outBatch.epIDs[idx] = parseOutput.arpEndpointIDs[i]
+            outBatch.payBase[idx] = nil
+            outBatch.count += 1
+        }
+    }
+
+    // MARK: - Pcap helper
+
+    private func writeBatchToPcap(batch: OutBatch, pcap: PCAPWriter) {
+        for i in 0..<batch.count {
+            let hdrPtr = io.output.baseAddress!.advanced(by: batch.hdrOfs[i])
+            let hdrLen = batch.hdrLen[i]
+            if batch.payOfs[i] >= 0, batch.payLen[i] > 0 {
+                let payBase = batch.payBase[i] ?? io.input.baseAddress!
+                let payPtr = payBase.advanced(by: batch.payOfs[i])
+                pcap.writeRawSplit(hdr: hdrPtr, hdrLen: hdrLen,
+                                   pay: payPtr, payLen: batch.payLen[i])
+            } else {
+                pcap.writeRaw(framePtr: hdrPtr, len: hdrLen)
+            }
+        }
+    }
+
+    // MARK: - Run loop
+
     @discardableResult
     public mutating func run(transport: inout PollingTransport, while shouldContinue: () -> Bool) -> UInt64 {
         natTable.syncExternalFDs(with: &transport)

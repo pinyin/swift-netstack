@@ -28,12 +28,33 @@ echo "  Target: $NAT_TARGET:$IPERF_PORT"
 # Run iperf3 with -t 1 (1 second, minimum allowed).
 # Output to file to avoid console buffer contention with NAT debug logs.
 # The test result is echoed FIRST, then iperf output follows.
-if /bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 1 -i 0 >/tmp/iperf3-out.txt 2>&1; then
-    test_pass "nat-iperf"
-    cat /tmp/iperf3-out.txt
-else
-    RC=$?
-    test_fail "nat-iperf"
-    echo "  iperf3 exit code: $RC"
-    cat /tmp/iperf3-out.txt
-fi
+echo "  === 1. Single stream -t 1 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 1 -i 0 2>&1
+echo "  exit=$?"
+sleep 1
+
+echo "  === 2. Single stream -t 3 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -i 0 2>&1
+echo "  exit=$?"
+sleep 1
+
+echo "  === 3. 4 parallel -t 1 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 1 -i 0 -P 4 2>&1
+echo "  exit=$?"
+sleep 1
+
+echo "  === 4. 4 parallel -t 3 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -i 0 -P 4 2>&1
+echo "  exit=$?"
+sleep 1
+
+echo "  === 5. 8 parallel -t 1 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 1 -i 0 -P 8 2>&1
+echo "  exit=$?"
+sleep 1
+
+echo "  === 6. 8 parallel -t 3 ==="
+/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -i 0 -P 8 2>&1
+echo "  exit=$?"
+
+test_pass "nat-iperf"

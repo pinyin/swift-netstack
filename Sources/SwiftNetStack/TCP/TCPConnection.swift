@@ -225,6 +225,20 @@ final class TCPConnection {
     /// Bytes queued in the external (VM→external) send queue.
     public var externalSendQueued: Int { externalSendQueue.count }
 
+    /// Available receive window to advertise to the VM, derived from external
+    /// send queue headroom. Advertises 0 when the queue is full so the VM
+    /// pauses via standard TCP flow control instead of seeing packet loss.
+    public var availableWindow: UInt32 {
+        let used = UInt32(externalSendQueued)
+        let maxQ = UInt32(Self.maxQueueBytes)
+        if used >= maxQ { return 0 }
+        return min(maxQ - used, 262144)
+    }
+
+    /// Last logical availableWindow we advertised to the VM.
+    /// Tracked so we can send a window update when the queue drains.
+    public var lastAdvertisedWindow: UInt32 = 262144
+
     public init(
         connectionID: UInt64, posixFD: Int32, state: TCPState,
         vmMAC: MACAddress, vmIP: IPv4Address, vmPort: UInt16,

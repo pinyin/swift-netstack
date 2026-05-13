@@ -1,7 +1,7 @@
 #!/bin/sh
 # Test: TCP correctness under chaos (packet loss + reordering + duplication).
 #
-# Uses netem-set (minimal netlink tool) to inject controlled network chaos,
+# Uses tc-netem to inject controlled network chaos,
 # then runs TCP echo, large transfer, and concurrent connection tests to
 # verify data integrity.
 #
@@ -28,8 +28,8 @@ if [ -z "$NAT_TARGET" ] || [ -z "$NAT_TCP_PORT" ]; then
     return 0
 fi
 
-if ! command -v netem-set >/dev/null 2>&1; then
-    echo "  SKIP: netem-set not available"
+if ! command -v tc >/dev/null 2>&1; then
+    echo "  SKIP: tc not available"
     return 0
 fi
 
@@ -38,12 +38,12 @@ echo "  Chaos: loss=${LOSS}% reorder=${REORDER}% dup=${DUP}%"
 
 # Apply chaos qdisc
 echo "  Applying netem..."
-netem-set eth0 "$LOSS" "$REORDER" "$DUP" >/tmp/netem-out.txt 2>&1
+tc qdisc replace dev eth0 root netem delay 1ms loss ${LOSS}% reorder ${REORDER}% duplicate ${DUP}% >/tmp/netem-out.txt 2>&1
 NETEM_RC=$?
 if [ $NETEM_RC -eq 0 ]; then
-    echo "  netem applied on eth0"
+    echo "  tc-netem applied on eth0"
 else
-    echo "  WARNING: netem-set failed (rc=$NETEM_RC)"
+    echo "  WARNING: tc netem failed (rc=$NETEM_RC)"
     cat /tmp/netem-out.txt 2>/dev/null
     test_fail "chaos-tcp-netem"
     return 0
@@ -123,7 +123,7 @@ else
 fi
 
 # ── Cleanup ──
-netem-set eth0 del >/dev/null 2>&1
+tc qdisc del dev eth0 root >/dev/null 2>&1
 echo "  netem removed"
 
 # ── Report ──

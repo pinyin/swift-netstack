@@ -33,7 +33,7 @@ TEST_COUNT=0
 
 # Run tests in dependency order.
 # dhcp must run first (validates IP/gateway); remainder depend on it.
-TESTS="dhcp icmp arp dns routing nat-udp nat-tcp nat-tcp-large nat-tcp-mss nat-tcp-rst nat-tcp-bidi nat-tcp-concurrent nat-tcp-stress-200 nat-tcp-close-first nat-udp-stress nat-iperf nat-internet nat-external-iperf nat-external-http chaos-tcp"
+TESTS="dhcp icmp arp dns routing nat-udp nat-tcp nat-tcp-large nat-tcp-mss nat-tcp-rst nat-tcp-bidi nat-tcp-concurrent nat-tcp-stress-200 nat-tcp-close-first nat-udp-stress nat-iperf nat-internet nat-external-iperf nat-external-http chaos-tcp chaos-iperf"
 
 for t in $TESTS; do
     TEST_SCRIPT="/tests/test-${t}.sh"

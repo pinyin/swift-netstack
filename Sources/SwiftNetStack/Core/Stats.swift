@@ -62,6 +62,8 @@ public struct NATStats {
     public var tcpFsmNs: UInt64 = 0
     public var tcpExtReadNs: UInt64 = 0
     public var tcpFlushNs: UInt64 = 0
+    /// Number of fast retransmit segments sent (RFC 5681, triggered by 3 dup ACKs).
+    public var tcpFastRetransmit: UInt64 = 0
     /// FSM sub-phase breakdown: dict lookup, tcpProcess call, ACK build, dict write-back.
     public var tcpFsmDictNs: UInt64 = 0
     public var tcpFsmFuncNs: UInt64 = 0

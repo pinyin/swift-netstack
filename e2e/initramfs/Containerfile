@@ -3,6 +3,7 @@ FROM --platform=linux/arm64 fedora:latest
 # Step 1: Install test dependencies.
 RUN dnf install -y --setopt=install_weak_deps=False \
     iproute \
+    iproute-tc \
     iputils \
     bind-utils \
     nmap-ncat \

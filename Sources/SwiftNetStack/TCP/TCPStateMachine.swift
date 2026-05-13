@@ -214,9 +214,11 @@ func _tcpProcessImpl(
             return (.established, [ackSeg], payloadPtr, payloadLen)
         }
 
-        // Pure ACK (no data)
+        // Pure ACK (no data) — only advance snd.una, never rewind.
+        // An old/reordered ACK must not move snd.una backward.
         if seg.flags.isAck {
-            snd.una = seg.ack
+            let acked = seg.ack
+            if acked &- snd.una < (1 << 31) { snd.una = acked }
         }
 
         // FIN — only process in-sequence (or ahead, which TCP permits)
@@ -315,6 +317,11 @@ func _tcpProcessImpl(
             )
             return (.finWait2, [dupAck], nil, 0)
         }
+        // Pure ACK — process even though we're waiting for peer's FIN
+        if seg.flags.isAck {
+            let acked = seg.ack
+            if acked &- snd.una < (1 << 31) { snd.una = acked }
+        }
         if seg.flags.isFin {
             rcv.nxt = rcv.nxt &+ 1
             let ackSeg = TCPSegmentToSend(
@@ -358,6 +365,12 @@ func _tcpProcessImpl(
                 window: 262144, payload: nil
             )
             return (.closeWait, [dupAck], nil, 0)
+        }
+        // Pure ACK — process even after peer has closed (common when
+        // external→VM data is still draining past the peer's FIN).
+        if seg.flags.isAck {
+            let acked = seg.ack
+            if acked &- snd.una < (1 << 31) { snd.una = acked }
         }
         // Wait for application to signal close
         if appClose {

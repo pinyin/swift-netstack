@@ -162,6 +162,14 @@ final class TCPConnection {
     /// SACK scoreboard tracking out-of-order data.
     public var sackBlocks: SACKScoreboard = .init()
 
+    // MARK: - RFC 5681 Fast Retransmit
+
+    /// Count of consecutive duplicate ACKs received (same ack number, no data).
+    /// Reset to 0 whenever snd.una advances. Fast retransmit triggers at 3.
+    public var dupAckCount: UInt8 = 0
+    /// The last ACK value received (to detect duplicates).
+    public var lastAckValue: UInt32 = 0
+
     // MARK: - RFC 7323 Timestamps
 
     /// True when TSopt negotiated (both sides sent TSopt during handshake).
@@ -286,6 +294,15 @@ final class TCPConnection {
         let n = Swift.min(remaining, max)
         let ptr = UnsafeRawPointer(sendQueue.buf.baseAddress! + sendQueue.readPos + sendQueueSent)
         return (ptr, n)
+    }
+
+    /// Peek the first unacknowledged byte(s) for retransmission (RFC 5681).
+    /// Ignores sendQueueSent — always reads from readPos, which corresponds
+    /// to snd.una. Returns at most `max` bytes.
+    public func peekRetransmitData(max: Int) -> (ptr: UnsafeRawPointer, len: Int)? {
+        let n = Swift.min(sendQueue.count, max)
+        guard n > 0 else { return nil }
+        return (UnsafeRawPointer(sendQueue.buf.baseAddress! + sendQueue.readPos), n)
     }
 
     // MARK: - External send queue (VM→external)

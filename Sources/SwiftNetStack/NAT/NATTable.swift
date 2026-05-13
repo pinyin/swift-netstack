@@ -578,7 +578,21 @@ public struct NATTable {
                 }
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
-            if unaDelta > 0 { entry.connection.ackSendBuf(delta: unaDelta) }
+            if unaDelta > 0 {
+                entry.connection.ackSendBuf(delta: unaDelta)
+                entry.connection.dupAckCount = 0
+                entry.connection.lastAckValue = entry.connection.snd.una
+            } else if seg.flags.isAck, !seg.flags.isSyn, payloadLen == 0 {
+                // Pure ACK that didn't advance snd.una — track dup ACKs (RFC 5681)
+                let ackVal = entry.connection.snd.una
+                if ackVal == entry.connection.lastAckValue, entry.connection.lastAckValue != 0 {
+                    let (sum, didOverflow) = entry.connection.dupAckCount.addingReportingOverflow(1 as UInt8)
+                    if !didOverflow { entry.connection.dupAckCount = sum }
+                } else {
+                    entry.connection.lastAckValue = ackVal
+                    entry.connection.dupAckCount = 1
+                }
+            }
             // Advance SACK scoreboard past acknowledged data
             if entry.connection.rcv.nxt != oldRcvNxt {
                 entry.connection.sackBlocks.ackThrough(entry.connection.rcv.nxt)
@@ -603,7 +617,7 @@ public struct NATTable {
                 if queued == 0, payloadLen > 0 {
                     // Safety net — should be rare with backpressure pre-check.
                     // Data was ACKed to VM but not queued for external send.
-                    debugLog("[NAT-TCP-ERR] external send queue full, \(dataLen)B dropped for \(key.dstIP):\(key.dstPort)\n")
+                    fputs("[NAT-TCP-ERR] external send queue full, \(dataLen)B dropped for \(key.dstIP):\(key.dstPort) extQ=\(entry.connection.externalSendQueued) maxQ=\(TCPConnection.maxQueueBytes)\n", stderr)
                 }
             }
 
@@ -736,6 +750,49 @@ public struct NATTable {
 
     // MARK: - Per-connection flush (send queues + FIN forwarding)
 
+    /// Build header, finalize checksum, and sendmsg one TCP data segment to the VM.
+    /// Returns bytes sent on success, -1 on EAGAIN/ENOBUFS, -2 on other error.
+    /// Does NOT advance snd.nxt or sendQueueSent — callers decide.
+    private func sendOneDataSegment(
+        to conn: TCPConnection,
+        seq: UInt32,
+        ack: UInt32,
+        flags: TCPFlags,
+        data: (ptr: UnsafeRawPointer, len: Int),
+        via epFD: Int32,
+        hostMAC: MACAddress,
+        io: IOBuffer
+    ) -> Int {
+        let hdrOfs = buildTCPHeader(
+            io: io, hostMAC: hostMAC, dstMAC: conn.vmMAC,
+            srcIP: conn.dstIP, dstIP: conn.vmIP,
+            srcPort: conn.dstPort, dstPort: conn.vmPort,
+            seqNumber: seq, ackNumber: ack,
+            flags: flags, window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale))
+        guard hdrOfs >= 0 else { return -2 }
+        finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
+            srcIP: conn.dstIP, dstIP: conn.vmIP,
+            payloadPtr: data.ptr, payloadLen: data.len)
+        let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
+        let iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: 54)
+        let iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: data.ptr), iov_len: data.len)
+        var iovs = (iov0, iov1)
+        var savedErrno: Int32 = 0
+        let r = withUnsafeMutableBytes(of: &iovs) { buf in
+            var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                             msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
+                             msg_control: nil, msg_controllen: 0, msg_flags: 0)
+            let r = Darwin.sendmsg(epFD, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
+            if r < 0 { savedErrno = errno }
+            return r
+        }
+        if r < 0 {
+            if savedErrno == EAGAIN || savedErrno == ENOBUFS { return -1 }
+            return -2
+        }
+        return r
+    }
+
     private mutating func flushOneConnection(
         key: NATKey, conn: TCPConnection,
         hostMAC: MACAddress,
@@ -758,40 +815,29 @@ public struct NATTable {
                 var canSend = Int(conn.snd.wnd) - Int(inFlight)
                 if canSend <= 0 { break }
                 if canSend > mss { canSend = mss }
-                guard let data = conn.peekSendData(max: canSend) else { break }
-                debugLog("[NAT-TCP-FLUSH] flushing \(data.len)B to VM \(conn.vmIP):\(conn.vmPort), state=\(conn.state), queued=\(conn.totalQueuedBytes)\n")
-                let hdrOfs = buildTCPHeader(
-                    io: io, hostMAC: hostMAC, dstMAC: conn.vmMAC,
-                    srcIP: conn.dstIP, dstIP: conn.vmIP,
-                    srcPort: conn.dstPort, dstPort: conn.vmPort,
-                    seqNumber: conn.snd.nxt, ackNumber: conn.rcv.nxt,
-                    flags: [.ack, .psh], window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale))
-                guard hdrOfs >= 0 else { break }
-                finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
-                    srcIP: conn.dstIP, dstIP: conn.vmIP,
-                    payloadPtr: data.ptr, payloadLen: data.len)
-
-                // Inline write — only advance state on success
-                let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
-                var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: 54)
-                var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: data.ptr), iov_len: data.len)
-                var iovs = (iov0, iov1)
-                var savedErrno: Int32 = 0
-                let r = withUnsafeMutableBytes(of: &iovs) { buf in
-                    var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                     msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
-                                     msg_control: nil, msg_controllen: 0, msg_flags: 0)
-                    let r = Darwin.sendmsg(epFD, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
-                    if r < 0 { savedErrno = errno }
-                    return r
-                }
-                if r < 0 {
-                    if savedErrno == EAGAIN || savedErrno == ENOBUFS {
-                        break  // data stays in send queue — retry next round
+                guard let data = conn.peekSendData(max: canSend) else {
+                    // RFC 5681 fast retransmit: resend ONE segment from snd.una
+                    if conn.totalQueuedBytes > 0, inFlight > 0,
+                       conn.dupAckCount >= 3,
+                       let rtData = conn.peekRetransmitData(max: min(mss, conn.totalQueuedBytes)) {
+                        let rr = sendOneDataSegment(
+                            to: conn, seq: conn.snd.una, ack: conn.rcv.nxt,
+                            flags: [.ack], data: rtData,
+                            via: epFD, hostMAC: hostMAC, io: io)
+                        if rr >= 0 { stats.tcpFastRetransmit += 1 }
+                        conn.dupAckCount = 0
                     }
                     break
                 }
-                // Delivered — advance TCP sender state
+                debugLog("[NAT-TCP-FLUSH] flushing \(data.len)B to VM \(conn.vmIP):\(conn.vmPort), state=\(conn.state), queued=\(conn.totalQueuedBytes)\n")
+                let r = sendOneDataSegment(
+                    to: conn, seq: conn.snd.nxt, ack: conn.rcv.nxt,
+                    flags: [.ack, .psh], data: data,
+                    via: epFD, hostMAC: hostMAC, io: io)
+                if r < 0 {
+                    if r == -1 { break }   // EAGAIN/ENOBUFS — retry next round
+                    break                   // hard error
+                }
                 conn.snd.nxt = conn.snd.nxt &+ UInt32(data.len)
                 conn.sendQueueSent += data.len
                 segCount += 1
@@ -1080,7 +1126,7 @@ public struct NATTable {
         guard let (vmMAC, vmEp) = lookupVM(ip: pf.vmIP, arpMapping: arpMapping) else { close(newFD); return }
 
         let isn = tcpGenerateISN()
-        var conn = TCPConnection(
+        let conn = TCPConnection(
             connectionID: nextID(), posixFD: newFD, state: .synReceived,
             vmMAC: vmMAC, vmIP: pf.vmIP, vmPort: pf.vmPort,
             dstIP: externalIP, dstPort: externalPort, endpointID: vmEp,
@@ -1258,7 +1304,7 @@ public struct NATTable {
         }
         debugLog("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) OK (fd=\(fd), errno=\(errno))\n")
 
-        var conn = TCPConnection(
+        let conn = TCPConnection(
             connectionID: nextID(), posixFD: fd, state: .listen,
             vmMAC: srcMAC, vmIP: key.vmIP, vmPort: key.vmPort,
             dstIP: connectIP, dstPort: key.dstPort, endpointID: endpointID,
@@ -1279,7 +1325,7 @@ public struct NATTable {
         conn.snd.wnd = UInt32(seg.window) << conn.peerWindowScale
         debugLog("[NAT-TCP-OUT] TCP FSM: .listen → \(newState), isn=\(conn.snd.nxt)\n")
 
-        var entry = NATEntry(connection: conn, isInbound: false)
+        let entry = NATEntry(connection: conn, isInbound: false)
         entry.lastActivity = currentTime()
         tcpEntries[key] = entry
         tcpFdToKey[fd] = key
@@ -1348,13 +1394,9 @@ public struct NATTable {
         var needsCleanup = false
         var cleanupFD: Int32 = 0
 
-        let sqBufBase = entry.connection.sendQueue.buf.baseAddress!
-
-        // Flush sendQueue with inline writes before sending FIN to VM.
+        // Flush sendQueue before sending FIN to VM.
         // State advances only on successful sendmsg — if EAGAIN/ENOBUFS
         // strikes, we set pendingFinToVM so flushOneConnection retries later.
-        debugLog("[NAT-TCP-FIN-FLUSH] flushing sendQueue to VM, totalQueued=\(entry.connection.totalQueuedBytes) state=\(entry.connection.state) snd.nxt=\(entry.connection.snd.nxt) snd.una=\(entry.connection.snd.una)\n")
-        debugLog("[NAT-TCP-FIN-FLUSH] ips: dstIP=\(entry.connection.dstIP) vmIP=\(entry.connection.vmIP) dstPort=\(entry.connection.dstPort) vmPort=\(entry.connection.vmPort)\n")
         var finDrainComplete = true
         if entry.connection.totalQueuedBytes > 0 {
             guard let epFD = transport.fdForEndpoint(entry.connection.endpointID) else { return }
@@ -1364,40 +1406,14 @@ public struct NATTable {
                 if canSend <= 0 { break }
                 if canSend > mss { canSend = mss }
                 guard let data = entry.connection.peekSendData(max: canSend) else { break }
-                debugLog("[NAT-TCP-FIN-FLUSH] sending \(data.len)B to VM, seq=\(entry.connection.snd.nxt) ack=\(entry.connection.rcv.nxt)\n")
-                let hdrOfs = buildTCPHeader(
-                    io: io, hostMAC: hostMAC, dstMAC: entry.connection.vmMAC,
-                    srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
-                    srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
-                    seqNumber: entry.connection.snd.nxt, ackNumber: entry.connection.rcv.nxt,
-                    flags: [.ack, .psh], window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale))
-                guard hdrOfs >= 0 else { break }
-                finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
-                    srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
-                    payloadPtr: data.ptr, payloadLen: data.len)
-
-                // Inline write — only advance state on success
-                let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
-                var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: 54)
-                var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: data.ptr), iov_len: data.len)
-                var iovs = (iov0, iov1)
-                var savedErrno: Int32 = 0
-                let r = withUnsafeMutableBytes(of: &iovs) { buf in
-                    var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                     msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
-                                     msg_control: nil, msg_controllen: 0, msg_flags: 0)
-                    let r = Darwin.sendmsg(epFD, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
-                    if r < 0 { savedErrno = errno }
-                    return r
-                }
+                let r = sendOneDataSegment(
+                    to: entry.connection, seq: entry.connection.snd.nxt, ack: entry.connection.rcv.nxt,
+                    flags: [.ack, .psh], data: data,
+                    via: epFD, hostMAC: hostMAC, io: io)
                 if r < 0 {
-                    if savedErrno == EAGAIN || savedErrno == ENOBUFS {
-                        finDrainComplete = false
-                        break
-                    }
+                    if r == -1 { finDrainComplete = false; break }
                     break
                 }
-                // Delivered — advance TCP sender state
                 entry.connection.snd.nxt = entry.connection.snd.nxt &+ UInt32(data.len)
                 entry.connection.sendQueueSent += data.len
             }

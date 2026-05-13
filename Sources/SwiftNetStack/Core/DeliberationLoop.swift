@@ -261,7 +261,8 @@ public struct DeliberationLoop {
                 dstIP: parseOutput.icmpEchoSrcIPs[i],
                 identifier: parseOutput.icmpEchoIDs[i],
                 sequenceNumber: parseOutput.icmpEchoSeqNums[i],
-                payloadLen: parseOutput.icmpEchoPayloadLen[i]
+                payloadLen: parseOutput.icmpEchoPayloadLen[i],
+                payloadSum: parseOutput.icmpEchoPayloadSum[i]
             )
             guard hdrOfs >= 0 else { break }
             let idx = outBatch.count

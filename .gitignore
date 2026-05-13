@@ -10,5 +10,6 @@ Packages/
 
 # E2E build artifacts
 e2e/initramfs/initramfs.cpio.gz
+e2e/bootc/output/
 .nfs.*
 Image.old

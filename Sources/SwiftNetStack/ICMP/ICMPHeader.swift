@@ -52,6 +52,11 @@ public struct ICMPHeader {
 /// Write Ethernet+IPv4+ICMP Echo Reply headers into IOBuffer.output.
 /// Returns the output offset, or -1 if the output buffer is full.
 /// The caller tracks the payload separately via OutBatch (zero-copy from IOBuffer.input).
+///
+/// The ICMP checksum covers header + payload per RFC 792.  The payload's
+/// one's complement sum is pre-computed during parse and stored in
+/// ParseOutput.icmpEchoPayloadSum, so the build phase only folds the 8-byte
+/// header into it — zero payload touch in the hot path.
 public func buildICMPEchoReplyHeader(
     io: IOBuffer,
     hostMAC: MACAddress,
@@ -60,7 +65,8 @@ public func buildICMPEchoReplyHeader(
     dstIP: IPv4Address,
     identifier: UInt16,
     sequenceNumber: UInt16,
-    payloadLen: Int
+    payloadLen: Int,
+    payloadSum: UInt32 = 0
 ) -> Int {
     let icmpTotalLen = 8 + payloadLen
     let ipTotalLen = 20 + icmpTotalLen
@@ -86,9 +92,13 @@ public func buildICMPEchoReplyHeader(
     writeUInt16BE(identifier, to: icmpPtr.advanced(by: 4))
     writeUInt16BE(sequenceNumber, to: icmpPtr.advanced(by: 6))
 
-    // ICMP checksum covers header only (payload is referenced, not copied)
-    let icmpCK = internetChecksum(UnsafeRawBufferPointer(start: icmpPtr, count: 8))
-    writeUInt16BE(icmpCK, to: icmpPtr.advanced(by: 2))
+    // RFC 792 checksum: fold pre-computed payload sum with 8-byte header.
+    // Addition is commutative, so processing header-last is equivalent to
+    // checksumming the full message in one pass. Zero additional payload touch.
+    let sum = payloadSum > 0
+        ? checksumAdd(payloadSum, UnsafeRawPointer(icmpPtr), 8)
+        : checksumAdd(0, UnsafeRawPointer(icmpPtr), 8)
+    writeUInt16BE(finalizeChecksum(sum), to: icmpPtr.advanced(by: 2))
 
     return ofs
 }

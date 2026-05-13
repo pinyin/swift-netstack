@@ -1,0 +1,2 @@
+[customizations.kernel]
+append = "console=hvc0 quiet loglevel=4 panic=10"

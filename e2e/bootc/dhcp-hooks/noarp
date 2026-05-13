@@ -1,0 +1,10 @@
+# Bypass dhclient's ARP duplicate address detection.
+# The BDP virtual network responds to ARP probes on the 100.64.1.0/24 subnet,
+# which causes ISC dhclient to incorrectly DECLINE every offered address.
+# (busybox udhcpc does not do DAD, so this was not an issue before.)
+arping() {
+    case "$*" in
+        *-D*) return 0 ;;
+        *) command arping "$@" ;;
+    esac
+}

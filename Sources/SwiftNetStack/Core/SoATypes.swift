@@ -108,6 +108,9 @@ public final class ParseOutput {
     public let icmpEchoSeqNums: UnsafeMutableBufferPointer<UInt16>
     public let icmpEchoPayloadOfs: UnsafeMutableBufferPointer<Int>
     public let icmpEchoPayloadLen: UnsafeMutableBufferPointer<Int>
+    /// Pre-computed one's complement sum of ICMP echo payload (RFC 792).
+    /// Computed once during parse, folded with header checksum during build.
+    public let icmpEchoPayloadSum: UnsafeMutableBufferPointer<UInt32>
     public var icmpEchoCount: Int = 0
 
     // ── ICMP Unreachable ──
@@ -168,6 +171,7 @@ public final class ParseOutput {
         icmpEchoSeqNums = .allocate(capacity: n)
         icmpEchoPayloadOfs = .allocate(capacity: n)
         icmpEchoPayloadLen = .allocate(capacity: n)
+        icmpEchoPayloadSum = .allocate(capacity: n)
 
         unreachEndpointIDs = .allocate(capacity: n)
         unreachSrcMACs = .allocate(capacity: n)
@@ -221,6 +225,7 @@ public final class ParseOutput {
         icmpEchoSeqNums.deallocate()
         icmpEchoPayloadOfs.deallocate()
         icmpEchoPayloadLen.deallocate()
+        icmpEchoPayloadSum.deallocate()
         unreachEndpointIDs.deallocate()
         unreachSrcMACs.deallocate()
         unreachGatewayIPs.deallocate()

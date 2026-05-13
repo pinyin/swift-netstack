@@ -164,6 +164,7 @@ private func parseOneICMP(
         out.icmpEchoSeqNums[idx] = sequenceNumber
         out.icmpEchoPayloadOfs[idx] = totalPayloadOfs + 8
         out.icmpEchoPayloadLen[idx] = len - 8
+        out.icmpEchoPayloadSum[idx] = checksumAdd(0, UnsafeRawPointer(ptr.advanced(by: 8)), len - 8)
         out.icmpEchoCount += 1
     }
     // Non-echo ICMP is silently ignored

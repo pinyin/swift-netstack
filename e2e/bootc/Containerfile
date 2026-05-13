@@ -1,0 +1,62 @@
+FROM --platform=linux/arm64 fedora:latest
+
+# Step 1: Install test dependencies.
+RUN dnf install -y --setopt=install_weak_deps=False \
+    iproute \
+    iputils \
+    bind-utils \
+    nmap-ncat \
+    wget \
+    iperf3 \
+    dhcp-client \
+    coreutils \
+    util-linux \
+    grep \
+    sed \
+    gawk \
+    diffutils \
+    net-tools \
+    tcpdump \
+    && dnf clean all
+
+# Step 2: Remove python3-libs (pulled by gpgme, we don't need it at runtime).
+# Using rpm --nodeps so we don't cascade-remove unbound-libs, gnutls, etc.
+# Keep python3-libs RPM (wget2 needs libpython3.14.so.1.0) but strip the
+# 43 MB stdlib directory and pip wheels which we never use at runtime.
+RUN rm -rf \
+        /usr/lib64/python3.14 \
+        /usr/lib/python3.14 \
+        /usr/share/python-wheels \
+        /usr/lib64/libpython3.so
+
+# Step 3: Strip unnecessary bulk.
+RUN rm -rf \
+        /usr/share/doc \
+        /usr/share/man \
+        /usr/share/locale/?? \
+        /usr/share/locale/??_?? \
+        /usr/share/info \
+        /usr/share/gtk-doc \
+        /usr/share/licenses \
+        /usr/share/zoneinfo \
+        /usr/share/bash-completion \
+        /usr/share/misc \
+        /usr/lib/systemd \
+        /usr/lib64/systemd \
+        /usr/lib/firmware \
+        /usr/lib/modules \
+        /var/cache/dnf \
+        /var/log/*
+
+# Disable dhclient ARP duplicate address detection (falsely triggers on BDP network).
+# Single-file hook (not .d dir) so run-parts is not required.
+COPY dhcp-hooks/noarp /etc/dhcp/dhclient-enter-hooks
+
+# systemd-networkd DHCP config and e2e service (for raw-disk bootc-image-builder path).
+COPY network/eth0.network /etc/systemd/network/
+COPY systemd/e2e-tests.service /etc/systemd/system/
+
+# Test scripts
+COPY tests/ /tests/
+COPY bin/ /bin/
+RUN chmod +x /tests/*.sh /etc/dhcp/dhclient-enter-hooks /bin/tcpstress

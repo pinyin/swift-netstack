@@ -1,0 +1,14 @@
+[Unit]
+Description=SwiftNetStack E2E Test Suite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/tests/run-all.sh
+StandardOutput=journal+console
+StandardError=journal+console
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

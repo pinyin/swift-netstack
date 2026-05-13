@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 # Test: Large UDP datagram through NAT.
 # Sends a text-based UDP datagram through NAT echo, verifies byte count.
+# Uses bash /dev/udp to avoid nmap-ncat UDP behavioral differences.
 # Requires: nat_target and nat_udp_port in kernel cmdline.
 
 . /tests/lib.sh
@@ -17,8 +18,7 @@ fi
 
 echo "  Target: $NAT_TARGET:$NAT_UDP_PORT"
 
-# Generate a large text payload for UDP (busybox nc UDP limit is typically 512-1024 bytes)
-# Use a single line to avoid newline issues with nc -u
+# Generate a large text payload for UDP
 PAYLOAD="UDP_LARGE_TEST_"
 i=0
 while [ $i -lt 40 ]; do
@@ -29,8 +29,20 @@ echo "$PAYLOAD" > /tmp/udp-large-in.bin
 SENT=$(wc -c < /tmp/udp-large-in.bin)
 echo "  Sending $SENT bytes via UDP..."
 
-# Sleep briefly to let NAT UDP mapping establish
-cat /tmp/udp-large-in.bin | nc -u -w 5 "$NAT_TARGET" "$NAT_UDP_PORT" > /tmp/udp-large-out.bin
+# bash /dev/udp: write sends datagram, dd reads response
+FAILED=0
+bash -c '
+    exec 3<>/dev/udp/$1/$2 2>/dev/null || exit 1
+    cat /tmp/udp-large-in.bin >&3
+    dd bs=4096 count=1 <&3 of=/tmp/udp-large-out.bin 2>/dev/null
+    exec 3>&-
+' -- "$NAT_TARGET" "$NAT_UDP_PORT" 2>/dev/null || FAILED=1
+
+if [ "$FAILED" -eq 1 ]; then
+    # Fallback to nc -u
+    cat /tmp/udp-large-in.bin | nc -u -w 5 "$NAT_TARGET" "$NAT_UDP_PORT" > /tmp/udp-large-out.bin
+fi
+
 RECV=$(wc -c < /tmp/udp-large-out.bin)
 
 if [ "$SENT" -eq "$RECV" ]; then

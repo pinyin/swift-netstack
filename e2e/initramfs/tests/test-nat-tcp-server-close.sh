@@ -22,7 +22,7 @@ fi
 echo "  Target: $NAT_TARGET:$NAT_TCP_CLOSE_PORT"
 echo "  Connecting to close-first server..."
 
-RESULT=$(nc -w 5 "$NAT_TARGET" "$NAT_TCP_CLOSE_PORT" 2>&1)
+RESULT=$(timeout 6 nc -w 5 "$NAT_TARGET" "$NAT_TCP_CLOSE_PORT" 2>&1)
 
 if echo "$RESULT" | grep -q "HELLO-FROM-SERVER"; then
     echo "  Received greeting: OK"

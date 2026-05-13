@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 # Test: Outbound UDP through NAT.
 # Sends a UDP datagram to the host echo server via NAT, verifies echo reply.
+# Uses bash /dev/udp to avoid nmap-ncat UDP behavioral differences.
 # Requires: nat_target and nat_udp_port in kernel cmdline.
 
 . /tests/lib.sh
@@ -18,7 +19,19 @@ fi
 echo "  Target: $NAT_TARGET:$NAT_UDP_PORT"
 echo "  Sending UDP echo probe..."
 
-RESULT=$(echo "hello-nat-udp" | nc -u -w 5 "$NAT_TARGET" "$NAT_UDP_PORT" 2>&1)
+# bash /dev/udp: write sends a datagram, dd reads full datagram in one syscall
+RESULT=$(bash -c '
+    exec 3<>/dev/udp/$1/$2 2>/dev/null || { printf "__BASH_UDP_FAILED__"; exit 0; }
+    printf "hello-nat-udp" >&3
+    dd bs=1024 count=1 <&3 2>/dev/null
+    exec 3>&-
+' -- "$NAT_TARGET" "$NAT_UDP_PORT" 2>/dev/null)
+
+if [ "$RESULT" = "__BASH_UDP_FAILED__" ]; then
+    # Fallback to nc -u (nmap-ncat)
+    RESULT=$(printf "hello-nat-udp" | nc -u -w 5 "$NAT_TARGET" "$NAT_UDP_PORT" 2>&1)
+fi
+
 case "$RESULT" in
     *"hello-nat-udp"*)
         test_pass "nat-udp"

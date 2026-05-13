@@ -9,7 +9,6 @@ Packages/
 *.dSYM/
 
 # E2E build artifacts
-e2e/initramfs/initramfs.cpio.gz
-e2e/bootc/output/
+e2e/initramfs/output/
 .nfs.*
 Image.old

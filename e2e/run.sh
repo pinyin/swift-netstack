@@ -5,8 +5,7 @@
 # networking tests (DHCP, ICMP, ARP, DNS, routing).
 #
 # Usage:
-#   ./run.sh                              # all tests (busybox initramfs, default)
-#   ./run.sh --bootc                      # all tests (Fedora bootc initramfs)
+#   ./run.sh                              # all tests (Fedora bootc initramfs)
 #   ./run.sh --host test.local:1.2.3.4   # with DNS hostname
 #   ./run.sh --timeout 30                 # custom timeout
 #   ./run.sh --ext-target 192.168.6.6     # external server for NAT tests
@@ -15,9 +14,7 @@
 #   - Swift toolchain (swift build)
 #   - com.apple.security.virtualization entitlement
 #   - e2e/kernel/Image (aarch64 Linux kernel)
-#   - busybox path: e2e/initramfs/bin/busybox + e2e/initramfs/initramfs.cpio.gz
-#   - bootc path:   e2e/bootc/output/initramfs.cpio.gz (build on server first)
-
+#   - e2e/initramfs/output/initramfs.cpio.gz (build on server: cd e2e/initramfs && bash build.sh)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +26,6 @@ HTTP_PORT=7779
 TCP_CLOSE_PORT=7780
 BIDI_PORT=7781
 IPERF_PORT=7782
-INIT="/init"
-BOOTC_MODE=false
 HOST_ARGS=()
 PCAP_PATH=""
 MTU=""
@@ -61,17 +56,12 @@ while [ $# -gt 0 ]; do
             CHAOS_CMD="chaos_loss=$CHAOS_LOSS chaos_reorder=$CHAOS_REORDER chaos_dup=$CHAOS_DUP"
             shift
             ;;
-        --bootc) BOOTC_MODE=true; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
 KERNEL="$SCRIPT_DIR/kernel/Image"
-if $BOOTC_MODE; then
-    INITRD="$SCRIPT_DIR/bootc/output/initramfs.cpio.gz"
-else
-    INITRD="$SCRIPT_DIR/initramfs/initramfs.cpio.gz"
-fi
+INITRD="$SCRIPT_DIR/initramfs/output/initramfs.cpio.gz"
 DEMO_BIN="$PROJECT_DIR/.build/release/SwiftNetStackDemo"
 
 # ── Validate prerequisites ──
@@ -81,19 +71,10 @@ if [ ! -f "$KERNEL" ]; then
     exit 1
 fi
 
-# Build initramfs if needed
-if $BOOTC_MODE; then
-    if [ ! -f "$INITRD" ]; then
-        echo "ERROR: bootc initramfs not found at $INITRD"
-        echo "Build it first: cd e2e/bootc && bash build.sh  (on the local server)"
-        exit 1
-    fi
-else
-    INIT_SRC="$SCRIPT_DIR/initramfs/init"
-    if [ ! -f "$INITRD" ] || [ "$INIT_SRC" -nt "$INITRD" ] || [ "$SCRIPT_DIR/initramfs/build.sh" -nt "$INITRD" ]; then
-        echo "Building initramfs..."
-        "$SCRIPT_DIR/initramfs/build.sh"
-    fi
+if [ ! -f "$INITRD" ]; then
+    echo "ERROR: initramfs not found at $INITRD"
+    echo "Build it first: cd e2e/initramfs && bash build.sh  (on the local server)"
+    exit 1
 fi
 
 # Build demo if needed
@@ -185,7 +166,6 @@ echo "SwiftNetStack E2E Test Suite"
 echo "========================================="
 echo "Kernel:  $KERNEL"
 echo "Initrd:  $INITRD"
-echo "Init:    $INIT"
 echo "Timeout: ${TIMEOUT}s"
 if [ ${#HOST_ARGS[@]} -gt 0 ]; then
     echo "Hosts:   ${HOST_ARGS[*]}"
@@ -193,18 +173,12 @@ fi
 echo ""
 
 echo "Starting demo..."
-MEMORY=512
-if $BOOTC_MODE; then
-    MEMORY=1024
-    CMDLINE="console=hvc0 loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD $EXT_CMD $CHAOS_CMD"
-else
-    CMDLINE="console=hvc0 init=$INIT loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD $EXT_CMD $CHAOS_CMD"
-fi
+CMDLINE="console=hvc0 loglevel=4 panic=10 ${MTU:+MTU=$MTU }$NAT_CMD $EXT_CMD $CHAOS_CMD"
 "$DEMO_BIN" \
     --kernel "$KERNEL" \
     --initrd "$INITRD" \
     --cmdline "$CMDLINE" \
-    --cpus 1 --memory $MEMORY \
+    --cpus 1 --memory 1024 \
     ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} \
     ${PCAP_PATH:+--pcap "$PCAP_PATH"} \
     ${MTU:+--mtu "$MTU"} \

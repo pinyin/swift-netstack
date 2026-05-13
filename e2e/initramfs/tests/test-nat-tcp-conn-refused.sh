@@ -24,7 +24,7 @@ fi
 DEAD_PORT=19999
 
 echo "  Connecting to $NAT_TARGET:$DEAD_PORT (expecting refusal)..."
-echo "test" | nc -w 3 "$NAT_TARGET" "$DEAD_PORT" > /tmp/refused-out.txt 2>&1
+echo "test" | timeout 5 nc -w 3 "$NAT_TARGET" "$DEAD_PORT" > /tmp/refused-out.txt 2>&1
 RC=$?
 
 # The VM should see connection failure (timeout or refused).

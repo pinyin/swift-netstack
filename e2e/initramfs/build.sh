@@ -1,83 +1,60 @@
 #!/usr/bin/env bash
-# Build the initramfs for SwiftNetStack E2E tests.
+# Build the SwiftNetStack E2E bootc-based initramfs.
 #
-# Requires:
-#   - busybox (aarch64 static) at initramfs/bin/busybox
+# Runs on the local Fedora server (x86_64), cross-compiles for aarch64.
+#
+# Usage:
+#   ./build.sh
+#
+# Prerequisites (on the server):
+#   - podman + qemu-user-static (for aarch64 emulation)
 #   - cpio, gzip
 #
-# Output: initramfs/initramfs.cpio.gz
+# Output:
+#   output/initramfs.cpio.gz    # Fedora rootfs as initramfs
 
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$(mktemp -d /tmp/swiftnetstack-initramfs.XXXXXX)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+OUTPUT_DIR="$SCRIPT_DIR/output"
+IMAGE_NAME="swift-netstack-e2e"
 
-echo "Building initramfs in $BUILD_DIR..."
+mkdir -p "$OUTPUT_DIR"
 
-# Copy busybox and optional extra binaries
-mkdir -p "$BUILD_DIR/bin"
-cp "$SCRIPT_DIR/bin/busybox" "$BUILD_DIR/bin/busybox"
-chmod +x "$BUILD_DIR/bin/busybox"
-if [ -f "$SCRIPT_DIR/bin/iperf3" ]; then
-    cp "$SCRIPT_DIR/bin/iperf3" "$BUILD_DIR/bin/iperf3"
-    chmod +x "$BUILD_DIR/bin/iperf3"
-fi
-if [ -f "$SCRIPT_DIR/bin/tcpstress" ]; then
-    cp "$SCRIPT_DIR/bin/tcpstress" "$BUILD_DIR/bin/tcpstress"
-    chmod +x "$BUILD_DIR/bin/tcpstress"
-fi
-if [ -f "$SCRIPT_DIR/bin/netem-set" ]; then
-    cp "$SCRIPT_DIR/bin/netem-set" "$BUILD_DIR/bin/netem-set"
-    chmod +x "$BUILD_DIR/bin/netem-set"
-fi
+# ── Step 1: Build bootc OCI image (aarch64 cross-compile on x86_64) ─
 
-# Create symlinks for busybox applets
-BUSYBOX_APPLETS=(
-    sh ash cat echo mount umount sleep
-    ip ifconfig route ping
-    udhcpc nslookup nc
-    ls mkdir poweroff
-    awk grep head tail sed wc tr cut
-    chmod cp ln arp
-    wget sha256sum md5sum base64 hexdump
-    printf xargs split expr
-    dd cmp seq kill
-    tc
-)
-for applet in "${BUSYBOX_APPLETS[@]}"; do
-    ln -sf busybox "$BUILD_DIR/bin/$applet"
-done
+echo "=== Step 1: Building bootc container (linux/arm64) ==="
+podman build \
+    --platform linux/arm64 \
+    -t "${IMAGE_NAME}:latest" \
+    "$SCRIPT_DIR"
+echo "Container built: ${IMAGE_NAME}:latest"
 
-# Create essential directories
-mkdir -p "$BUILD_DIR"/{etc,proc,sys,dev,dev/pts,dev/shm,run,tmp,var,root,sbin,usr/share/udhcpc,tests}
+# ── Step 2: Export rootfs → initramfs cpio.gz ──────────────────────
 
-# Copy init
-cp "$SCRIPT_DIR/init" "$BUILD_DIR/init"
-chmod +x "$BUILD_DIR/init"
+echo ""
+echo "=== Step 2: Exporting rootfs for initramfs ==="
 
-# Copy all test scripts
-for f in "$SCRIPT_DIR/tests/"*; do
-    cp "$f" "$BUILD_DIR/tests/"
-    chmod +x "$BUILD_DIR/tests/$(basename "$f")"
-done
+TEMP_DIR="$(mktemp -d /tmp/bootc-initramfs.XXXXXX)"
+cleanup() { chmod -R u+w "$TEMP_DIR" 2>/dev/null || true; rm -rf "$TEMP_DIR"; }
+trap cleanup EXIT
 
-# Install udhcpc callback at the path busybox expects
-ln -sf /tests/udhcpc.script "$BUILD_DIR/usr/share/udhcpc/default.script"
+CONTAINER_ID=$(podman create --platform linux/arm64 "${IMAGE_NAME}:latest")
+podman export "$CONTAINER_ID" | tar -C "$TEMP_DIR" -xf -
+podman rm "$CONTAINER_ID" >/dev/null
 
-# Create /etc/inittab (minimal)
-cat > "$BUILD_DIR/etc/inittab" <<'EOF'
-::sysinit:/etc/init.d/rcS
-::askfirst:-/bin/sh
-EOF
+# Overlay custom /init (replaces systemd PID 1)
+cp "$SCRIPT_DIR/init" "$TEMP_DIR/init"
+chmod +x "$TEMP_DIR/init"
 
-# Create /etc/group and /etc/passwd (minimal)
-echo "root:x:0:" > "$BUILD_DIR/etc/group"
-echo "root:x:0:0:root:/root:/bin/sh" > "$BUILD_DIR/etc/passwd"
+INITRD="$OUTPUT_DIR/initramfs.cpio.gz"
+echo "Packaging $INITRD ..."
+(cd "$TEMP_DIR" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$INITRD")
+ls -lh "$INITRD"
 
-# Pack as cpio.gz
-OUTPUT="$SCRIPT_DIR/initramfs.cpio.gz"
-echo "Packing $OUTPUT..."
-(cd "$BUILD_DIR" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$OUTPUT")
-ls -lh "$OUTPUT"
-echo "Done."
+echo ""
+echo "=== Done ==="
+echo "Initramfs: $INITRD"
+echo ""
+echo "Run e2e test with:"
+echo "  cd $(dirname "$SCRIPT_DIR") && ./run.sh"

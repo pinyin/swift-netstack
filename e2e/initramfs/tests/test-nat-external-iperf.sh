@@ -32,7 +32,7 @@ run_ext_iperf() {
     local label="$1" duration="$2"
     echo "  === ${label}: 8 parallel x ${duration}s ==="
     local json
-    json=$(/bin/iperf3 -c "$EXT_TARGET" -p "$EXT_IPERF_PORT" -t "$duration" -P 8 --json 2>&1)
+    json=$(/bin/iperf3 -c "$EXT_TARGET" -p "$EXT_IPERF_PORT" -t "$duration" -P 8 --json 2>/dev/null)
     local rc=$?
 
     if [ $rc -ne 0 ]; then
@@ -42,9 +42,9 @@ run_ext_iperf() {
     fi
 
     # Integrity check: verify actual data traversed the NAT.
-    if echo "$json" | grep -q '"bits_per_second":[1-9]'; then
+    if echo "$json" | grep -q '"bits_per_second":[[:space:]]*[1-9]'; then
         local bps
-        bps=$(echo "$json" | grep -o '"bits_per_second":[0-9.]*' | tail -1 | cut -d: -f2)
+        bps=$(echo "$json" | grep -o '"bits_per_second":[[:space:]]*[0-9.e+]*' | tail -1 | sed 's/.*: *//')
         local gbps
         gbps=$(awk "BEGIN { printf \"%.2f\", $bps / 1000000000 }" 2>/dev/null || echo "N/A")
         echo "  Throughput: ${gbps} Gbits/sec  exit=$rc"

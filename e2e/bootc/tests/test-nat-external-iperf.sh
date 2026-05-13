@@ -3,6 +3,9 @@
 #
 # Validates TCP throughput against a real external server on the LAN,
 # exercising the full NAT outbound path including external routing.
+# Uses --json output for data integrity verification.
+#
+# Requires: ext_target and ext_iperf_port in kernel cmdline.
 
 . /tests/lib.sh
 
@@ -23,20 +26,40 @@ fi
 
 echo "  Target: $EXT_TARGET:$EXT_IPERF_PORT"
 
-echo "  === 1. 8 parallel -t 1 ==="
-/bin/iperf3 -c "$EXT_TARGET" -p "$EXT_IPERF_PORT" -t 1 -i 0 -P 8 2>&1
-RC1=$?
-echo "  exit=$RC1"
+FAIL=0
+
+run_ext_iperf() {
+    local label="$1" duration="$2"
+    echo "  === ${label}: 8 parallel x ${duration}s ==="
+    local json
+    json=$(/bin/iperf3 -c "$EXT_TARGET" -p "$EXT_IPERF_PORT" -t "$duration" -P 8 --json 2>&1)
+    local rc=$?
+
+    if [ $rc -ne 0 ]; then
+        echo "  iperf3 exit=$rc (connection/execution failure)"
+        FAIL=1
+        return
+    fi
+
+    # Integrity check: verify actual data traversed the NAT.
+    if echo "$json" | grep -q '"bits_per_second":[1-9]'; then
+        local bps
+        bps=$(echo "$json" | grep -o '"bits_per_second":[0-9.]*' | tail -1 | cut -d: -f2)
+        local gbps
+        gbps=$(awk "BEGIN { printf \"%.2f\", $bps / 1000000000 }" 2>/dev/null || echo "N/A")
+        echo "  Throughput: ${gbps} Gbits/sec  exit=$rc"
+    else
+        echo "  INTEGRITY FAIL: zero throughput (no data transferred through NAT)"
+        FAIL=1
+    fi
+}
+
+run_ext_iperf "1" 1
 sleep 1
+run_ext_iperf "2" 3
 
-echo "  === 2. 8 parallel -t 3 ==="
-/bin/iperf3 -c "$EXT_TARGET" -p "$EXT_IPERF_PORT" -t 3 -i 0 -P 8 2>&1
-RC2=$?
-echo "  exit=$RC2"
-
-if [ $RC1 -eq 0 ] && [ $RC2 -eq 0 ]; then
+if [ $FAIL -eq 0 ]; then
     test_pass "nat-external-iperf"
 else
-    echo "  One or more iperf3 runs failed: rc1=$RC1 rc2=$RC2"
     test_fail "nat-external-iperf"
 fi

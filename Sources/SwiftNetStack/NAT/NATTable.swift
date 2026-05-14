@@ -272,6 +272,9 @@ public struct NATTable {
                 if let epFD = transport.fdForEndpoint(c.endpointID) {
                     let inFlight = c.snd.nxt &- c.snd.una
                     if inFlight > 0 {
+                        // Loss-tolerant: retransmit without reducing cwnd.
+                        c.dupAckCount = 0
+                        c.lastAckValue = 0
                         let oldRTO = c.rtoValue
                         c.rtoBackoffCount = min(6, c.rtoBackoffCount &+ 1)
                         c.rtoValue = min(60_000_000, oldRTO &* 2)
@@ -700,6 +703,11 @@ public struct NATTable {
                 entry.connection.ackSendBuf(delta: unaDelta)
                 entry.connection.dupAckCount = 0
                 entry.connection.lastAckValue = entry.connection.snd.una
+                entry.connection.snd.nonRecoveryRtxCount = 0  // new hole position, reset escalation
+                // Approximate send time of the new oldest in-flight segment.
+                // Uses rtoSendTime (time of last send) as a conservative proxy —
+                // errs on the side of reordering tolerance.
+                entry.connection.snd.sndUnaSendTime = entry.connection.rtoSendTime
 
                 // RFC 6298 RTT measurement: compute sample if we have a valid send timestamp
                 // and this ACK acknowledges new (non-retransmitted) data.
@@ -749,26 +757,45 @@ public struct NATTable {
                     entry.connection.dupAckCount = 1
                 }
             }
-            // RFC 5681 fast retransmit/recovery state machine.
-            // Retransmit is done immediately (not deferred to flushOneConnection)
-            // so that inFlight and snd.una are accurate at the point of decision.
+            // Loss-tolerant fast retransmit (no cwnd reduction).
+            // virtio-net has zero real congestion — all apparent "loss" is
+            // artificial netem injection. Reducing cwnd on loss is actively
+            // harmful: it throttles the sender for no reason.
+            //
+            // On 3 dup ACKs, retransmit snd.una immediately. If the
+            // retransmit is also lost, retransmit again with exponential
+            // backoff (srtt-based). cwnd is never reduced; it only grows
+            // via slow-start / congestion-avoidance on new ACKs.
+            //
+            // The old RFC 5681 recovery state machine is retained in the
+            // `else` branch for the unlikely case another path sets
+            // inRecovery, but the primary path no longer enters recovery.
             let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
             let unaAdvanced = unaDelta > 0
             var doRetransmit = false
             if !entry.connection.snd.inRecovery {
                 if entry.connection.dupAckCount >= 3 && !unaAdvanced, inFlight > 0 {
-                    entry.connection.snd.ssthresh = max(inFlight / 2, UInt32(2 * mss))
-                    entry.connection.snd.cwnd = entry.connection.snd.ssthresh + UInt32(3 * mss)
-                    entry.connection.snd.recover = entry.connection.snd.nxt
-                    entry.connection.snd.inRecovery = true
-                    stats.tcpFastRecovery += 1
-                    doRetransmit = true
-                    if entry.connection.totalQueuedBytes > 0 {
-                        stats.recvEnteredWithData += 1
+                    if entry.connection.snd.nonRecoveryRtxCount == 0 {
+                        // First retransmit for this hole: immediate.
+                        entry.connection.snd.nonRecoveryRtxCount = 1
+                        entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
+                        stats.tcpFastRecovery += 1
+                        doRetransmit = true
                     } else {
-                        stats.recvEnteredNoData += 1
+                        // Already retransmitted this hole. Retransmit again
+                        // at most once per RTT (srtt-based interval, no
+                        // exponential growth — loss-tolerant, not congestion).
+                        let elapsed = freshNowUs &- entry.connection.snd.lastNonRecoveryRtxTime
+                        let minInterval = entry.connection.srtt > 0
+                            ? entry.connection.srtt
+                            : 200_000
+                        if elapsed > minInterval {
+                            entry.connection.snd.nonRecoveryRtxCount += 1
+                            entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
+                            stats.tcpFastRecovery += 1
+                            doRetransmit = true
+                        }
                     }
-                    if inFlight == 0 { stats.recvEnteredZeroIF += 1 }
                 }
             } else {
                 let ackValue = seg.ack
@@ -790,6 +817,10 @@ public struct NATTable {
             if doRetransmit {
                 retransmitHole(from: entry.connection, hostMAC: hostMAC,
                                transport: &transport, io: io)
+            }
+            // RFC 5681 cwnd growth on new ACK (after recovery processing, per gVisor snd.go).
+            if unaDelta > 0 {
+                entry.connection.snd.growCwnd(bytesAcked: UInt32(unaDelta), smss: UInt32(mss))
             }
             // Advance SACK scoreboard past acknowledged data + trim OOO
             if entry.connection.rcv.nxt != oldRcvNxt {
@@ -1078,6 +1109,7 @@ public struct NATTable {
             let sndNxtBefore = conn.snd.nxt
             while segCount < maxSegs {
                 let inFlight = conn.snd.nxt &- conn.snd.una
+                if inFlight == 0 { conn.snd.sndUnaSendTime = nowUs }
                 let effectiveWnd = Swift.min(conn.snd.wnd, conn.snd.cwnd)
                 var canSend = Int(effectiveWnd) - Int(inFlight)
 

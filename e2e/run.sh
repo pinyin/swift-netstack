@@ -32,6 +32,7 @@ MTU=""
 EXT_TARGET=""
 EXT_IPERF_PORT=7782
 EXT_HTTP_PORT=7783
+EXT_TCP_ECHO_PORT=7784
 CHAOS_CMD=""
 
 while [ $# -gt 0 ]; do
@@ -133,7 +134,7 @@ EXT_CMD=""
 
 if [ -n "$EXT_TARGET" ]; then
     echo "External target: $EXT_TARGET"
-    EXT_CMD="ext_target=$EXT_TARGET ext_iperf_port=$EXT_IPERF_PORT ext_http_port=$EXT_HTTP_PORT"
+    EXT_CMD="ext_target=$EXT_TARGET ext_iperf_port=$EXT_IPERF_PORT ext_http_port=$EXT_HTTP_PORT ext_tcp_echo_port=$EXT_TCP_ECHO_PORT"
 
     # Start iperf3 on external server if not already running
     if ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "iperf3 -c 127.0.0.1 -p $EXT_IPERF_PORT -t 1 2>&1" >/dev/null 2>&1; then
@@ -156,10 +157,33 @@ if [ -n "$EXT_TARGET" ]; then
     fi
 fi
 
+	# Start TCP echo server on external (for chaos-tcp)
+	EXT_TCP_ECHO_SSH_PID=""
+	if [ -n "$EXT_TARGET" ]; then
+	    ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "kill \$(cat /tmp/tcp-echo-server.pid 2>/dev/null) 2>/dev/null; nohup python3 -u /tmp/tcp-echo-server.py > /tmp/tcp-echo.log 2>&1 & echo \$!" > /tmp/ext-echo-pid 2>/dev/null
+	    if [ -s /tmp/ext-echo-pid ]; then
+	        EXT_TCP_ECHO_SSH_PID=$(cat /tmp/ext-echo-pid)
+	        echo "Started TCP echo on $EXT_TARGET:$EXT_TCP_ECHO_PORT"
+	    fi
+	fi
+
+	# Apply tc netem on external server when chaos is enabled
+	EXT_NETEM_ACTIVE=""
+	if [ -n "$CHAOS_CMD" ] && [ -n "$EXT_TARGET" ]; then
+	    echo "Applying tc netem on $EXT_TARGET..."
+	    if ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "sudo tc qdisc replace dev enp5s0 root netem delay 1ms loss ${CHAOS_LOSS}% reorder ${CHAOS_REORDER}% duplicate ${CHAOS_DUP}%" 2>/dev/null; then
+	        EXT_NETEM_ACTIVE="yes"
+	        echo "tc netem applied on $EXT_TARGET (loss=${CHAOS_LOSS}% reorder=${CHAOS_REORDER}% dup=${CHAOS_DUP}%)"
+	    else
+	        echo "WARNING: Failed to apply tc netem on $EXT_TARGET"
+	    fi
+	fi
+
+
 # ── Run test ──
 
 TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
-trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null; [ -n "$EXT_IPERF_SSH_PID" ] && kill "$EXT_IPERF_SSH_PID" 2>/dev/null; [ -n "$EXT_HTTP_SSH_PID" ] && kill "$EXT_HTTP_SSH_PID" 2>/dev/null; rm -f "$TMPLOG"' EXIT
+trap '[ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null; [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null; [ -n "$EXT_IPERF_SSH_PID" ] && kill "$EXT_IPERF_SSH_PID" 2>/dev/null; [ -n "$EXT_HTTP_SSH_PID" ] && kill "$EXT_HTTP_SSH_PID" 2>/dev/null; [ -n "$EXT_TCP_ECHO_SSH_PID" ] && kill "$EXT_TCP_ECHO_SSH_PID" 2>/dev/null; [ -n "$EXT_NETEM_ACTIVE" ] && ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$EXT_TARGET" "sudo tc qdisc del dev enp5s0 root" 2>/dev/null; rm -f "$TMPLOG"' EXIT
 
 echo "========================================="
 echo "SwiftNetStack E2E Test Suite"

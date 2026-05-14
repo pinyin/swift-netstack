@@ -112,6 +112,22 @@ struct SACKScoreboard {
         return false
     }
 
+    /// Total bytes in SACK blocks that overlap [from, to).
+    func totalSackedBytes(from: UInt32, to: UInt32) -> UInt32 {
+        guard to > from else { return 0 }
+        let n = Int(count)
+        var total: UInt32 = 0
+        for i in 0..<n {
+            let l = leftAt(i), r = rightAt(i)
+            let overlapStart = Swift.max(l, from)
+            let overlapEnd = Swift.min(r, to)
+            if overlapEnd > overlapStart {
+                total &+= overlapEnd &- overlapStart
+            }
+        }
+        return total
+    }
+
     /// Left edge of the first SACK block at or after `seq`, or nil if none.
     func firstSackedAfter(from seq: UInt32) -> UInt32? {
         let n = Int(count)
@@ -233,7 +249,7 @@ final class TCPConnection {
 
     public var sendQueue: SendQueue
     public var sendQueueSent: Int = 0
-    public static let maxQueueBytes: Int = 256 * 1024
+    public static let maxQueueBytes: Int = 512 * 1024
 
     /// True when the send queue is full and the external socket should not be
     /// read from until the queue drains.
@@ -295,8 +311,7 @@ final class TCPConnection {
         self.connectionID = connectionID
         self.posixFD = posixFD
         self.state = state
-        let iw = UInt32(min(4 * mss, max(2 * mss, 4380)))
-        self.snd = SendSequence(nxt: 0, una: 0, wnd: 65535, cwnd: iw)
+        self.snd = SendSequence(nxt: 0, una: 0, wnd: 65535)
         self.rcv = RecvSequence(nxt: 0, initialSeq: 0)
         self.vmMAC = vmMAC; self.vmIP = vmIP; self.vmPort = vmPort
         self.dstIP = dstIP; self.dstPort = dstPort

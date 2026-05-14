@@ -12,3 +12,4 @@ Packages/
 e2e/initramfs/output/
 .nfs.*
 Image.old
+e2e/initramfs/initramfs.cpio.gz

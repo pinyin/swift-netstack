@@ -128,11 +128,11 @@ import Testing
     // Complete loss → recovery → exit cycle
     let mss: UInt32 = 1460
     var snd = SendSequence(nxt: 5000, una: 0, wnd: 65535,
-                           cwnd: UInt32(min(4 * 1460, max(2 * 1460, 4380))),
+                           cwnd: 14600,
                            ssthresh: 65535)
 
-    // Initial cwnd = IW = min(4*1460, max(2*1460, 4380)) = min(5840, 4380) = 4380
-    #expect(snd.cwnd == 4380)
+    // Initial cwnd = IW = 10*MSS = 14600 (RFC 6928)
+    #expect(snd.cwnd == 14600)
 
     // Step 1: Normal operation, send some data
     snd.nxt = 5000
@@ -309,4 +309,102 @@ import Testing
         canSend = mss
     }
     #expect(canSend <= 0, "Limited Transmit blocked when receiver window is full")
+}
+
+// MARK: - cwnd growth (slow start + congestion avoidance)
+
+@Test func slowStartGrowsCwndOnNewAck() {
+    let smss: UInt32 = 1460
+    var snd = SendSequence(nxt: 5000, una: 0, wnd: 65535,
+                           cwnd: 4380, ssthresh: 65535)
+    #expect(snd.cwnd == 4380, "initial cwnd = IW")
+    #expect(snd.cwnd < snd.ssthresh, "in slow start")
+
+    // New ACK acknowledges 1460 bytes
+    snd.growCwnd(bytesAcked: 1460, smss: smss)
+    #expect(snd.cwnd == 4380 + 1460, "slow start: cwnd += bytesAcked per ACK")
+    #expect(snd.cwnd == 5840)
+
+    // Another ACK for 2920 bytes (delayed ACK covering 2 segments)
+    snd.growCwnd(bytesAcked: 2920, smss: smss)
+    #expect(snd.cwnd == 5840 + 1460, "slow start: cwnd += min(bytesAcked, SMSS)")
+    #expect(snd.cwnd == 7300)
+}
+
+@Test func slowStartCapsGrowthAtSMSS() {
+    let smss: UInt32 = 1400
+    var snd = SendSequence(nxt: 0, una: 0, wnd: 65535,
+                           cwnd: 2920, ssthresh: 65535)
+
+    // ACK covering many bytes (delayed ACK after several segments)
+    snd.growCwnd(bytesAcked: 5600, smss: smss)
+    #expect(snd.cwnd == 2920 + 1400, "slow start cap: cwnd += min(bytesAcked, SMSS)")
+    #expect(snd.cwnd == 4320)
+}
+
+@Test func congestionAvoidanceGrowsCwnd() {
+    let smss: UInt32 = 1460
+    // cwnd >= ssthresh → congestion avoidance
+    var snd = SendSequence(nxt: 0, una: 0, wnd: 65535,
+                           cwnd: 20000, ssthresh: 14600)
+    #expect(snd.cwnd >= snd.ssthresh, "in congestion avoidance")
+
+    // SMSS * SMSS / cwnd = 1460 * 1460 / 20000 = 2131600 / 20000 = 106
+    let expectedInc = Swift.max(1, smss &* smss / 20000)
+    #expect(expectedInc == 106)
+
+    snd.growCwnd(bytesAcked: 1460, smss: smss)
+    #expect(snd.cwnd == 20000 + expectedInc, "congestion avoidance: cwnd += SMSS^2/cwnd")
+}
+
+@Test func cwndGrowthSuppressedInRecovery() {
+    let smss: UInt32 = 1460
+    var snd = SendSequence(nxt: 5000, una: 0, wnd: 65535,
+                           cwnd: 7300, ssthresh: 2920)
+    snd.inRecovery = true
+
+    let cwndBefore = snd.cwnd
+    snd.growCwnd(bytesAcked: 1460, smss: smss)
+    #expect(snd.cwnd == cwndBefore, "cwnd should NOT grow during recovery")
+}
+
+@Test func cwndGrowthNoopOnZeroBytesAcked() {
+    var snd = SendSequence(nxt: 0, una: 0, wnd: 65535,
+                           cwnd: 4380, ssthresh: 65535)
+    let cwndBefore = snd.cwnd
+    snd.growCwnd(bytesAcked: 0, smss: 1460)
+    #expect(snd.cwnd == cwndBefore, "zero bytes acked → no cwnd change")
+}
+
+// MARK: - RTO cwnd reset (RFC 5681 §5)
+
+@Test func rtoResetsCwndToLossWindow() {
+    let smss: UInt32 = 1460
+    var snd = SendSequence(nxt: 10000, una: 5000, wnd: 65535,
+                           cwnd: 20000, ssthresh: 10000)
+    snd.inRecovery = true
+
+    snd.resetCwndOnRTO(smss: smss)
+
+    let inFlight = UInt32(5000)  // nxt - una = 10000 - 5000
+    #expect(snd.ssthresh == max(inFlight / 2, 2 * smss),
+            "ssthresh = max(inFlight/2, 2*SMSS)")
+    #expect(snd.ssthresh == max(2500, 2920))
+    #expect(snd.ssthresh == 2920)
+    #expect(snd.cwnd == smss, "cwnd = 1 SMSS (Loss Window)")
+    #expect(snd.inRecovery == false, "recovery flag cleared on RTO")
+}
+
+@Test func rtoResetsCwndWithSmallInFlight() {
+    let smss: UInt32 = 1400
+    // Small inFlight (only 1 segment) → ssthresh floored at 2*SMSS
+    var snd = SendSequence(nxt: 1400, una: 0, wnd: 65535,
+                           cwnd: 4380, ssthresh: 65535)
+
+    snd.resetCwndOnRTO(smss: smss)
+
+    #expect(snd.ssthresh == 2 * smss, "ssthresh floored at 2*SMSS")
+    #expect(snd.ssthresh == 2800)
+    #expect(snd.cwnd == smss, "cwnd = 1 SMSS")
+    #expect(snd.inRecovery == false)
 }

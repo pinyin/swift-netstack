@@ -798,15 +798,12 @@ public struct NATTable {
             // Drain reassembly buffer AFTER FSM data is queued, preserving seq order:
             // FSM data [oldRcvNxt, rcv.nxt) → OOO data [rcv.nxt, newNxt).
             if entry.connection.rcv.nxt != oldRcvNxt {
-                if let (oooData, newNxt) = entry.connection.drainOOO(rcvNxt: entry.connection.rcv.nxt) {
-                    oooData.withUnsafeBytes { oooPtr in
-                        _ = entry.connection.appendExternalSend(oooPtr.baseAddress!, oooData.count)
-                    }
-                    stats.oooBytesDrained += UInt64(oooData.count)
+                let oldNxt = entry.connection.rcv.nxt
+                let oooDrained = entry.connection.drainOOO()
+                if oooDrained > 0 {
+                    stats.oooBytesDrained += UInt64(oooDrained)
                     stats.oooDrainEvents += 1
-                    let oldNxt = entry.connection.rcv.nxt
-                    entry.connection.rcv.nxt = newNxt
-                    debugLog("[NAT-TCP-OOO] C\(entry.connection.connectionID) drained \(oooData.count)B OOO, rcv.nxt \(oldNxt)→\(newNxt)\n")
+                    debugLog("[NAT-TCP-OOO] C\(entry.connection.connectionID) drained \(oooDrained)B OOO, rcv.nxt \(oldNxt)→\(entry.connection.rcv.nxt)\n")
                 }
             }
 

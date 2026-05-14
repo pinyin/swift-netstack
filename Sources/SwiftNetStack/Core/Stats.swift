@@ -272,6 +272,10 @@ public func printStats(
         let wbkPct  = Int(Double(n.tcpFsmWBkNs)  / Double(fsmSubTotal) * 100)
         parts.append("fsmSub[dict=\(dictPct)% func=\(funcPct)% ack=\(ackPct)% wbk=\(wbkPct)%]")
     }
+    // ── OOO reassembly buffer ──
+    if n.oooBufferInserted + n.oooBufferDropped + n.oooBytesDrained > 0 {
+        parts.append("ooo[ins=\(n.oooBufferInserted) drop=\(n.oooBufferDropped) drain=\(n.oooBytesDrained)B ev=\(n.oooDrainEvents)]")
+    }
     let line = "[STATS] " + parts.joined(separator: " ")
     _ = line.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }
     _ = "\n".withCString { Darwin.write(STDERR_FILENO, $0, 1) }

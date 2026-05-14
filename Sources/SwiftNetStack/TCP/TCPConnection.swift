@@ -354,137 +354,130 @@ final class TCPConnection {
     // MARK: - Reassembly buffer (out-of-order VM→external data)
 
     /// Sorted list of out-of-order segments awaiting gap fill.
-    /// Each entry is (seq, data). When a segment arrives that fills the gap at
-    /// rcv.nxt, all contiguous buffered segments are drained and delivered
-    /// to the external send queue in order.
-    var oooSegments: [(seq: UInt32, data: [UInt8])] = []
+    /// Each segment owns a separately allocated buffer to avoid data copies
+    /// during overlap resolution. Adjacent segments are NOT merged —
+    /// drainOOO drains them sequentially into the external send queue.
+    ///
+    /// Layout: (seq, base: allocated pointer, offset: within allocation, len: valid bytes)
+    var oooSegments: [(seq: UInt32, base: UnsafeMutableRawPointer, offset: Int, len: Int)] = []
     var oooTotalBytes: Int = 0
     static let oooMaxBytes: Int = 256 * 1024
 
-    /// Buffer an out-of-order segment. Overlapping segments are merged.
+    /// Buffer an out-of-order segment. Data is copied into an owned buffer.
+    /// Overlaps are resolved by trimming (no segment merging).
     /// Returns true if buffered, false if the buffer is full.
     func bufferOOO(seq: UInt32, data: UnsafeRawPointer, len: Int) -> Bool {
         guard len > 0, oooTotalBytes + len <= Self.oooMaxBytes else { return false }
-        let bytes = [UInt8](UnsafeRawBufferPointer(start: data, count: len))
-        return _bufferOOO(seq: seq, bytes: bytes)
+        let endSeq = seq &+ UInt32(len)
+        guard endSeq > seq else { return false }
+
+        let base = UnsafeMutableRawPointer.allocate(byteCount: len, alignment: 1)
+        base.copyMemory(from: data, byteCount: len)
+        insertOOO(seq: seq, base: base, offset: 0, len: len)
+        return true
     }
 
-    private func _bufferOOO(seq: UInt32, bytes: [UInt8]) -> Bool {
-        let endSeq = seq &+ UInt32(bytes.count)
-        guard endSeq > seq else { return false }
+    /// Insert a segment into the sorted OOO list.
+    /// Resolves overlaps by trimming (discarding duplicate ranges).
+    /// NEVER merges segments — adjacent segments stay separate.
+    private func insertOOO(seq: UInt32, base: UnsafeMutableRawPointer, offset: Int, len: Int) {
+        var seq = seq
+        var offset = offset
+        var len = len
+        let endSeq = seq &+ UInt32(len)
 
         // Find insertion index (maintain sort by seq)
         var idx = 0
         while idx < oooSegments.count && oooSegments[idx].seq < seq { idx += 1 }
 
-        // Consume any fully-contained existing segments (must start at or after new seq)
-        while idx < oooSegments.count && oooSegments[idx].seq >= seq && oooSegments[idx].seq &+ UInt32(oooSegments[idx].data.count) <= endSeq {
-            oooTotalBytes -= oooSegments[idx].data.count
+        // Remove any existing segments fully contained within the new segment
+        while idx < oooSegments.count, oooSegments[idx].seq >= seq,
+              oooSegments[idx].seq &+ UInt32(oooSegments[idx].len) <= endSeq {
+            oooTotalBytes -= oooSegments[idx].len
+            oooSegments[idx].base.deallocate()
             oooSegments.remove(at: idx)
         }
 
-        // Merge with previous if overlapping
+        // Trim overlap with previous segment (new starts within previous)
         if idx > 0 {
-            let prevEnd = oooSegments[idx - 1].seq &+ UInt32(oooSegments[idx - 1].data.count)
-            if seq <= prevEnd {
-                // Extend previous segment if new data goes beyond it
-                if endSeq > prevEnd {
-                    let overlap = Int(prevEnd &- seq)
-                    let extra = bytes[overlap...]
-                    oooSegments[idx - 1].data.append(contentsOf: extra)
-                    oooTotalBytes += extra.count
-                }
-                // Check if this merged segment now overlaps with next
-                let newEnd = oooSegments[idx - 1].seq &+ UInt32(oooSegments[idx - 1].data.count)
-                while idx < oooSegments.count && oooSegments[idx].seq <= newEnd {
-                    let nextEnd = oooSegments[idx].seq &+ UInt32(oooSegments[idx].data.count)
-                    if nextEnd > newEnd {
-                        let overlap = Int(newEnd &- oooSegments[idx].seq)
-                        let extra = oooSegments[idx].data[overlap...]
-                        oooSegments[idx - 1].data.append(contentsOf: extra)
-                        oooTotalBytes += extra.count
-                    }
-                    oooTotalBytes -= oooSegments[idx].data.count
+            let prevEnd = oooSegments[idx - 1].seq &+ UInt32(oooSegments[idx - 1].len)
+            if seq < prevEnd {
+                let overlap = Int(prevEnd &- seq)
+                seq = prevEnd
+                offset += overlap
+                len -= overlap
+                guard len > 0 else { base.deallocate(); return }
+            }
+        }
+
+        // Trim overlap with next segment (new extends into next)
+        if idx < oooSegments.count {
+            let nextSeq = oooSegments[idx].seq
+            if endSeq > nextSeq {
+                let overlap = Int(endSeq &- nextSeq)
+                if overlap >= len { base.deallocate(); return }
+
+                len -= overlap
+                // If next is fully contained in the new segment, remove it
+                if oooSegments[idx].seq &+ UInt32(oooSegments[idx].len) <= endSeq {
+                    oooTotalBytes -= oooSegments[idx].len
+                    oooSegments[idx].base.deallocate()
                     oooSegments.remove(at: idx)
                 }
-                return true
             }
         }
 
-        // Merge with next if overlapping
-        if idx < oooSegments.count && endSeq >= oooSegments[idx].seq {
-            let nextStart = oooSegments[idx].seq
-            let nextEnd = nextStart &+ UInt32(oooSegments[idx].data.count)
-            if endSeq < nextEnd {
-                // Trim new data to not overlap next segment
-                let keep = Int(nextStart &- seq)
-                if keep <= 0 { return true }
-                oooSegments.insert((seq, Array(bytes[0..<keep])), at: idx)
-                oooTotalBytes += keep
-            } else {
-                // New data completely covers next segment(s) — replace
-                oooTotalBytes -= oooSegments[idx].data.count
-                oooSegments[idx] = (seq, bytes)
-                oooTotalBytes += bytes.count
-                // Merge any subsequent segments covered by this one
-                let finalEnd = seq &+ UInt32(bytes.count)
-                let j = idx + 1
-                while j < oooSegments.count && oooSegments[j].seq &+ UInt32(oooSegments[j].data.count) <= finalEnd {
-                    oooTotalBytes -= oooSegments[j].data.count
-                    oooSegments.remove(at: j)
-                }
-                if j < oooSegments.count && oooSegments[j].seq <= finalEnd {
-                    let overlap = Int(finalEnd &- oooSegments[j].seq)
-                    if overlap < oooSegments[j].data.count {
-                        let extra = oooSegments[j].data[overlap...]
-                        oooSegments[idx].data.append(contentsOf: extra)
-                        oooTotalBytes += extra.count
-                    }
-                    oooTotalBytes -= oooSegments[j].data.count
-                    oooSegments.remove(at: j)
-                }
-            }
-            return true
-        }
+        guard len > 0 else { base.deallocate(); return }
 
-        // No overlap — insert as new segment
-        oooSegments.insert((seq, bytes), at: idx)
-        oooTotalBytes += bytes.count
-        return true
+        oooSegments.insert((seq, base, offset, len), at: idx)
+        oooTotalBytes += len
     }
 
     /// Discard or trim buffered segments that are now behind rcv.nxt
     /// (already delivered via a gap-filling segment that partially overlapped).
     func trimOOO(rcvNxt: UInt32) {
         while !oooSegments.isEmpty && oooSegments[0].seq < rcvNxt {
-            let segEnd = oooSegments[0].seq &+ UInt32(oooSegments[0].data.count)
+            let segEnd = oooSegments[0].seq &+ UInt32(oooSegments[0].len)
             if segEnd <= rcvNxt {
-                oooTotalBytes -= oooSegments[0].data.count
+                oooTotalBytes -= oooSegments[0].len
+                oooSegments[0].base.deallocate()
                 oooSegments.removeFirst()
             } else {
                 let overlap = Int(rcvNxt &- oooSegments[0].seq)
-                let trimmed = Array(oooSegments[0].data[overlap...])
-                oooTotalBytes -= oooSegments[0].data.count
+                oooTotalBytes -= oooSegments[0].len
                 oooSegments[0].seq = rcvNxt
-                oooSegments[0].data = trimmed
-                oooTotalBytes += trimmed.count
+                oooSegments[0].offset += overlap
+                oooSegments[0].len -= overlap
+                oooTotalBytes += oooSegments[0].len
                 break
             }
         }
     }
 
-    /// Drain contiguous segments starting at rcv.nxt.
-    /// Returns the concatenated data and new rcv.nxt, or nil if no data is contiguous.
-    func drainOOO(rcvNxt: UInt32) -> (data: [UInt8], newNxt: UInt32)? {
-        guard !oooSegments.isEmpty, oooSegments[0].seq == rcvNxt else { return nil }
-        var result: [UInt8] = []
-        var nxt = rcvNxt
-        while !oooSegments.isEmpty && oooSegments[0].seq == nxt {
-            let seg = oooSegments.removeFirst()
-            oooTotalBytes -= seg.data.count
-            result.append(contentsOf: seg.data)
-            nxt = nxt &+ UInt32(seg.data.count)
+    /// Drain contiguous OOO segments starting at rcv.nxt into externalSendQueue.
+    /// Each segment's data is copied directly from its buffer to the send queue
+    /// (eliminating the intermediate [UInt8] array from the old design).
+    /// Updates rcv.nxt. Returns bytes drained, 0 if nothing to drain.
+    @discardableResult
+    func drainOOO() -> Int {
+        guard !oooSegments.isEmpty, oooSegments[0].seq == rcv.nxt else { return 0 }
+        var total = 0
+        while !oooSegments.isEmpty && oooSegments[0].seq == rcv.nxt {
+            let seg = oooSegments[0]
+            let written = externalSendQueue.enqueue(seg.base + seg.offset, seg.len)
+            total += written
+            rcv.nxt = rcv.nxt &+ UInt32(written)
+            if written < seg.len {
+                // Partial write — keep remainder in OOO buffer
+                oooSegments[0].offset += written
+                oooSegments[0].len -= written
+                oooTotalBytes -= written
+                break
+            }
+            oooTotalBytes -= seg.len
+            seg.base.deallocate()
+            oooSegments.removeFirst()
         }
-        return (result, nxt)
+        return total
     }
 }

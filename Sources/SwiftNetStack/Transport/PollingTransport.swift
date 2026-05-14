@@ -28,7 +28,11 @@ public enum ExternalFDKind {
 
 /// All data read by a single readPackets() call.
 public struct TransportResult {
-    public var streamReads: [(fd: Int32, data: [UInt8])] = []
+    /// Flat buffer backing streamReads offsets. All stream data for a round
+    /// is accumulated here, avoiding per-recv() [UInt8] heap allocations.
+    public var streamDataBuffer: [UInt8] = []
+    /// Stream reads as (fd, offset, len) into streamDataBuffer.
+    public var streamReads: [(fd: Int32, offset: Int, len: Int)] = []
     public var streamAccepts: [(listenerFD: Int32, newFD: Int32, remoteAddr: sockaddr_in)] = []
     public var streamHangup: [Int32] = []
     public var streamConnects: [Int32] = []
@@ -180,7 +184,9 @@ public struct PollingTransport {
                             return Darwin.recv(fd, $0.baseAddress!, 65536, 0)
                         }
                         if n > 0 {
-                            result.streamReads.append((fd, Array(recvScratch[0..<n])))
+                            let off = result.streamDataBuffer.count
+                            result.streamDataBuffer.append(contentsOf: recvScratch[0..<n])
+                            result.streamReads.append((fd, off, n))
                         } else if n == 0 {
                             result.streamHangup.append(fd); break
                         } else {

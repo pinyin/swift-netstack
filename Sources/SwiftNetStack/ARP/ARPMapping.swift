@@ -5,7 +5,7 @@ public struct ARPEntry {
     public let ip: IPv4Address
     public let mac: MACAddress
     public let endpointID: Int
-    public let createdAt: UInt64
+    public var createdAt: UInt64
 
     public init(ip: IPv4Address, mac: MACAddress, endpointID: Int) {
         self.ip = ip
@@ -14,9 +14,20 @@ public struct ARPEntry {
         self.createdAt = UInt64(Darwin.time(nil))
     }
 
-    /// Entries older than 1 hour are considered stale.
-    var isExpired: Bool {
-        UInt64(Darwin.time(nil)) - createdAt > 3600
+    /// Test-only init with explicit creation timestamp.
+    public init(ip: IPv4Address, mac: MACAddress, endpointID: Int, createdAt: UInt64) {
+        self.ip = ip
+        self.mac = mac
+        self.endpointID = endpointID
+        self.createdAt = createdAt
+    }
+
+    /// Whether this entry has exceeded the given timeout.
+    /// - Parameters:
+    ///   - now: Current time in seconds since epoch (default: now).
+    ///   - timeout: Maximum entry age in seconds (default: 3600 = 1 hour).
+    public func isExpired(now: UInt64 = UInt64(Darwin.time(nil)), timeout: UInt64 = 3600) -> Bool {
+        now < createdAt || now - createdAt > timeout
     }
 }
 
@@ -42,31 +53,45 @@ public struct ARPMapping {
     // MARK: - Query
 
     /// Look up the MAC for an IP. Returns nil if unknown or expired.
-    public func lookup(ip: IPv4Address) -> MACAddress? {
-        guard let entry = entries[ip.addr], !entry.isExpired else { return nil }
+    public func lookup(ip: IPv4Address, now: UInt64 = UInt64(Darwin.time(nil)),
+                       timeout: UInt64 = 3600) -> MACAddress? {
+        guard let entry = entries[ip.addr], !entry.isExpired(now: now, timeout: timeout) else { return nil }
         return entry.mac
     }
 
     /// Look up the endpoint ID for a MAC address. Returns nil if unknown or expired.
-    public func lookupEndpoint(mac: MACAddress) -> Int? {
+    public func lookupEndpoint(mac: MACAddress, now: UInt64 = UInt64(Darwin.time(nil)),
+                               timeout: UInt64 = 3600) -> Int? {
         for entry in entries.values where entry.mac == mac {
-            if entry.isExpired { return nil }
+            if entry.isExpired(now: now, timeout: timeout) { return nil }
             return entry.endpointID
         }
         return nil
     }
 
     /// Whether this IP is known and not expired.
-    public func isKnown(_ ip: IPv4Address) -> Bool {
+    public func isKnown(_ ip: IPv4Address, now: UInt64 = UInt64(Darwin.time(nil)),
+                        timeout: UInt64 = 3600) -> Bool {
         guard let entry = entries[ip.addr] else { return false }
-        return !entry.isExpired
+        return !entry.isExpired(now: now, timeout: timeout)
     }
 
     // MARK: - Mutation
 
     /// Add or update an entry. Called by DHCP server on lease allocation.
-    public mutating func add(ip: IPv4Address, mac: MACAddress, endpointID: Int) {
-        entries[ip.addr] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID)
+    public mutating func add(ip: IPv4Address, mac: MACAddress, endpointID: Int,
+                              createdAt: UInt64? = nil) {
+        if let ts = createdAt {
+            entries[ip.addr] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID, createdAt: ts)
+        } else {
+            entries[ip.addr] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID)
+        }
+    }
+
+    /// Remove expired entries. Call periodically (every ~60s).
+    public mutating func reapExpired(now: UInt64 = UInt64(Darwin.time(nil)),
+                                      timeout: UInt64 = 3600) {
+        entries = entries.filter { !$0.value.isExpired(now: now, timeout: timeout) }
     }
 
     /// Remove an entry. Called by DHCP server on lease release.

@@ -64,6 +64,45 @@ public struct NATStats {
     public var tcpFlushNs: UInt64 = 0
     /// Number of fast retransmit segments sent (RFC 5681, triggered by 3 dup ACKs).
     public var tcpFastRetransmit: UInt64 = 0
+    /// Number of fast recovery episodes entered (RFC 5681).
+    public var tcpFastRecovery: UInt64 = 0
+    /// Number of RTO timer expirations that triggered retransmission.
+    public var rtoExpired: UInt64 = 0
+    /// Number of RTO expirations where no data was available to retransmit.
+    public var rtoExpiredNoData: UInt64 = 0
+    /// Number of RTO expirations where sendOneDataSegment failed.
+    public var rtoExpiredSendFail: UInt64 = 0
+    /// Number of valid RTT samples collected (non-retransmit).
+    public var rttSamples: UInt64 = 0
+    // ── retransmitHole debug counters ──
+    /// Total calls to retransmitHole.
+    public var rtHoleCalled: UInt64 = 0
+    /// retransmitHole: inFlight == 0 (no data in flight to retransmit).
+    public var rtHoleNoInflight: UInt64 = 0
+    /// retransmitHole: no endpoint FD found.
+    public var rtHoleNoEPFD: UInt64 = 0
+    /// retransmitHole: peekRetransmitData returned nil (send queue empty).
+    public var rtHoleNoData: UInt64 = 0
+    /// retransmitHole: all data was SACKed (rtLen truncated to 0).
+    public var rtHoleNoLen: UInt64 = 0
+    /// retransmitHole: all guards passed, retransmit attempted.
+    public var rtHoleOK: UInt64 = 0
+    /// retransmitHole: sendOneDataSegment returned < 0 (send failure).
+    public var rtHoleFail: UInt64 = 0
+    /// Recovery entered with queued data available for retransmit.
+    public var recvEnteredWithData: UInt64 = 0
+    /// Recovery entered with NO queued data (spurious entry).
+    public var recvEnteredNoData: UInt64 = 0
+    /// Recovery entered when inFlight == 0 (should not happen).
+    public var recvEnteredZeroIF: UInt64 = 0
+    /// OOO segments inserted into reassembly buffer.
+    public var oooBufferInserted: UInt64 = 0
+    /// OOO segments dropped (buffer full or out of window).
+    public var oooBufferDropped: UInt64 = 0
+    /// Bytes drained from reassembly buffer to external send queue.
+    public var oooBytesDrained: UInt64 = 0
+    /// Number of drain events (gap-filled-then-drain).
+    public var oooDrainEvents: UInt64 = 0
     /// FSM sub-phase breakdown: dict lookup, tcpProcess call, ACK build, dict write-back.
     public var tcpFsmDictNs: UInt64 = 0
     public var tcpFsmFuncNs: UInt64 = 0
@@ -200,6 +239,19 @@ public func printStats(
     }
     if n.ackChecksumIncremental + n.ackChecksumFull > 0 {
         parts.append("ackCKinc=\(n.ackChecksumIncremental)/\(n.ackChecksumIncremental + n.ackChecksumFull)")
+    }
+    if n.tcpFastRetransmit + n.tcpFastRecovery > 0 {
+        parts.append("fastRT=\(n.tcpFastRetransmit) fastRec=\(n.tcpFastRecovery)")
+    }
+    if n.rtoExpired + n.rttSamples > 0 {
+        parts.append("rto[exp=\(n.rtoExpired) noDat=\(n.rtoExpiredNoData) fail=\(n.rtoExpiredSendFail) samples=\(n.rttSamples)]")
+    }
+    // ── retransmitHole debug breakdown ──
+    if n.rtHoleCalled > 0 {
+        parts.append("rtHole[ok=\(n.rtHoleOK) fail=\(n.rtHoleFail) noInf=\(n.rtHoleNoInflight) noEP=\(n.rtHoleNoEPFD) noDat=\(n.rtHoleNoData) noLen=\(n.rtHoleNoLen)]")
+        if n.recvEnteredWithData + n.recvEnteredNoData > 0 {
+            parts.append("recvEnt[data=\(n.recvEnteredWithData) noDat=\(n.recvEnteredNoData) zeroIF=\(n.recvEnteredZeroIF)]")
+        }
     }
     // ── TCP sub-phase timing ──
     let subTotal = n.tcpAckFlushNs + n.tcpFsmNs + n.tcpExtReadNs + n.tcpFlushNs

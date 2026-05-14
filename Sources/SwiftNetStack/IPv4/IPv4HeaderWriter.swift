@@ -38,3 +38,32 @@ func writeIPv4Header(
 let ethHeaderLen = 14
 let ipv4HeaderLen = 20
 let udpHeaderLen = 8
+
+/// Decrement the TTL field of an in-place IPv4 header and update its checksum.
+/// Returns true if forwarding may continue (TTL was > 1). Returns false if the
+/// TTL reached 0 — the caller should generate ICMP Time Exceeded and drop the packet.
+///
+/// Uses incremental checksum (RFC 1624): HC' = HC + ~((oldTTL - newTTL) << 8).
+/// This avoids recomputing the entire 20-byte checksum in the hot path.
+public func decrementTTL(at ipPtr: UnsafeMutableRawPointer) -> Bool {
+    let ttl = ipPtr.load(fromByteOffset: 8, as: UInt8.self)
+    guard ttl > 1 else {
+        ipPtr.storeBytes(of: UInt8(0), toByteOffset: 8, as: UInt8.self)
+        // TTL=1 → 0: add 0x0100 to checksum (one's complement)
+        // Derivation: new_checksum = ~(~old_checksum - 0x0100) = old_checksum + 0x0100
+        let oldCK = UInt32(readUInt16BE(ipPtr, 10))
+        var newCK = oldCK &+ 0x0100
+        newCK = (newCK & 0xFFFF) &+ (newCK >> 16)
+        newCK = (newCK & 0xFFFF) &+ (newCK >> 16)
+        writeUInt16BE(UInt16(newCK & 0xFFFF), to: ipPtr.advanced(by: 10))
+        return false
+    }
+    ipPtr.storeBytes(of: ttl &- 1, toByteOffset: 8, as: UInt8.self)
+    // RFC 1624 incremental: HC' = ~(~HC - 0x0100) = HC + 0x0100
+    let oldCK = UInt32(readUInt16BE(ipPtr, 10))
+    var newCK = oldCK &+ 0x0100
+    newCK = (newCK & 0xFFFF) &+ (newCK >> 16)
+    newCK = (newCK & 0xFFFF) &+ (newCK >> 16)
+    writeUInt16BE(UInt16(newCK & 0xFFFF), to: ipPtr.advanced(by: 10))
+    return true
+}

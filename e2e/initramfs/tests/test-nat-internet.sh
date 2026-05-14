@@ -37,7 +37,7 @@ echo "  Guest→Internet: DNS + HTTP fetch..."
 
 # wget does its own DNS resolution through libc getaddrinfo().
 # This exercises both A and AAAA query forwarding through the NAT DNS server.
-WGET_ERR=$(wget -q -O /tmp/inet-http-resp.txt "http://example.com/" 2>&1)
+WGET_ERR=$(timeout 10 wget -q -O /tmp/inet-http-resp.txt "http://example.com/" 2>&1)
 WGET_RC=$?
 if [ $WGET_RC -eq 0 ]; then
     TCP_RESP=$(wc -c < /tmp/inet-http-resp.txt)

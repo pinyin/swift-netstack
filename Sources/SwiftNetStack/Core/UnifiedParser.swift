@@ -37,6 +37,30 @@ public func parseAllFrames(
         // ── MAC filter ──
         if dstMAC != hostMAC && dstMAC != .broadcast {
             if let dstEp = arpMapping.lookupEndpoint(mac: dstMAC), dstEp != epID {
+                // IPv4 L2 forwarding: decrement TTL before forwarding.
+                if etherTypeRaw == 0x0800 {
+                    let ipPtr = ptr.advanced(by: ethHeaderLen)
+                    let ttlOK = decrementTTL(at: ipPtr)
+                    if !ttlOK {
+                        // TTL expired → ICMP Time Exceeded (Type 11 Code 0)
+                        let ihl = Int(ipPtr.load(fromByteOffset: 0, as: UInt8.self) & 0x0F)
+                        let srcAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 12), count: 4))
+                        let dstAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 16), count: 4))
+                        let idx = out.unreachCount
+                        if idx < out.maxFrames {
+                            out.unreachEndpointIDs[idx] = epID
+                            out.unreachSrcMACs[idx] = srcMAC
+                            out.unreachGatewayIPs[idx] = dstAddr
+                            out.unreachClientIPs[idx] = srcAddr
+                            out.unreachRawOfs[idx] = i * mtu + ethHeaderLen
+                            out.unreachRawLen[idx] = len - ethHeaderLen
+                            out.unreachCodes[idx] = 0    // Time Exceeded
+                            out.unreachTypes[idx] = 11   // Type 11
+                            out.unreachCount += 1
+                        }
+                        continue
+                    }
+                }
                 let idx = fwdBatch.count
                 guard idx < fwdBatch.maxFrames else { continue }
                 fwdBatch.hdrOfs[idx] = i * mtu
@@ -102,6 +126,24 @@ private func parseOneIPv4(
     let srcAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 12), count: 4))
     let dstAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 16), count: 4))
 
+    // Fragment detection: MF=1 (0x2000) or offset>0 (0x1FFF)
+    let isFragment = (flagsFrag & 0x3FFF) != 0
+    if isFragment {
+        let idx = out.fragmentCount
+        guard idx < out.maxFrames else { return }
+        out.fragmentEndpointIDs[idx] = epID
+        out.fragmentSrcMACs[idx] = srcMAC
+        out.fragmentSrcIPs[idx] = srcAddr
+        out.fragmentDstIPs[idx] = dstAddr
+        out.fragmentIdentifications[idx] = readUInt16BE(ipPtr, 4)
+        out.fragmentFlagsFrags[idx] = flagsFrag
+        out.fragmentProtocols[idx] = rawProtocol
+        out.fragmentFrameIdxs[idx] = frameIdx
+        out.fragmentFrameLens[idx] = frameLen
+        out.fragmentCount += 1
+        return
+    }
+
     let ipHeaderLen = ihl * 4
     let ipPayloadOfs = ipOfs + ipHeaderLen
     let ipPayloadLen = min(totalLength - ipHeaderLen, frameLen - ipPayloadOfs)
@@ -135,6 +177,8 @@ private func parseOneIPv4(
         out.unreachClientIPs[idx] = srcAddr
         out.unreachRawOfs[idx] = baseOfs + ipOfs
         out.unreachRawLen[idx] = frameLen - ipOfs
+        out.unreachCodes[idx] = 2   // Protocol Unreachable
+        out.unreachTypes[idx] = 3   // Destination Unreachable
         out.unreachCount += 1
     }
 }

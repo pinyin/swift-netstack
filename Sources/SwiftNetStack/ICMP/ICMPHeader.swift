@@ -103,15 +103,23 @@ public func buildICMPEchoReplyHeader(
     return ofs
 }
 
-/// Write Ethernet+IPv4+ICMP Protocol Unreachable (Type 3 Code 2) headers into IOBuffer.output.
+/// Write Ethernet+IPv4+ICMP Unreachable headers into IOBuffer.output.
 /// Returns the output offset, or -1 if full.
 /// The original IP packet data is referenced from IOBuffer.input (zero-copy).
+///
+/// - Parameters:
+///   - code: ICMP code — 2 (Protocol Unreachable, default), 3 (Port Unreachable), or 4 (Fragmentation Needed).
+///   - type: ICMP type — 3 (Destination Unreachable, default) or 11 (Time Exceeded).
+///   - payloadLen: Length of the original IP packet excerpt to be appended after the ICMP header (default 28).
 public func buildICMPUnreachableHeader(
     io: IOBuffer,
     hostMAC: MACAddress,
     clientMAC: MACAddress,
     gatewayIP: IPv4Address,
-    clientIP: IPv4Address
+    clientIP: IPv4Address,
+    code: UInt8 = 2,
+    type: UInt8 = 3,
+    payloadLen: Int = 28
 ) -> Int {
     let hdrLen = 14 + 20 + 8  // Ethernet + IPv4 + ICMP header
     guard let ptr = io.allocOutput(hdrLen) else { return -1 }
@@ -122,16 +130,16 @@ public func buildICMPUnreachableHeader(
     hostMAC.write(to: ptr.advanced(by: 6))
     writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
 
-    // IPv4 (totalLength written later by checksum finalizer ... actually we don't finalize)
+    // IPv4: totalLength matches actual ICMP message size
     let ipPtr = ptr.advanced(by: ethHeaderLen)
-    let ipTotalLen = 20 + 8 + 28  // IP hdr + ICMP hdr + max payload (28)
+    let ipTotalLen = 20 + 8 + payloadLen
     writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .icmp,
                     srcIP: gatewayIP, dstIP: clientIP)
 
-    // ICMP header: Type 3, Code 2
+    // ICMP header
     let icmpPtr = ipPtr.advanced(by: ipv4HeaderLen)
-    icmpPtr.storeBytes(of: UInt8(3), as: UInt8.self)
-    icmpPtr.advanced(by: 1).storeBytes(of: UInt8(2), as: UInt8.self)
+    icmpPtr.storeBytes(of: type, as: UInt8.self)
+    icmpPtr.advanced(by: 1).storeBytes(of: code, as: UInt8.self)
     writeUInt16BE(0, to: icmpPtr.advanced(by: 2))
     writeUInt32BE(0, to: icmpPtr.advanced(by: 4))
 

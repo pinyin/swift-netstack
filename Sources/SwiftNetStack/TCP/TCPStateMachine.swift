@@ -20,6 +20,12 @@ struct SendSequence {
     var una: UInt32    // oldest unacknowledged sequence number
     var wnd: UInt32    // peer's receive window (post-scaling, actual bytes)
 
+    // RFC 5681 congestion control
+    var cwnd: UInt32 = 4380       // IW per §3.1: min(4*MSS, max(2*MSS, 4380))
+    var ssthresh: UInt32 = 65535  // slow start threshold (TCP_MAXWIN)
+    var recover: UInt32 = 0       // snd.nxt at loss detection (RFC 6675 §5)
+    var inRecovery: Bool = false
+
     /// Bytes in flight (sent but not acknowledged).
     var bytesInFlight: UInt32 { nxt &- una }
 }

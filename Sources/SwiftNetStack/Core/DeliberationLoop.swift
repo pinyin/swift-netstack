@@ -24,6 +24,12 @@ public struct DeliberationLoop {
     /// Per-phase cumulative CPU time for hotspot analysis.
     public var phaseTiming = PhaseTiming()
 
+    /// Timestamp of last ARP reap (seconds since epoch).
+    private var lastARPReapSec: UInt64 = 0
+
+    /// IPv4 fragment reassembly state machine.
+    private var fragmentReassembly = FragmentReassembly(maxReassemblies: 16)
+
     // ── Pre-allocated SoA infrastructure ──
     private let io: IOBuffer
     private let parseOutput: ParseOutput
@@ -86,11 +92,23 @@ public struct DeliberationLoop {
         // ── Dynamic poll timeout ──
         let nowSec = UInt64(Darwin.time(nil))
         let nowUs = monotonicMicros()
-        if let deadline = natTable.nextDelayedACKDeadline() {
+
+        // Periodic ARP reap (every 60 seconds)
+        if nowSec - lastARPReapSec > 60 {
+            arpMapping.reapExpired(now: nowSec)
+            lastARPReapSec = nowSec
+        }
+        // Pick the earliest deadline among delayed ACKs and RTO timers
+        var earliestDeadline: UInt64?
+        if let ackDL = natTable.nextDelayedACKDeadline() { earliestDeadline = ackDL }
+        if let rtoDL = natTable.nextRTODeadline() {
+            if earliestDeadline == nil || rtoDL < earliestDeadline! { earliestDeadline = rtoDL }
+        }
+        if let deadline = earliestDeadline {
             let deltaUs = deadline > nowUs ? deadline - nowUs : 0
             transport.pollTimeout = Int32(max(1, Int(deltaUs / 1000)))
         } else {
-            transport.pollTimeout = 100
+            transport.pollTimeout = 5  // 5ms fallback (was 100ms)
         }
 
         // ── Phase 1: Poll ──
@@ -144,6 +162,34 @@ public struct DeliberationLoop {
         }
         phaseTiming.icmp &+= cpuNanos() - tICMP
 
+        // ── Phase 8.5: IPv4 Fragment Reassembly ──
+        if parseOutput.fragmentCount > 0 {
+            for i in 0..<parseOutput.fragmentCount {
+                let frameIdx = parseOutput.fragmentFrameIdxs[i]
+                let framePtr = io.framePtr(frameIdx)
+                let result = fragmentReassembly.processFragment(
+                    framePtr: framePtr,
+                    frameLen: parseOutput.fragmentFrameLens[i],
+                    frameIndex: frameIdx,
+                    identification: parseOutput.fragmentIdentifications[i],
+                    flagsFrag: parseOutput.fragmentFlagsFrags[i],
+                    srcIP: parseOutput.fragmentSrcIPs[i],
+                    dstIP: parseOutput.fragmentDstIPs[i],
+                    protocol: parseOutput.fragmentProtocols[i],
+                    now: nowSec, io: io
+                )
+                // Reassembled datagram ready — re-inject into parse pipeline.
+                // The reassembled payload is in io.output; for now the caller
+                // could dispatch it directly. Future: re-parse the assembled datagram.
+                if let _ = result {
+                    // Reassembly complete. The assembled payload is in io.output.
+                    // TODO: dispatch to transport layer (e.g., via natTable).
+                }
+            }
+            // Periodic reap of expired fragment reassemblies (every 30s)
+            fragmentReassembly.reapExpired(now: nowSec)
+        }
+
         // ── Phase 9: UDP ──
         let tUDP = cpuNanos()
         outBatch.reset()
@@ -175,6 +221,7 @@ public struct DeliberationLoop {
         natTable.processTCPRound(
             out: parseOutput, io: io,
             streamReads: result.streamReads,
+            streamDataBuffer: result.streamDataBuffer,
             streamHangup: result.streamHangup,
             streamConnects: result.streamConnects,
             transport: &transport,
@@ -279,18 +326,21 @@ public struct DeliberationLoop {
 
     private mutating func processICMPUnreachable(outBatch: OutBatch) {
         for i in 0..<parseOutput.unreachCount {
+            // Compute payload length first so the IPv4 totalLength is accurate.
+            let copyLen = min(28, parseOutput.unreachRawLen[i])
             let hdrOfs = buildICMPUnreachableHeader(
                 io: io,
                 hostMAC: hostMAC,
                 clientMAC: parseOutput.unreachSrcMACs[i],
                 gatewayIP: parseOutput.unreachGatewayIPs[i],
-                clientIP: parseOutput.unreachClientIPs[i]
+                clientIP: parseOutput.unreachClientIPs[i],
+                code: parseOutput.unreachCodes[i],
+                type: parseOutput.unreachTypes[i],
+                payloadLen: copyLen
             )
             guard hdrOfs >= 0 else { break }
             let idx = outBatch.count
             guard idx < outBatch.maxFrames else { break }
-            // Payload is the original IP header + first 8 bytes of transport
-            let copyLen = min(28, parseOutput.unreachRawLen[i])
             outBatch.hdrOfs[idx] = hdrOfs
             outBatch.hdrLen[idx] = ethHeaderLen + ipv4HeaderLen + 8  // 42
             outBatch.payOfs[idx] = parseOutput.unreachRawOfs[i]
@@ -326,7 +376,8 @@ public struct DeliberationLoop {
                     outBatch: outBatch, io: io
                 )
             } else {
-                natTable.processUDP(
+                let key = NATKey(vmIP: srcIP, vmPort: srcPort, dstIP: dstIP, dstPort: dstPort, protocol: .udp)
+                let handled = natTable.processUDP(
                     srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
                     srcPort: srcPort, dstPort: dstPort,
                     payloadOfs: payloadOfs, payloadLen: payloadLen,
@@ -336,6 +387,24 @@ public struct DeliberationLoop {
                     io: io,
                     nowSec: nowSec
                 )
+                if !handled {
+                    // No socket listener and NAT table at capacity → Port Unreachable
+                    let idx = parseOutput.unreachCount
+                    if idx < parseOutput.maxFrames {
+                        // payloadOfs points to UDP payload. IP header is 28 bytes back
+                        // (20-byte IPv4 + 8-byte UDP). This is the absolute offset in io.input.
+                        let ipHdrOfs = payloadOfs - ipv4HeaderLen - udpHeaderLen
+                        parseOutput.unreachEndpointIDs[idx] = epID
+                        parseOutput.unreachSrcMACs[idx] = srcMAC
+                        parseOutput.unreachGatewayIPs[idx] = dstIP
+                        parseOutput.unreachClientIPs[idx] = srcIP
+                        parseOutput.unreachRawOfs[idx] = ipHdrOfs
+                        parseOutput.unreachRawLen[idx] = ipv4HeaderLen + udpHeaderLen + payloadLen
+                        parseOutput.unreachCodes[idx] = 3   // Port Unreachable
+                        parseOutput.unreachTypes[idx] = 3   // Destination Unreachable
+                        parseOutput.unreachCount += 1
+                    }
+                }
             }
         }
     }

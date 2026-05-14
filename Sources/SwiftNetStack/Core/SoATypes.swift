@@ -120,6 +120,10 @@ public final class ParseOutput {
     public let unreachClientIPs: UnsafeMutableBufferPointer<IPv4Address>
     public let unreachRawOfs: UnsafeMutableBufferPointer<Int>
     public let unreachRawLen: UnsafeMutableBufferPointer<Int>
+    /// ICMP code per unreachable entry (2=Protocol, 3=Port, 4=Frag Needed).
+    public let unreachCodes: UnsafeMutableBufferPointer<UInt8>
+    /// ICMP type per unreachable entry (3=Dest Unreachable, 11=Time Exceeded).
+    public let unreachTypes: UnsafeMutableBufferPointer<UInt8>
     public var unreachCount: Int = 0
 
     // ── UDP ──
@@ -142,6 +146,18 @@ public final class ParseOutput {
     public let dnsPayloadOfs: UnsafeMutableBufferPointer<Int>
     public let dnsPayloadLen: UnsafeMutableBufferPointer<Int>
     public var dnsCount: Int = 0
+
+    // ── IPv4 Fragment ──
+    public let fragmentEndpointIDs: UnsafeMutableBufferPointer<Int>
+    public let fragmentSrcMACs: UnsafeMutableBufferPointer<MACAddress>
+    public let fragmentSrcIPs: UnsafeMutableBufferPointer<IPv4Address>
+    public let fragmentDstIPs: UnsafeMutableBufferPointer<IPv4Address>
+    public let fragmentIdentifications: UnsafeMutableBufferPointer<UInt16>
+    public let fragmentFlagsFrags: UnsafeMutableBufferPointer<UInt16>
+    public let fragmentProtocols: UnsafeMutableBufferPointer<UInt8>
+    public let fragmentFrameIdxs: UnsafeMutableBufferPointer<Int>
+    public let fragmentFrameLens: UnsafeMutableBufferPointer<Int>
+    public var fragmentCount: Int = 0
 
     // ── DHCP ──
     public let dhcpEndpointIDs: UnsafeMutableBufferPointer<Int>
@@ -179,6 +195,8 @@ public final class ParseOutput {
         unreachClientIPs = .allocate(capacity: n)
         unreachRawOfs = .allocate(capacity: n)
         unreachRawLen = .allocate(capacity: n)
+        unreachCodes = .allocate(capacity: n)
+        unreachTypes = .allocate(capacity: n)
 
         udpEndpointIDs = .allocate(capacity: n)
         udpSrcMACs = .allocate(capacity: n)
@@ -197,6 +215,16 @@ public final class ParseOutput {
         dnsPayloadOfs = .allocate(capacity: n)
         dnsPayloadLen = .allocate(capacity: n)
 
+        fragmentEndpointIDs = .allocate(capacity: n)
+        fragmentSrcMACs = .allocate(capacity: n)
+        fragmentSrcIPs = .allocate(capacity: n)
+        fragmentDstIPs = .allocate(capacity: n)
+        fragmentIdentifications = .allocate(capacity: n)
+        fragmentFlagsFrags = .allocate(capacity: n)
+        fragmentProtocols = .allocate(capacity: n)
+        fragmentFrameIdxs = .allocate(capacity: n)
+        fragmentFrameLens = .allocate(capacity: n)
+
         dhcpEndpointIDs = .allocate(capacity: n)
         dhcpSrcMACs = .allocate(capacity: n)
         dhcpPackets = .allocate(capacity: n)
@@ -205,7 +233,7 @@ public final class ParseOutput {
     /// Zero all counters. No memory ops — just integer writes.
     public func reset() {
         tcpCount = 0; arpCount = 0; icmpEchoCount = 0; unreachCount = 0
-        udpCount = 0; dnsCount = 0; dhcpCount = 0
+        udpCount = 0; dnsCount = 0; dhcpCount = 0; fragmentCount = 0
     }
 
     deinit {
@@ -232,6 +260,8 @@ public final class ParseOutput {
         unreachClientIPs.deallocate()
         unreachRawOfs.deallocate()
         unreachRawLen.deallocate()
+        unreachCodes.deallocate()
+        unreachTypes.deallocate()
         udpEndpointIDs.deallocate()
         udpSrcMACs.deallocate()
         udpSrcIPs.deallocate()
@@ -247,6 +277,16 @@ public final class ParseOutput {
         dnsSrcPorts.deallocate()
         dnsPayloadOfs.deallocate()
         dnsPayloadLen.deallocate()
+        fragmentEndpointIDs.deallocate()
+        fragmentSrcMACs.deallocate()
+        fragmentSrcIPs.deallocate()
+        fragmentDstIPs.deallocate()
+        fragmentIdentifications.deallocate()
+        fragmentFlagsFrags.deallocate()
+        fragmentProtocols.deallocate()
+        fragmentFrameIdxs.deallocate()
+        fragmentFrameLens.deallocate()
+
         dhcpEndpointIDs.deallocate()
         dhcpSrcMACs.deallocate()
         dhcpPackets.deallocate()

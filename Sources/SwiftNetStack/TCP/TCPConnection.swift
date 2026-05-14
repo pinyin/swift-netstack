@@ -112,6 +112,17 @@ struct SACKScoreboard {
         return false
     }
 
+    /// Left edge of the first SACK block at or after `seq`, or nil if none.
+    func firstSackedAfter(from seq: UInt32) -> UInt32? {
+        let n = Int(count)
+        var result: UInt32? = nil
+        for i in 0..<n {
+            let l = leftAt(i)
+            if l >= seq, result == nil || l < result! { result = l }
+        }
+        return result
+    }
+
     /// Remove blocks fully before `seq` (acknowledged data).
     mutating func ackThrough(_ seq: UInt32) {
         let n = Int(count)
@@ -247,16 +258,37 @@ final class TCPConnection {
     /// Tracked so we can send a window update when the queue drains.
     public var lastAdvertisedWindow: UInt32 = 262144
 
+    // MARK: - RFC 6298 RTO (Retransmission Timeout)
+
+    /// Current RTO value in microseconds. Initial 1 second per RFC 6298 §2.
+    public var rtoValue: UInt64 = 1_000_000
+    /// Monotonic-µs deadline when RTO next fires. 0 when timer is not armed.
+    public var rtoDeadline: UInt64 = 0
+    /// Number of consecutive RTO expirations without new data ACKed.
+    public var rtoBackoffCount: UInt8 = 0
+    /// Smoothed RTT estimate in microseconds (RFC 6298 §2).
+    public var srtt: UInt64 = 0
+    /// RTT variance estimate in microseconds (RFC 6298 §2).
+    public var rttvar: UInt64 = 0
+    /// Monotonic-µs timestamp when the first unacked data was sent (for RTT sample).
+    public var rtoSendTime: UInt64 = 0
+    /// snd.nxt at the time rtoSendTime was recorded. When snd.una passes this,
+    /// we have a valid RTT sample.
+    public var rtoMeasuredSeq: UInt32 = 0
+    /// True when the outstanding send is a retransmission (Karn's algorithm).
+    public var rtoIsRetransmit: Bool = false
+
     public init(
         connectionID: UInt64, posixFD: Int32, state: TCPState,
         vmMAC: MACAddress, vmIP: IPv4Address, vmPort: UInt16,
         dstIP: IPv4Address, dstPort: UInt16, endpointID: Int,
-        hostMAC: MACAddress
+        hostMAC: MACAddress, mss: Int = 1460
     ) {
         self.connectionID = connectionID
         self.posixFD = posixFD
         self.state = state
-        self.snd = SendSequence(nxt: 0, una: 0, wnd: 65535)
+        let iw = UInt32(min(4 * mss, max(2 * mss, 4380)))
+        self.snd = SendSequence(nxt: 0, una: 0, wnd: 65535, cwnd: iw)
         self.rcv = RecvSequence(nxt: 0, initialSeq: 0)
         self.vmMAC = vmMAC; self.vmIP = vmIP; self.vmPort = vmPort
         self.dstIP = dstIP; self.dstPort = dstPort
@@ -317,5 +349,142 @@ final class TCPConnection {
     /// Remove written bytes from the front of the external send queue.
     public func drainExternalSend(_ delta: Int) {
         externalSendQueue.dequeue(delta)
+    }
+
+    // MARK: - Reassembly buffer (out-of-order VM→external data)
+
+    /// Sorted list of out-of-order segments awaiting gap fill.
+    /// Each entry is (seq, data). When a segment arrives that fills the gap at
+    /// rcv.nxt, all contiguous buffered segments are drained and delivered
+    /// to the external send queue in order.
+    var oooSegments: [(seq: UInt32, data: [UInt8])] = []
+    var oooTotalBytes: Int = 0
+    static let oooMaxBytes: Int = 256 * 1024
+
+    /// Buffer an out-of-order segment. Overlapping segments are merged.
+    /// Returns true if buffered, false if the buffer is full.
+    func bufferOOO(seq: UInt32, data: UnsafeRawPointer, len: Int) -> Bool {
+        guard len > 0, oooTotalBytes + len <= Self.oooMaxBytes else { return false }
+        let bytes = [UInt8](UnsafeRawBufferPointer(start: data, count: len))
+        return _bufferOOO(seq: seq, bytes: bytes)
+    }
+
+    private func _bufferOOO(seq: UInt32, bytes: [UInt8]) -> Bool {
+        let endSeq = seq &+ UInt32(bytes.count)
+        guard endSeq > seq else { return false }
+
+        // Find insertion index (maintain sort by seq)
+        var idx = 0
+        while idx < oooSegments.count && oooSegments[idx].seq < seq { idx += 1 }
+
+        // Consume any fully-contained existing segments (must start at or after new seq)
+        while idx < oooSegments.count && oooSegments[idx].seq >= seq && oooSegments[idx].seq &+ UInt32(oooSegments[idx].data.count) <= endSeq {
+            oooTotalBytes -= oooSegments[idx].data.count
+            oooSegments.remove(at: idx)
+        }
+
+        // Merge with previous if overlapping
+        if idx > 0 {
+            let prevEnd = oooSegments[idx - 1].seq &+ UInt32(oooSegments[idx - 1].data.count)
+            if seq <= prevEnd {
+                // Extend previous segment if new data goes beyond it
+                if endSeq > prevEnd {
+                    let overlap = Int(prevEnd &- seq)
+                    let extra = bytes[overlap...]
+                    oooSegments[idx - 1].data.append(contentsOf: extra)
+                    oooTotalBytes += extra.count
+                }
+                // Check if this merged segment now overlaps with next
+                let newEnd = oooSegments[idx - 1].seq &+ UInt32(oooSegments[idx - 1].data.count)
+                while idx < oooSegments.count && oooSegments[idx].seq <= newEnd {
+                    let nextEnd = oooSegments[idx].seq &+ UInt32(oooSegments[idx].data.count)
+                    if nextEnd > newEnd {
+                        let overlap = Int(newEnd &- oooSegments[idx].seq)
+                        let extra = oooSegments[idx].data[overlap...]
+                        oooSegments[idx - 1].data.append(contentsOf: extra)
+                        oooTotalBytes += extra.count
+                    }
+                    oooTotalBytes -= oooSegments[idx].data.count
+                    oooSegments.remove(at: idx)
+                }
+                return true
+            }
+        }
+
+        // Merge with next if overlapping
+        if idx < oooSegments.count && endSeq >= oooSegments[idx].seq {
+            let nextStart = oooSegments[idx].seq
+            let nextEnd = nextStart &+ UInt32(oooSegments[idx].data.count)
+            if endSeq < nextEnd {
+                // Trim new data to not overlap next segment
+                let keep = Int(nextStart &- seq)
+                if keep <= 0 { return true }
+                oooSegments.insert((seq, Array(bytes[0..<keep])), at: idx)
+                oooTotalBytes += keep
+            } else {
+                // New data completely covers next segment(s) — replace
+                oooTotalBytes -= oooSegments[idx].data.count
+                oooSegments[idx] = (seq, bytes)
+                oooTotalBytes += bytes.count
+                // Merge any subsequent segments covered by this one
+                let finalEnd = seq &+ UInt32(bytes.count)
+                let j = idx + 1
+                while j < oooSegments.count && oooSegments[j].seq &+ UInt32(oooSegments[j].data.count) <= finalEnd {
+                    oooTotalBytes -= oooSegments[j].data.count
+                    oooSegments.remove(at: j)
+                }
+                if j < oooSegments.count && oooSegments[j].seq <= finalEnd {
+                    let overlap = Int(finalEnd &- oooSegments[j].seq)
+                    if overlap < oooSegments[j].data.count {
+                        let extra = oooSegments[j].data[overlap...]
+                        oooSegments[idx].data.append(contentsOf: extra)
+                        oooTotalBytes += extra.count
+                    }
+                    oooTotalBytes -= oooSegments[j].data.count
+                    oooSegments.remove(at: j)
+                }
+            }
+            return true
+        }
+
+        // No overlap — insert as new segment
+        oooSegments.insert((seq, bytes), at: idx)
+        oooTotalBytes += bytes.count
+        return true
+    }
+
+    /// Discard or trim buffered segments that are now behind rcv.nxt
+    /// (already delivered via a gap-filling segment that partially overlapped).
+    func trimOOO(rcvNxt: UInt32) {
+        while !oooSegments.isEmpty && oooSegments[0].seq < rcvNxt {
+            let segEnd = oooSegments[0].seq &+ UInt32(oooSegments[0].data.count)
+            if segEnd <= rcvNxt {
+                oooTotalBytes -= oooSegments[0].data.count
+                oooSegments.removeFirst()
+            } else {
+                let overlap = Int(rcvNxt &- oooSegments[0].seq)
+                let trimmed = Array(oooSegments[0].data[overlap...])
+                oooTotalBytes -= oooSegments[0].data.count
+                oooSegments[0].seq = rcvNxt
+                oooSegments[0].data = trimmed
+                oooTotalBytes += trimmed.count
+                break
+            }
+        }
+    }
+
+    /// Drain contiguous segments starting at rcv.nxt.
+    /// Returns the concatenated data and new rcv.nxt, or nil if no data is contiguous.
+    func drainOOO(rcvNxt: UInt32) -> (data: [UInt8], newNxt: UInt32)? {
+        guard !oooSegments.isEmpty, oooSegments[0].seq == rcvNxt else { return nil }
+        var result: [UInt8] = []
+        var nxt = rcvNxt
+        while !oooSegments.isEmpty && oooSegments[0].seq == nxt {
+            let seg = oooSegments.removeFirst()
+            oooTotalBytes -= seg.data.count
+            result.append(contentsOf: seg.data)
+            nxt = nxt &+ UInt32(seg.data.count)
+        }
+        return (result, nxt)
     }
 }

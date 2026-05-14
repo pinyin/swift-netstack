@@ -145,8 +145,8 @@ import Darwin
     let data2: [UInt8] = [40, 50, 60, 70]
     _ = data2.withUnsafeBytes { conn.bufferOOO(seq: 103, data: $0.baseAddress!, len: data2.count) }
 
-    // Adjacent segments NOT merged — kept separate
-    #expect(conn.oooSegments.count == 2)
+    // Adjacent segments merged into single buffer
+    #expect(conn.oooSegments.count == 1)
     #expect(conn.oooTotalBytes == 7)
 
     // Drain
@@ -195,8 +195,8 @@ import Darwin
     _ = [UInt8]([3, 3, 3]).withUnsafeBytes { conn.bufferOOO(seq: 15, data: $0.baseAddress!, len: 3) }  // 15-17
     _ = [UInt8]([2, 2, 2]).withUnsafeBytes { conn.bufferOOO(seq: 12, data: $0.baseAddress!, len: 3) }  // 12-14 — fills gap
 
-    // Adjacent segments kept separate (no merge): three segments covering 10-17
-    #expect(conn.oooSegments.count == 3)
+    // All three segments adjacent → merged into one covering 10-17
+    #expect(conn.oooSegments.count == 1)
     #expect(conn.oooTotalBytes == 8)
 
     conn.rcv.nxt = 10
@@ -224,8 +224,8 @@ import Darwin
     let data2: [UInt8] = [0x43, 0x44, 0x45, 0x46, 0x47]  // C, D, E, F, G
     _ = data2.withUnsafeBytes { conn.bufferOOO(seq: 102, data: $0.baseAddress!, len: data2.count) }
 
-    // Adjacent segments kept separate (not merged): 2 segments, 7 bytes total
-    #expect(conn.oooSegments.count == 2, "Should have 2 segments (adjacent, not merged)")
+    // Adjacent segments merged into single buffer: 1 segment, 7 bytes total
+    #expect(conn.oooSegments.count == 1, "Should have 1 segment (adjacent, merged)")
     #expect(conn.oooTotalBytes == 7, "Should have 7 bytes total")
 
     conn.rcv.nxt = 100

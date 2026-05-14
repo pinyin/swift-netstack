@@ -372,7 +372,7 @@ final class TCPConnection {
     static let oooMaxBytes: Int = 256 * 1024
 
     /// Buffer an out-of-order segment. Data is copied into an owned buffer.
-    /// Overlaps are resolved by trimming (no segment merging).
+    /// Overlaps are resolved by trimming; adjacent segments are merged.
     /// Returns true if buffered, false if the buffer is full.
     func bufferOOO(seq: UInt32, data: UnsafeRawPointer, len: Int) -> Bool {
         guard len > 0, oooTotalBytes + len <= Self.oooMaxBytes else { return false }
@@ -386,8 +386,7 @@ final class TCPConnection {
     }
 
     /// Insert a segment into the sorted OOO list.
-    /// Resolves overlaps by trimming (discarding duplicate ranges).
-    /// NEVER merges segments — adjacent segments stay separate.
+    /// Resolves overlaps by trimming; merges adjacent segments into a single buffer.
     private func insertOOO(seq: UInt32, base: UnsafeMutableRawPointer, offset: Int, len: Int) {
         var seq = seq
         var offset = offset
@@ -437,7 +436,55 @@ final class TCPConnection {
 
         guard len > 0 else { base.deallocate(); return }
 
-        oooSegments.insert((seq, base, offset, len), at: idx)
+        // Merge with previous segment if adjacent (seq == prevEnd).
+        var merged = false
+        if idx > 0 {
+            let prev = oooSegments[idx - 1]
+            let prevEnd = prev.seq &+ UInt32(prev.len)
+            if seq == prevEnd {
+                let mergedLen = prev.len + len
+                let buf = UnsafeMutableRawPointer.allocate(byteCount: mergedLen, alignment: 1)
+                buf.copyMemory(from: prev.base + prev.offset, byteCount: prev.len)
+                (buf + prev.len).copyMemory(from: base + offset, byteCount: len)
+                prev.base.deallocate()
+                base.deallocate()
+                oooSegments[idx - 1] = (prev.seq, buf, 0, mergedLen)
+
+                // If now adjacent to next segment, merge again (three-way).
+                let mergedEnd = prev.seq &+ UInt32(mergedLen)
+                if idx < oooSegments.count, mergedEnd == oooSegments[idx].seq {
+                    let next = oooSegments[idx]
+                    let tripleLen = mergedLen + next.len
+                    let triple = UnsafeMutableRawPointer.allocate(byteCount: tripleLen, alignment: 1)
+                    triple.copyMemory(from: buf, byteCount: mergedLen)
+                    (triple + mergedLen).copyMemory(from: next.base + next.offset, byteCount: next.len)
+                    buf.deallocate()
+                    next.base.deallocate()
+                    oooSegments[idx - 1] = (prev.seq, triple, 0, tripleLen)
+                    oooSegments.remove(at: idx)
+                }
+                merged = true
+            }
+        }
+
+        // Merge with next segment if adjacent (endSeq == nextSeq).
+        if !merged, idx < oooSegments.count {
+            let next = oooSegments[idx]
+            if endSeq == next.seq {
+                let mergedLen = len + next.len
+                let buf = UnsafeMutableRawPointer.allocate(byteCount: mergedLen, alignment: 1)
+                buf.copyMemory(from: base + offset, byteCount: len)
+                (buf + len).copyMemory(from: next.base + next.offset, byteCount: next.len)
+                base.deallocate()
+                next.base.deallocate()
+                oooSegments[idx] = (seq, buf, 0, mergedLen)
+                merged = true
+            }
+        }
+
+        if !merged {
+            oooSegments.insert((seq, base, offset, len), at: idx)
+        }
         oooTotalBytes += len
     }
 

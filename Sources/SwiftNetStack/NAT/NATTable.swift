@@ -235,90 +235,111 @@ public struct NATTable {
 
     // MARK: - Delayed ACK (RFC 1122 timer-based coalescing)
 
-    /// Returns the earliest monotonic-µs deadline among all pending delayed ACKs,
-    /// or nil if no delayed ACKs are pending.
-    public func nextDelayedACKDeadline() -> UInt64? {
-        var earliest: UInt64?
-        for entry in tcpEntries.values {
-            guard entry.connection.pendingDelayedACK else { continue }
-            let dl = entry.connection.delayedACKDeadline
-            if earliest == nil || dl < earliest! { earliest = dl }
-        }
-        return earliest
-    }
+    // MARK: - Deadline queries (single pass)
 
-    // MARK: - RTO timer (RFC 6298)
-
-    /// Returns the earliest RTO deadline across all connections, or nil.
-    public func nextRTODeadline() -> UInt64? {
-        var earliest: UInt64?
+    /// Returns the earliest deadline for each timer category, or nil if none.
+    /// Scans tcpEntries once instead of three separate passes.
+    public func nextDeadlines() -> (ack: UInt64?, rto: UInt64?, persist: UInt64?) {
+        var ackDL: UInt64?
+        var rtoDL: UInt64?
+        var persistDL: UInt64?
         for entry in tcpEntries.values {
             let c = entry.connection
-            let dl = c.rtoDeadline
-            guard dl != 0 else { continue }
-            if earliest == nil || dl < earliest! { earliest = dl }
+            if c.pendingDelayedACK {
+                let dl = c.delayedACKDeadline
+                if ackDL == nil || dl < ackDL! { ackDL = dl }
+            }
+            let rdl = c.rtoDeadline
+            if rdl != 0, rtoDL == nil || rdl < rtoDL! { rtoDL = rdl }
+            let pdl = c.persistDeadline
+            if pdl != 0, persistDL == nil || pdl < persistDL! { persistDL = pdl }
         }
-        return earliest
+        return (ackDL, rtoDL, persistDL)
     }
 
-    /// Returns the earliest persist timer deadline across all connections, or nil.
-    public func nextPersistDeadline() -> UInt64? {
-        var earliest: UInt64?
-        for entry in tcpEntries.values {
-            let dl = entry.connection.persistDeadline
-            guard dl != 0 else { continue }
-            if earliest == nil || dl < earliest! { earliest = dl }
-        }
-        return earliest
-    }
+    // MARK: - Unified timer processing (single pass over tcpEntries)
 
-    /// Check all TCP connections for expired RTO timers. Retransmits from snd.una
-    /// with exponential backoff. Called at the top of processTCPRound.
-    private mutating func checkRTOExpired(
+    /// Process expired RTO, delayed ACK, and persist timers in one pass over
+    /// tcpEntries. Called at the top of processTCPRound.
+    private mutating func processTCPTimers(
         io: IOBuffer, transport: inout PollingTransport, hostMAC: MACAddress, nowUs: UInt64
     ) {
-        for (key, entry) in tcpEntries {
+        for (_, entry) in tcpEntries {
             let c = entry.connection
-            guard c.rtoDeadline != 0 else { continue }
-            guard c.rtoDeadline <= nowUs else { continue }
-            guard let epFD = transport.fdForEndpoint(c.endpointID) else { continue }
 
-            let inFlight = c.snd.nxt &- c.snd.una
-            guard inFlight > 0 else {
-                // All data ACKed — stop the timer
-                tcpEntries[key]?.connection.rtoDeadline = 0
-                continue
+            // ── RTO expiry (RFC 6298) ──
+            if c.rtoDeadline != 0, c.rtoDeadline <= nowUs {
+                if let epFD = transport.fdForEndpoint(c.endpointID) {
+                    let inFlight = c.snd.nxt &- c.snd.una
+                    if inFlight > 0 {
+                        let oldRTO = c.rtoValue
+                        c.rtoBackoffCount = min(6, c.rtoBackoffCount &+ 1)
+                        c.rtoValue = min(60_000_000, oldRTO &* 2)
+                        c.rtoDeadline = nowUs &+ c.rtoValue
+                        c.rtoIsRetransmit = true
+
+                        if let rtData = c.peekRetransmitData(max: min(mss, c.totalQueuedBytes)) {
+                            var rtLen = rtData.len
+                            if let firstSacked = c.sackBlocks.firstSackedAfter(from: c.snd.una) {
+                                let sackedOffset = Int(firstSacked &- c.snd.una)
+                                if sackedOffset > 0, sackedOffset < rtLen { rtLen = sackedOffset }
+                            }
+                            if rtLen > 0 {
+                                stats.rtoExpired += 1
+                                let rr = sendOneDataSegment(
+                                    to: c, seq: c.snd.una, ack: c.rcv.nxt,
+                                    flags: [.ack], data: (rtData.ptr, rtLen),
+                                    via: epFD, hostMAC: hostMAC, io: io)
+                                if rr < 0 { stats.rtoExpiredSendFail += 1 }
+                            } else {
+                                stats.rtoExpiredNoData += 1
+                            }
+                        } else {
+                            stats.rtoExpiredNoData += 1
+                        }
+                    } else {
+                        c.rtoDeadline = 0  // all data ACKed
+                    }
+                }
             }
 
-            // Exponential backoff
-            let oldRTO = c.rtoValue
-            c.rtoBackoffCount = min(6, c.rtoBackoffCount &+ 1)
-            c.rtoValue = min(60_000_000, oldRTO &* 2)  // cap at 60s
-            c.rtoDeadline = nowUs &+ c.rtoValue
-            c.rtoIsRetransmit = true
-
-            // Retransmit from snd.una
-            guard let rtData = c.peekRetransmitData(max: min(mss, c.totalQueuedBytes)) else {
-                stats.rtoExpiredNoData += 1
-                continue
-            }
-            var rtLen = rtData.len
-            if let firstSacked = c.sackBlocks.firstSackedAfter(from: c.snd.una) {
-                let sackedOffset = Int(firstSacked &- c.snd.una)
-                if sackedOffset > 0, sackedOffset < rtLen { rtLen = sackedOffset }
-            }
-            guard rtLen > 0 else {
-                stats.rtoExpiredNoData += 1
-                continue
+            // ── Delayed ACK flush ──
+            if c.pendingDelayedACK, c.delayedACKDeadline <= nowUs {
+                if buildAckFrame(
+                    conn: c, seq: c.delayedACKSeq, ack: c.delayedACKAck,
+                    window: wireWindow(c.availableWindow, scale: c.ourWindowScale),
+                    io: io, transport: &transport
+                ) {
+                    stats.ackFlushedTimer += 1
+                }
+                c.pendingDelayedACK = false
             }
 
-            stats.rtoExpired += 1
-            let rr = sendOneDataSegment(
-                to: c, seq: c.snd.una, ack: c.rcv.nxt,
-                flags: [.ack], data: (rtData.ptr, rtLen),
-                via: epFD, hostMAC: hostMAC, io: io)
-            if rr < 0 { stats.rtoExpiredSendFail += 1 }
-            debugLog("[NAT-TCP-RTO] C\(c.connectionID) expired, backoff=\(c.rtoBackoffCount) rto=\(c.rtoValue)µs retransmit=\(rtLen)B from snd.una=\(c.snd.una) rr=\(rr)\n")
+            // ── Persist timer (RFC 1122 §4.2.2.17) ──
+            if c.persistDeadline != 0, c.persistDeadline <= nowUs,
+               c.state == .established || c.state == .closeWait
+               || c.state == .finWait1 || c.state == .finWait2 {
+                if let epFD = transport.fdForEndpoint(c.endpointID) {
+                    if let data = c.peekSendData(max: 1) {
+                        let rr = sendOneDataSegment(
+                            to: c, seq: c.snd.nxt, ack: c.rcv.nxt,
+                            flags: [.ack], data: (data.ptr, 1),
+                            via: epFD, hostMAC: hostMAC, io: io)
+
+                        let backoffCount = min(6, c.persistBackoffCount &+ 1)
+                        c.persistBackoffCount = backoffCount
+                        let interval = min(60_000_000, c.rtoValue << backoffCount)
+                        c.persistDeadline = nowUs + interval
+
+                        if rr >= 0 {
+                            c.snd.nxt = c.snd.nxt &+ 1
+                            c.sendQueueSent += 1
+                        }
+                    } else {
+                        c.persistDeadline = 0
+                    }
+                }
+            }
         }
     }
 
@@ -444,59 +465,6 @@ public struct NATTable {
                                           payPtr: nil, payLen: 0)
     }
 
-    /// Flush expired delayed ACKs for all connections.
-    private mutating func flushExpiredDelayedACKs(
-        io: IOBuffer, transport: inout PollingTransport, nowUs: UInt64
-    ) {
-        for (_, entry) in tcpEntries {
-            guard entry.connection.pendingDelayedACK else { continue }
-            guard entry.connection.delayedACKDeadline <= nowUs else { continue }
-            if buildAckFrame(
-                conn: entry.connection, seq: entry.connection.delayedACKSeq,
-                ack: entry.connection.delayedACKAck,
-                window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                io: io, transport: &transport
-            ) {
-                stats.ackFlushedTimer += 1
-            }
-            entry.connection.pendingDelayedACK = false
-        }
-    }
-
-    /// Check for expired persist timers (RFC 1122 §4.2.2.17).
-    /// Sends a 1-byte window probe with exponential backoff.
-    private mutating func checkPersistExpired(
-        io: IOBuffer, transport: inout PollingTransport, hostMAC: MACAddress, nowUs: UInt64
-    ) {
-        for (key, entry) in tcpEntries {
-            let c = entry.connection
-            guard c.persistDeadline != 0 else { continue }
-            guard c.persistDeadline <= nowUs else { continue }
-            guard c.state == .established || c.state == .closeWait
-                  || c.state == .finWait1 || c.state == .finWait2 else { continue }
-            guard let epFD = transport.fdForEndpoint(c.endpointID) else { continue }
-
-            guard let data = c.peekSendData(max: 1) else {
-                tcpEntries[key]?.connection.persistDeadline = 0
-                continue
-            }
-
-            let rr = sendOneDataSegment(
-                to: c, seq: c.snd.nxt, ack: c.rcv.nxt,
-                flags: [.ack], data: (data.ptr, 1),
-                via: epFD, hostMAC: hostMAC, io: io)
-
-            let backoffCount = min(6, c.persistBackoffCount &+ 1)
-            tcpEntries[key]?.connection.persistBackoffCount = backoffCount
-            let interval = min(60_000_000, c.rtoValue << backoffCount)
-            tcpEntries[key]?.connection.persistDeadline = nowUs + interval
-
-            if rr >= 0 {
-                tcpEntries[key]?.connection.snd.nxt = c.snd.nxt &+ 1
-                tcpEntries[key]?.connection.sendQueueSent += 1
-            }
-        }
-    }
 
     // MARK: - Window scale helper
 
@@ -561,11 +529,9 @@ public struct NATTable {
         // 2-10 complete between its capture and processTCPRound).
         let freshNowUs = monotonicMicros()
 
-        // ── Step 0: Check RTO expiry and flush expired delayed ACKs ──
+        // ── Step 0: Process TCP timers (RTO, delayed ACK, persist) in one pass ──
         let tAckFlush = cpuNanos()
-        checkRTOExpired(io: io, transport: &transport, hostMAC: hostMAC, nowUs: freshNowUs)
-        flushExpiredDelayedACKs(io: io, transport: &transport, nowUs: freshNowUs)
-        checkPersistExpired(io: io, transport: &transport, hostMAC: hostMAC, nowUs: freshNowUs)
+        processTCPTimers(io: io, transport: &transport, hostMAC: hostMAC, nowUs: freshNowUs)
         stats.tcpAckFlushNs &+= cpuNanos() - tAckFlush
 
         // ── Step 1: Complete non-blocking connects ──
@@ -741,7 +707,7 @@ public struct NATTable {
                 let measurable = entry.connection.rtoMeasuredSeq != 0
                     && (entry.connection.snd.una &- entry.connection.rtoMeasuredSeq) < (1 << 31)
                 if measurable, !entry.connection.rtoIsRetransmit {
-                    let sampleRTT = nowUs &- entry.connection.rtoSendTime
+                    let sampleRTT = freshNowUs &- entry.connection.rtoSendTime
                     let srtt = entry.connection.srtt
                     let rttvar = entry.connection.rttvar
                     if srtt == 0 {
@@ -878,7 +844,22 @@ public struct NATTable {
                 let isPureACK = segToSend.flags == .ack
                 if isPureACK {
                     if entry.connection.pendingDelayedACK {
-                        stats.ackOverwritten += 1
+                        // RFC 5681: duplicate ACKs MUST be sent immediately so the
+                        // sender can count them for fast retransmit (3 dup ACKs).
+                        // If the new ACK echoes the same rcv.nxt, flush the pending
+                        // ACK now and queue the new one — otherwise the sender would
+                        // never see ≥3 identical ACKs within the 200µs window.
+                        if entry.connection.delayedACKAck == segToSend.ack {
+                            _ = buildAckFrame(
+                                conn: entry.connection, seq: entry.connection.delayedACKSeq,
+                                ack: entry.connection.delayedACKAck,
+                                window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
+                                io: io, transport: &transport
+                            )
+                            stats.ackFlushedImmediate += 1
+                        } else {
+                            stats.ackOverwritten += 1
+                        }
                     }
                     stats.ackDeferred += 1
                     entry.connection.pendingDelayedACK = true
@@ -993,7 +974,7 @@ public struct NATTable {
                   || entry.connection.state == .lastAck else { continue }
 
             flushOneConnection(key: key, conn: entry.connection, hostMAC: hostMAC,
-                               transport: &transport, io: io)
+                               transport: &transport, io: io, nowUs: freshNowUs)
         }
         stats.tcpFlushNs &+= cpuNanos() - tFlush
         dirtyConnections.removeAll(keepingCapacity: true)
@@ -1080,7 +1061,8 @@ public struct NATTable {
         key: NATKey, conn: TCPConnection,
         hostMAC: MACAddress,
         transport: inout PollingTransport,
-        io: IOBuffer
+        io: IOBuffer,
+        nowUs: UInt64
     ) {
         // ── Drain sendQueue (external→VM) with inline writes ──
         // Each frame is sent immediately via sendmsg. TCP state (snd.nxt,
@@ -1109,7 +1091,7 @@ public struct NATTable {
                 if canSend <= 0 {
                     // Arm persist timer if blocked by zero receiver window
                     if conn.snd.wnd == 0, conn.totalQueuedBytes > 0, conn.persistDeadline == 0 {
-                        conn.persistDeadline = monotonicMicros() + max(conn.rtoValue, 200_000)
+                        conn.persistDeadline = nowUs + max(conn.rtoValue, 200_000)
                     }
                     break
                 }

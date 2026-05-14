@@ -57,6 +57,10 @@ DEMO_BIN="$PROJECT_DIR/.build/release/SwiftNetStackDemo"
 check_prereqs "$KERNEL" "$INITRD"
 build_demo "$SCRIPT_DIR" "$PROJECT_DIR"
 
+# ── Cleanup stale state from previous runs ────────────────────────────
+
+cleanup_stale_state "$EXT_TARGET"
+
 # ── Host IP & local services ──────────────────────────────────────────
 
 HOST_IP=$(find_host_ip)

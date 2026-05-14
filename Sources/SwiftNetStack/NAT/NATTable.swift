@@ -1453,6 +1453,7 @@ public struct NATTable {
             stats.tcpConnRejected += 1; close(newFD); return
         }
         setNoDelay(newFD)
+        setSocketBuffers(newFD)
 
         guard let pf = findTCPListener(fd: listenerFd) else { close(newFD); return }
         let externalIP = IPv4Address(addr: clientAddr.sin_addr.s_addr.bigEndian)
@@ -1631,6 +1632,7 @@ public struct NATTable {
         guard fd >= 0 else { debugLog("[NAT-TCP-OUT] socket() failed for \(connectIP):\(key.dstPort)\n"); return }
         setNonBlocking(fd)
         setNoDelay(fd)
+        setSocketBuffers(fd)
 
         let connectOK = withSockAddr(ip: connectIP, port: key.dstPort) { sa, saLen in
             Darwin.connect(fd, sa, saLen)

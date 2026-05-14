@@ -26,6 +26,32 @@ EXT_HTTP_PORT="${EXT_HTTP_PORT:-7783}"
 EXT_TCP_ECHO_PORT="${EXT_TCP_ECHO_PORT:-7784}"
 TIMEOUT="${TIMEOUT:-120}"
 
+# ── Pre-test cleanup ──────────────────────────────────────────────────
+
+# cleanup_stale_state [ext_target]
+# Kills stale processes, removes socket files, and clears tc netem from
+# previous runs so ports are free for the current test.
+cleanup_stale_state() {
+    local ext_target="$1"
+
+    # Kill stale processes from prior runs
+    pkill -9 SwiftNetStackDemo 2>/dev/null || true
+    pkill -9 gvproxy           2>/dev/null || true
+    pkill -9 -f echo_servers.py 2>/dev/null || true
+
+    # Remove stale socket files
+    rm -f /tmp/gvproxy-comparison.sock 2>/dev/null || true
+
+    # Remove tc netem from external server
+    if [ -n "$ext_target" ]; then
+        ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$ext_target" \
+            "sudo tc qdisc del dev enp5s0 root 2>/dev/null; sudo tc qdisc del dev eno1 root 2>/dev/null; echo -n" 2>/dev/null || true
+    fi
+
+    # Give killed processes time to release their ports
+    sleep 1
+}
+
 # ── Host IP detection ─────────────────────────────────────────────────
 
 find_host_ip() {

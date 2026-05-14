@@ -29,6 +29,8 @@ public struct DeliberationLoop {
 
     /// IPv4 fragment reassembly state machine.
     private var fragmentReassembly = FragmentReassembly(maxReassemblies: 16)
+    /// Rate limiter for ICMP error messages (RFC 1812 §4.3.2.8).
+    private var icmpErrorLimiter = RateLimiter<IPv4Address>(window: 1, maxRequests: 10)
 
     // ── Pre-allocated SoA infrastructure ──
     private let io: IOBuffer
@@ -330,8 +332,14 @@ public struct DeliberationLoop {
 
     private mutating func processICMPUnreachable(outBatch: OutBatch) {
         for i in 0..<parseOutput.unreachCount {
+            // Rate limit per destination IP to prevent ICMP error floods.
+            let clientIP = parseOutput.unreachClientIPs[i]
+            guard icmpErrorLimiter.allow(clientIP) else { continue }
+
             // Compute payload length first so the IPv4 totalLength is accurate.
             let copyLen = min(28, parseOutput.unreachRawLen[i])
+            let payloadPtr = copyLen > 0
+                ? UnsafeRawPointer(io.inputBase.advanced(by: parseOutput.unreachRawOfs[i])) : nil
             let hdrOfs = buildICMPUnreachableHeader(
                 io: io,
                 hostMAC: hostMAC,
@@ -340,6 +348,7 @@ public struct DeliberationLoop {
                 clientIP: parseOutput.unreachClientIPs[i],
                 code: parseOutput.unreachCodes[i],
                 type: parseOutput.unreachTypes[i],
+                payloadPtr: payloadPtr,
                 payloadLen: copyLen
             )
             guard hdrOfs >= 0 else { break }
@@ -395,15 +404,15 @@ public struct DeliberationLoop {
                     // No socket listener and NAT table at capacity → Port Unreachable
                     let idx = parseOutput.unreachCount
                     if idx < parseOutput.maxFrames {
-                        // payloadOfs points to UDP payload. IP header is 28 bytes back
-                        // (20-byte IPv4 + 8-byte UDP). This is the absolute offset in io.input.
-                        let ipHdrOfs = payloadOfs - ipv4HeaderLen - udpHeaderLen
+                        // Use actual IP header length from parse (may be >20 with IP options).
+                        let ipHdrLen = parseOutput.udpIPHeaderLens[i]
+                        let ipHdrOfs = payloadOfs - ipHdrLen - udpHeaderLen
                         parseOutput.unreachEndpointIDs[idx] = epID
                         parseOutput.unreachSrcMACs[idx] = srcMAC
                         parseOutput.unreachGatewayIPs[idx] = dstIP
                         parseOutput.unreachClientIPs[idx] = srcIP
                         parseOutput.unreachRawOfs[idx] = ipHdrOfs
-                        parseOutput.unreachRawLen[idx] = ipv4HeaderLen + udpHeaderLen + payloadLen
+                        parseOutput.unreachRawLen[idx] = ipHdrLen + udpHeaderLen + payloadLen
                         parseOutput.unreachCodes[idx] = 3   // Port Unreachable
                         parseOutput.unreachTypes[idx] = 3   // Destination Unreachable
                         parseOutput.unreachCount += 1

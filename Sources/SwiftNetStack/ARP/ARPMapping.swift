@@ -41,6 +41,7 @@ public struct ARPEntry {
 public struct ARPMapping {
     public let hostMAC: MACAddress
     private var entries: [UInt32: ARPEntry] = [:]
+    private var rateLimiter = RateLimiter<MACAddress>(window: 1, maxRequests: 100)
 
     /// Build from VMEndpoint list. Gateway IPs are registered with hostMAC.
     public init(hostMAC: MACAddress, endpoints: [VMEndpoint]) {
@@ -103,11 +104,12 @@ public struct ARPMapping {
 
     /// Process an incoming ARP request, writing the reply into IOBuffer.output.
     /// Returns (header offset, header length) or nil if output is full or no reply needed.
-    public func processARPRequest(
+    public mutating func processARPRequest(
         _ arp: ARPFrame, io: IOBuffer
     ) -> (hdrOfs: Int, hdrLen: Int)? {
         guard arp.operation == .request else { return nil }
         guard isKnown(arp.targetIP) else { return nil }
+        guard rateLimiter.allow(arp.senderMAC) else { return nil }
 
         guard let ptr = io.allocOutput(42) else { return nil }
         let ofs = ptr - io.output.baseAddress!

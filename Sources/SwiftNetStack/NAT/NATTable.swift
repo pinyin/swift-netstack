@@ -324,7 +324,7 @@ public struct NATTable {
                || c.state == .finWait1 || c.state == .finWait2 {
                 if let epFD = transport.fdForEndpoint(c.endpointID) {
                     if let data = c.peekSendData(max: 1) {
-                        let rr = sendOneDataSegment(
+                        _ = sendOneDataSegment(
                             to: c, seq: c.snd.nxt, ack: c.rcv.nxt,
                             flags: [.ack], data: (data.ptr, 1),
                             via: epFD, hostMAC: hostMAC, io: io)
@@ -334,10 +334,9 @@ public struct NATTable {
                         let interval = min(60_000_000, c.rtoValue << backoffCount)
                         c.persistDeadline = nowUs + interval
 
-                        if rr >= 0 {
-                            c.snd.nxt = c.snd.nxt &+ 1
-                            c.sendQueueSent += 1
-                        }
+                        // Probe byte does not consume send queue or advance
+                        // snd.nxt — the receiver will drop it if the window
+                        // is still zero, and we retransmit the same byte.
                     } else {
                         c.persistDeadline = 0
                     }
@@ -368,7 +367,7 @@ public struct NATTable {
                 let tsecr = conn.tsRecent
                 opts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: tsecr))
             }
-            opts.append(contentsOf: conn.sackBlocks.buildSACKOption())
+            opts.append(contentsOf: conn.sackBlocks.buildSACKOption(limit: conn.tsOK ? 3 : 4))
             while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
 
             let tcpHdrLen = 20 + opts.count
@@ -736,19 +735,20 @@ public struct NATTable {
                 entry.connection.rtoMeasuredSeq = 0
                 entry.connection.rtoIsRetransmit = false
 
-                // Restart RTO timer if there's still data in flight
+                // Restart RTO timer if there's still data in flight.
+                // Keep rtoSendTime from flushOneConnection (the actual send time)
+                // so RTT samples don't include local processing delay.
                 let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
                 if inFlight > 0 {
-                    let now = monotonicMicros()  // fresh timestamp for deadline
-                    entry.connection.rtoDeadline = now &+ entry.connection.rtoValue
-                    entry.connection.rtoSendTime = now
-                    entry.connection.rtoMeasuredSeq = entry.connection.snd.nxt
+                    entry.connection.rtoDeadline = monotonicMicros() &+ entry.connection.rtoValue
                 } else {
                     entry.connection.rtoDeadline = 0
                 }
             } else if seg.flags.isAck, !seg.flags.isSyn, payloadLen == 0 {
                 // Pure ACK that didn't advance snd.una — track dup ACKs (RFC 5681)
-                let ackVal = entry.connection.snd.una
+                // Use seg.ack (the received ACK value), not snd.una, so that
+                // ACKs with different ack values aren't conflated as duplicates.
+                let ackVal = seg.ack
                 if ackVal == entry.connection.lastAckValue, entry.connection.lastAckValue != 0 {
                     let (sum, didOverflow) = entry.connection.dupAckCount.addingReportingOverflow(1 as UInt8)
                     if !didOverflow { entry.connection.dupAckCount = sum }

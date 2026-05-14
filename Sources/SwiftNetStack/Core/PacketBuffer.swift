@@ -295,7 +295,8 @@ public struct PacketBuffer {
         // Recycle fully consumed Storage chunks that are now unreferenced.
         // The old _views array held references; after replacing with newViews,
         // consumed Storages may have dropped to refcount 0.
-        for var s in consumedStorages {
+        while let s = consumedStorages.popLast() {
+            var s = s
             if isKnownUniquelyReferenced(&s) {
                 ChunkPools.poolFor(chunkCapacity: s.capacity).release(s)
             }

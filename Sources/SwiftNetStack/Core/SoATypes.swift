@@ -135,6 +135,9 @@ public final class ParseOutput {
     public let udpDstPorts: UnsafeMutableBufferPointer<UInt16>
     public let udpPayloadOfs: UnsafeMutableBufferPointer<Int>
     public let udpPayloadLen: UnsafeMutableBufferPointer<Int>
+    /// IP header length per UDP entry (from IHL field). Used for ICMP Port Unreachable
+    /// where the IP header offset must be computed correctly even when IP options exist.
+    public let udpIPHeaderLens: UnsafeMutableBufferPointer<Int>
     public var udpCount: Int = 0
 
     // ── DNS ──
@@ -207,6 +210,7 @@ public final class ParseOutput {
         udpDstPorts = .allocate(capacity: n)
         udpPayloadOfs = .allocate(capacity: n)
         udpPayloadLen = .allocate(capacity: n)
+        udpIPHeaderLens = .allocate(capacity: n)
 
         dnsEndpointIDs = .allocate(capacity: n)
         dnsSrcMACs = .allocate(capacity: n)
@@ -272,6 +276,7 @@ public final class ParseOutput {
         udpDstPorts.deallocate()
         udpPayloadOfs.deallocate()
         udpPayloadLen.deallocate()
+        udpIPHeaderLens.deallocate()
         dnsEndpointIDs.deallocate()
         dnsSrcMACs.deallocate()
         dnsSrcIPs.deallocate()
@@ -360,7 +365,7 @@ public struct SendQueue {
         if readPos > 0 && writePos + n > capacity {
             let cnt = count
             if cnt > 0 {
-                buf.baseAddress!.copyMemory(from: buf.baseAddress! + readPos, byteCount: cnt)
+                memmove(buf.baseAddress!, buf.baseAddress! + readPos, cnt)
             }
             writePos = cnt
             readPos = 0
@@ -384,7 +389,7 @@ public struct SendQueue {
         if readPos > 16384 || readPos * 2 >= writePos && writePos > 16384 {
             let cnt = count
             if cnt > 0 {
-                buf.baseAddress!.copyMemory(from: buf.baseAddress! + readPos, byteCount: cnt)
+                memmove(buf.baseAddress!, buf.baseAddress! + readPos, cnt)
             }
             writePos = cnt
             readPos = 0

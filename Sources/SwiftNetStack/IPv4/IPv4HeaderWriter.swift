@@ -47,6 +47,8 @@ let udpHeaderLen = 8
 /// This avoids recomputing the entire 20-byte checksum in the hot path.
 public func decrementTTL(at ipPtr: UnsafeMutableRawPointer) -> Bool {
     let ttl = ipPtr.load(fromByteOffset: 8, as: UInt8.self)
+    // TTL already 0 — packet is expired, don't modify checksum.
+    guard ttl > 0 else { return false }
     guard ttl > 1 else {
         ipPtr.storeBytes(of: UInt8(0), toByteOffset: 8, as: UInt8.self)
         // TTL=1 → 0: add 0x0100 to checksum (one's complement)

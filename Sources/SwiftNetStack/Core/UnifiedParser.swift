@@ -166,7 +166,8 @@ private func parseOneIPv4(
     case 17: // UDP
         parseOneUDP(ptr: framePtr.advanced(by: ipPayloadOfs), len: ipPayloadLen,
                     epID: epID, srcMAC: srcMAC, srcIP: srcAddr, dstIP: dstAddr,
-                    baseOfs: baseOfs, ipPayloadOfs: ipPayloadOfs, out: out)
+                    baseOfs: baseOfs, ipPayloadOfs: ipPayloadOfs,
+                    ipHeaderLen: ipHeaderLen, out: out)
 
     default:
         // Unknown protocol → ICMP unreachable
@@ -330,7 +331,7 @@ private func parseOneTCP(
 private func parseOneUDP(
     ptr: UnsafeMutableRawPointer, len: Int,
     epID: Int, srcMAC: MACAddress, srcIP: IPv4Address, dstIP: IPv4Address,
-    baseOfs: Int, ipPayloadOfs: Int, out: ParseOutput
+    baseOfs: Int, ipPayloadOfs: Int, ipHeaderLen: Int, out: ParseOutput
 ) {
     guard len >= 8 else { return }
 
@@ -378,6 +379,7 @@ private func parseOneUDP(
         out.udpDstPorts[idx] = dstPort
         out.udpPayloadOfs[idx] = totalPayloadOfs + 8
         out.udpPayloadLen[idx] = payloadLen
+        out.udpIPHeaderLens[idx] = ipHeaderLen
         out.udpCount += 1
     }
 }

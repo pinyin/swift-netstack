@@ -95,9 +95,7 @@ public func buildICMPEchoReplyHeader(
     // RFC 792 checksum: fold pre-computed payload sum with 8-byte header.
     // Addition is commutative, so processing header-last is equivalent to
     // checksumming the full message in one pass. Zero additional payload touch.
-    let sum = payloadSum > 0
-        ? checksumAdd(payloadSum, UnsafeRawPointer(icmpPtr), 8)
-        : checksumAdd(0, UnsafeRawPointer(icmpPtr), 8)
+    let sum = checksumAdd(payloadSum, UnsafeRawPointer(icmpPtr), 8)
     writeUInt16BE(finalizeChecksum(sum), to: icmpPtr.advanced(by: 2))
 
     return ofs
@@ -110,6 +108,7 @@ public func buildICMPEchoReplyHeader(
 /// - Parameters:
 ///   - code: ICMP code — 2 (Protocol Unreachable, default), 3 (Port Unreachable), or 4 (Fragmentation Needed).
 ///   - type: ICMP type — 3 (Destination Unreachable, default) or 11 (Time Exceeded).
+///   - payloadPtr: Pointer to the original IP packet data to include in the ICMP payload (first 28 bytes by RFC 792).
 ///   - payloadLen: Length of the original IP packet excerpt to be appended after the ICMP header (default 28).
 public func buildICMPUnreachableHeader(
     io: IOBuffer,
@@ -119,6 +118,7 @@ public func buildICMPUnreachableHeader(
     clientIP: IPv4Address,
     code: UInt8 = 2,
     type: UInt8 = 3,
+    payloadPtr: UnsafeRawPointer? = nil,
     payloadLen: Int = 28
 ) -> Int {
     let hdrLen = 14 + 20 + 8  // Ethernet + IPv4 + ICMP header
@@ -140,13 +140,15 @@ public func buildICMPUnreachableHeader(
     let icmpPtr = ipPtr.advanced(by: ipv4HeaderLen)
     icmpPtr.storeBytes(of: type, as: UInt8.self)
     icmpPtr.advanced(by: 1).storeBytes(of: code, as: UInt8.self)
-    writeUInt16BE(0, to: icmpPtr.advanced(by: 2))
+    writeUInt16BE(0, to: icmpPtr.advanced(by: 2))  // placeholder
     writeUInt32BE(0, to: icmpPtr.advanced(by: 4))
 
-    // ICMP checksum: the payload is referenced separately, so we write a placeholder.
-    // The checksum depends on the payload which the caller tracks via OutBatch.
-    // The OS doesn't validate ICMP checksums on AF_UNIX, so a placeholder is acceptable
-    // for the virtio-net use case. If needed, the caller can recompute.
+    // Compute ICMP checksum over header + payload.
+    var sum = checksumAdd(0, UnsafeRawPointer(icmpPtr), 8)
+    if let pptr = payloadPtr, payloadLen > 0 {
+        sum = checksumAdd(sum, pptr, payloadLen)
+    }
+    writeUInt16BE(finalizeChecksum(sum), to: icmpPtr.advanced(by: 2))
 
     return ofs
 }

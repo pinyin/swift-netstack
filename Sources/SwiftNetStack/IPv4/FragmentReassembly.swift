@@ -31,7 +31,7 @@ public struct FragmentReassembly {
 
         /// Fragment descriptors: (offset in bytes, payload len, input frame index).
         /// offsetBytes is relative to the unfragmented datagram (not the IP header field).
-        var fragments: [(offsetBytes: Int, len: Int, frameIdx: Int)] = []
+        var fragments: [(offsetBytes: Int, len: Int, frameIdx: Int, ipHdrLen: Int)] = []
         var lastFragmentSeen: Bool = false
     }
 
@@ -67,7 +67,10 @@ public struct FragmentReassembly {
         // Payload starts after Ethernet (14) + actual IP header (from IHL field).
         let ipHdrLen = ipHeaderLen
         let payloadOfs = ethHeaderLen + ipHdrLen
-        let payloadLen = frameLen - payloadOfs
+        // Read totalLength from IP header to get actual datagram size
+        // (frameLen may include Ethernet padding, inflating the payload).
+        let ipTotalLen = Int(readUInt16BE(UnsafeRawPointer(framePtr), ethHeaderLen + 2))
+        let payloadLen = ipTotalLen - ipHdrLen
         guard payloadLen > 0 else { return nil }
 
         // Find existing slot or allocate new one.
@@ -85,8 +88,10 @@ public struct FragmentReassembly {
 
         var slot = slots[slotIdx]!
 
-        // RFC 1858: detect overlapping fragments before appending.
-        let newEnd = offsetBytes + payloadLen
+        // RFC 1858: guard fragment offset + payload doesn't overflow.
+        let newEnd32 = UInt32(offsetBytes) + UInt32(payloadLen)
+        guard newEnd32 <= 65535 else { return nil }
+        let newEnd = Int(newEnd32)
         for existing in slot.fragments {
             let existEnd = existing.offsetBytes + existing.len
             if offsetBytes < existEnd && newEnd > existing.offsetBytes {
@@ -109,7 +114,8 @@ public struct FragmentReassembly {
             }
         }
 
-        slot.fragments.append((offsetBytes: offsetBytes, len: payloadLen, frameIdx: frameIndex))
+        slot.fragments.append((offsetBytes: offsetBytes, len: payloadLen,
+                               frameIdx: frameIndex, ipHdrLen: ipHeaderLen))
 
         slots[slotIdx] = slot
 
@@ -124,9 +130,10 @@ public struct FragmentReassembly {
 
         // Copy each fragment's payload to the correct offset in the output buffer.
         // Fragments are stored in arrival order; copy by offset position.
+        // Uses per-fragment IP header length (may differ across fragments).
         for frag in slot.fragments.sorted(by: { $0.offsetBytes < $1.offsetBytes }) {
             guard frag.frameIdx >= 0 else { continue }
-            let srcPtr = io.framePtr(frag.frameIdx).advanced(by: payloadOfs)
+            let srcPtr = io.framePtr(frag.frameIdx).advanced(by: ethHeaderLen + frag.ipHdrLen)
             let dstPtr = outPtr.advanced(by: frag.offsetBytes)
             dstPtr.copyMemory(from: srcPtr, byteCount: frag.len)
         }

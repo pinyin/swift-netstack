@@ -244,7 +244,7 @@ private struct DHCPPool {
     /// Pending offers: ip.addr → (clientMAC, deadline). Dictionary for O(1) lookup.
     private var pendingOffers: [UInt32: (mac: MACAddress, deadline: UInt64)] = [:]
     /// Per-MAC rate limiter for DISCOVER floods.
-    private var rateLimiter = RateLimiter(window: 1, maxRequests: 5)
+    private var rateLimiter = RateLimiter<MACAddress>(window: 1, maxRequests: 5)
 
     init(subnet: IPv4Subnet, gateway: IPv4Address, offerTimeout: UInt64 = 60, leaseTime: UInt32 = 3600) {
         self.subnet = subnet
@@ -259,12 +259,14 @@ private struct DHCPPool {
         precondition(netAddr != 0xFFFFFFFF,
             "DHCP subnet network address 255.255.255.255 is invalid")
         var ips: Set<UInt32> = []
-        let start = max(netAddr + 1, gwAddr + 1)
+        let start = netAddr + 1
         let end = bcAddr
         if start < end {
             let count = min(end - start, 65536)
             for i: UInt32 in 0..<count {
-                ips.insert(start + i)
+                let addr = start + i
+                if addr == gwAddr { continue }
+                ips.insert(addr)
             }
         }
         self.available = ips
@@ -382,38 +384,4 @@ private struct DHCPPool {
         }
     }
     #endif
-}
-
-// MARK: - Per-MAC rate limiter
-
-/// Sliding-window rate limiter keyed by MAC address.
-/// Rejects requests when `maxRequests` is exceeded within `window` seconds.
-fileprivate struct RateLimiter {
-    let window: UInt64
-    let maxRequests: Int
-
-    private var counters: [MACAddress: (count: Int, windowStart: UInt64)] = [:]
-
-    init(window: UInt64, maxRequests: Int) {
-        self.window = window
-        self.maxRequests = maxRequests
-    }
-    mutating func allow(_ mac: MACAddress) -> Bool {
-        let now = RateLimiter.now()
-        if let entry = counters[mac] {
-            if now - entry.windowStart < window {
-                if entry.count >= maxRequests { return false }
-                counters[mac] = (entry.count + 1, entry.windowStart)
-            } else {
-                counters[mac] = (1, now)
-            }
-        } else {
-            counters[mac] = (1, now)
-        }
-        return true
-    }
-
-    private static func now() -> UInt64 {
-        UInt64(Darwin.time(nil))
-    }
 }

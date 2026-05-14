@@ -74,6 +74,10 @@ public struct NATStats {
     public var rtoExpiredSendFail: UInt64 = 0
     /// Number of valid RTT samples collected (non-retransmit).
     public var rttSamples: UInt64 = 0
+    /// Number of TCP connections rejected at capacity.
+    public var tcpConnRejected: UInt64 = 0
+    /// Number of UDP mappings rejected at capacity.
+    public var udpMappingRejected: UInt64 = 0
     // ── retransmitHole debug counters ──
     /// Total calls to retransmitHole.
     public var rtHoleCalled: UInt64 = 0
@@ -245,6 +249,9 @@ public func printStats(
     }
     if n.rtoExpired + n.rttSamples > 0 {
         parts.append("rto[exp=\(n.rtoExpired) noDat=\(n.rtoExpiredNoData) fail=\(n.rtoExpiredSendFail) samples=\(n.rttSamples)]")
+    }
+    if n.tcpConnRejected + n.udpMappingRejected > 0 {
+        parts.append("reject[tcp=\(n.tcpConnRejected) udp=\(n.udpMappingRejected)]")
     }
     // ── retransmitHole debug breakdown ──
     if n.rtHoleCalled > 0 {

@@ -18,9 +18,9 @@ public func monotonicMicros() -> UInt64 {
 /// Each NAT entry (TCP connection or UDP mapping) owns exactly one POSIX fd,
 /// making the fd→key reverse lookup trivial and symmetric across protocols.
 public struct NATTable {
-    // Connection limits
-    private let maxTCPConnections: Int = 256
-    private let maxUDPMappings: Int = 256
+    // Connection limits (configurable via init, default 256)
+    public let maxTCPConnections: Int
+    public let maxUDPMappings: Int
 
     /// Skip cleanup scanning if last scan was less than 1 second ago.
     private var lastCleanupTime: UInt64 = 0
@@ -59,7 +59,10 @@ public struct NATTable {
     /// Upstream DNS server for TCP DNS redirect (NAT-based, non-blocking).
     public var upstreamDNS: IPv4Address? = nil
 
-    public init(portForwards: [PortForwardEntry] = [], mss: Int = 1400) {
+    public init(portForwards: [PortForwardEntry] = [], mss: Int = 1400,
+                maxTCPConnections: Int = 256, maxUDPMappings: Int = 256) {
+        self.maxTCPConnections = maxTCPConnections
+        self.maxUDPMappings = maxUDPMappings
         self.mss = mss
         self.stats = NATStats()
         tcpEntries.reserveCapacity(maxTCPConnections)
@@ -194,7 +197,10 @@ public struct NATTable {
             return true
         }
 
-        if udpEntries.count >= maxUDPMappings { return false }
+        if udpEntries.count >= maxUDPMappings {
+            stats.udpMappingRejected += 1
+            return false
+        }
 
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { return false }
@@ -249,6 +255,17 @@ public struct NATTable {
         for entry in tcpEntries.values {
             let c = entry.connection
             let dl = c.rtoDeadline
+            guard dl != 0 else { continue }
+            if earliest == nil || dl < earliest! { earliest = dl }
+        }
+        return earliest
+    }
+
+    /// Returns the earliest persist timer deadline across all connections, or nil.
+    public func nextPersistDeadline() -> UInt64? {
+        var earliest: UInt64?
+        for entry in tcpEntries.values {
+            let dl = entry.connection.persistDeadline
             guard dl != 0 else { continue }
             if earliest == nil || dl < earliest! { earliest = dl }
         }
@@ -446,6 +463,41 @@ public struct NATTable {
         }
     }
 
+    /// Check for expired persist timers (RFC 1122 §4.2.2.17).
+    /// Sends a 1-byte window probe with exponential backoff.
+    private mutating func checkPersistExpired(
+        io: IOBuffer, transport: inout PollingTransport, hostMAC: MACAddress, nowUs: UInt64
+    ) {
+        for (key, entry) in tcpEntries {
+            let c = entry.connection
+            guard c.persistDeadline != 0 else { continue }
+            guard c.persistDeadline <= nowUs else { continue }
+            guard c.state == .established || c.state == .closeWait
+                  || c.state == .finWait1 || c.state == .finWait2 else { continue }
+            guard let epFD = transport.fdForEndpoint(c.endpointID) else { continue }
+
+            guard let data = c.peekSendData(max: 1) else {
+                tcpEntries[key]?.connection.persistDeadline = 0
+                continue
+            }
+
+            let rr = sendOneDataSegment(
+                to: c, seq: c.snd.nxt, ack: c.rcv.nxt,
+                flags: [.ack], data: (data.ptr, 1),
+                via: epFD, hostMAC: hostMAC, io: io)
+
+            let backoffCount = min(6, c.persistBackoffCount &+ 1)
+            tcpEntries[key]?.connection.persistBackoffCount = backoffCount
+            let interval = min(60_000_000, c.rtoValue << backoffCount)
+            tcpEntries[key]?.connection.persistDeadline = nowUs + interval
+
+            if rr >= 0 {
+                tcpEntries[key]?.connection.snd.nxt = c.snd.nxt &+ 1
+                tcpEntries[key]?.connection.sendQueueSent += 1
+            }
+        }
+    }
+
     // MARK: - Window scale helper
 
     /// Convert logical window to wire-format UInt16 using RFC 1323 window scaling.
@@ -504,10 +556,16 @@ public struct NATTable {
         // debug round tracking; caller can update via debugRound if desired
 #endif
 
+        // Capture fresh timestamp for deadline computations (the caller's
+        // nowUs may be many milliseconds stale — poll() + parse phases
+        // 2-10 complete between its capture and processTCPRound).
+        let freshNowUs = monotonicMicros()
+
         // ── Step 0: Check RTO expiry and flush expired delayed ACKs ──
         let tAckFlush = cpuNanos()
-        checkRTOExpired(io: io, transport: &transport, hostMAC: hostMAC, nowUs: nowUs)
-        flushExpiredDelayedACKs(io: io, transport: &transport, nowUs: nowUs)
+        checkRTOExpired(io: io, transport: &transport, hostMAC: hostMAC, nowUs: freshNowUs)
+        flushExpiredDelayedACKs(io: io, transport: &transport, nowUs: freshNowUs)
+        checkPersistExpired(io: io, transport: &transport, hostMAC: hostMAC, nowUs: freshNowUs)
         stats.tcpAckFlushNs &+= cpuNanos() - tAckFlush
 
         // ── Step 1: Complete non-blocking connects ──
@@ -632,6 +690,11 @@ public struct NATTable {
             entry.connection.state = newState
             // Apply peer window scaling (FSM stores raw wire window from seg.window)
             entry.connection.snd.wnd = UInt32(seg.window) << entry.connection.peerWindowScale
+            // Disarm persist timer if window opened
+            if entry.connection.snd.wnd > 0 {
+                entry.connection.persistDeadline = 0
+                entry.connection.persistBackoffCount = 0
+            }
 
             // Record TSval for next PAWS check
             if entry.connection.tsOK, seg.tsOK {
@@ -819,7 +882,7 @@ public struct NATTable {
                     }
                     stats.ackDeferred += 1
                     entry.connection.pendingDelayedACK = true
-                    entry.connection.delayedACKDeadline = nowUs + 200
+                    entry.connection.delayedACKDeadline = freshNowUs + 200
                     entry.connection.delayedACKSeq = segToSend.seq
                     // Use current rcv.nxt which may include OOO-drained data
                     entry.connection.delayedACKAck = entry.connection.rcv.nxt
@@ -1043,7 +1106,13 @@ public struct NATTable {
                     canSend = mss
                 }
 
-                if canSend <= 0 { break }
+                if canSend <= 0 {
+                    // Arm persist timer if blocked by zero receiver window
+                    if conn.snd.wnd == 0, conn.totalQueuedBytes > 0, conn.persistDeadline == 0 {
+                        conn.persistDeadline = monotonicMicros() + max(conn.rtoValue, 200_000)
+                    }
+                    break
+                }
                 if canSend > mss { canSend = mss }
                 guard let data = conn.peekSendData(max: canSend) else {
                     // RFC 5681 fast retransmit: resend holes from snd.una.
@@ -1366,7 +1435,9 @@ public struct NATTable {
         hostMAC: MACAddress, arpMapping: ARPMapping, transport: inout PollingTransport,
         io: IOBuffer
     ) {
-        guard tcpEntries.count < maxTCPConnections else { close(newFD); return }
+        guard tcpEntries.count < maxTCPConnections else {
+            stats.tcpConnRejected += 1; close(newFD); return
+        }
         setNoDelay(newFD)
 
         guard let pf = findTCPListener(fd: listenerFd) else { close(newFD); return }
@@ -1519,6 +1590,7 @@ public struct NATTable {
         redirectIP: IPv4Address? = nil
     ) {
         if tcpEntries.count >= maxTCPConnections {
+            stats.tcpConnRejected += 1
             let hdrOfs = buildTCPHeader(
                 io: io, hostMAC: hostMAC, dstMAC: srcMAC,
                 srcIP: key.dstIP, dstIP: key.vmIP,

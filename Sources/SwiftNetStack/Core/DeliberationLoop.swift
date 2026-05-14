@@ -98,11 +98,14 @@ public struct DeliberationLoop {
             arpMapping.reapExpired(now: nowSec)
             lastARPReapSec = nowSec
         }
-        // Pick the earliest deadline among delayed ACKs and RTO timers
+        // Pick the earliest deadline among delayed ACKs, RTO, and persist timers
         var earliestDeadline: UInt64?
         if let ackDL = natTable.nextDelayedACKDeadline() { earliestDeadline = ackDL }
         if let rtoDL = natTable.nextRTODeadline() {
             if earliestDeadline == nil || rtoDL < earliestDeadline! { earliestDeadline = rtoDL }
+        }
+        if let persistDL = natTable.nextPersistDeadline() {
+            if earliestDeadline == nil || persistDL < earliestDeadline! { earliestDeadline = persistDL }
         }
         if let deadline = earliestDeadline {
             let deltaUs = deadline > nowUs ? deadline - nowUs : 0
@@ -176,7 +179,8 @@ public struct DeliberationLoop {
                     srcIP: parseOutput.fragmentSrcIPs[i],
                     dstIP: parseOutput.fragmentDstIPs[i],
                     protocol: parseOutput.fragmentProtocols[i],
-                    now: nowSec, io: io
+                    now: nowSec, io: io,
+                    ipHeaderLen: parseOutput.fragmentIPHeaderLens[i]
                 )
                 // Reassembled datagram ready — re-inject into parse pipeline.
                 // The reassembled payload is in io.output; for now the caller

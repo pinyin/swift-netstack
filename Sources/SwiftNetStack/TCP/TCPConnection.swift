@@ -278,6 +278,14 @@ final class TCPConnection {
     /// True when the outstanding send is a retransmission (Karn's algorithm).
     public var rtoIsRetransmit: Bool = false
 
+    // MARK: - Persist timer (RFC 1122 §4.2.2.17)
+
+    /// Persist timer deadline in monotonic microseconds. 0 = not armed.
+    /// Armed when the receiver window is zero and we have data to send.
+    public var persistDeadline: UInt64 = 0
+    /// Number of consecutive persist timer expirations (exponential backoff).
+    public var persistBackoffCount: UInt8 = 0
+
     public init(
         connectionID: UInt64, posixFD: Int32, state: TCPState,
         vmMAC: MACAddress, vmIP: IPv4Address, vmPort: UInt16,

@@ -157,6 +157,7 @@ public final class ParseOutput {
     public let fragmentProtocols: UnsafeMutableBufferPointer<UInt8>
     public let fragmentFrameIdxs: UnsafeMutableBufferPointer<Int>
     public let fragmentFrameLens: UnsafeMutableBufferPointer<Int>
+    public let fragmentIPHeaderLens: UnsafeMutableBufferPointer<Int>
     public var fragmentCount: Int = 0
 
     // ── DHCP ──
@@ -224,6 +225,7 @@ public final class ParseOutput {
         fragmentProtocols = .allocate(capacity: n)
         fragmentFrameIdxs = .allocate(capacity: n)
         fragmentFrameLens = .allocate(capacity: n)
+        fragmentIPHeaderLens = .allocate(capacity: n)
 
         dhcpEndpointIDs = .allocate(capacity: n)
         dhcpSrcMACs = .allocate(capacity: n)
@@ -286,6 +288,7 @@ public final class ParseOutput {
         fragmentProtocols.deallocate()
         fragmentFrameIdxs.deallocate()
         fragmentFrameLens.deallocate()
+        fragmentIPHeaderLens.deallocate()
 
         dhcpEndpointIDs.deallocate()
         dhcpSrcMACs.deallocate()

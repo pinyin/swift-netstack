@@ -140,6 +140,7 @@ private func parseOneIPv4(
         out.fragmentProtocols[idx] = rawProtocol
         out.fragmentFrameIdxs[idx] = frameIdx
         out.fragmentFrameLens[idx] = frameLen
+        out.fragmentIPHeaderLens[idx] = ihl * 4
         out.fragmentCount += 1
         return
     }

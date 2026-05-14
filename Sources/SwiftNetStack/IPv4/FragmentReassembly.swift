@@ -57,14 +57,15 @@ public struct FragmentReassembly {
         framePtr: UnsafeMutableRawPointer, frameLen: Int, frameIndex: Int,
         identification: UInt16, flagsFrag: UInt16,
         srcIP: IPv4Address, dstIP: IPv4Address, protocol: UInt8,
-        now: UInt64, io: IOBuffer
+        now: UInt64, io: IOBuffer,
+        ipHeaderLen: Int = 20
     ) -> (ptr: UnsafeMutableRawPointer, len: Int)? {
         let mf = (flagsFrag & 0x2000) != 0
         let fragOffset = Int(flagsFrag & 0x1FFF)  // in 8-byte units
         let offsetBytes = fragOffset * 8
 
-        // Payload starts after Ethernet (14) + IP header (assume 20-byte, no options).
-        let ipHdrLen = 20
+        // Payload starts after Ethernet (14) + actual IP header (from IHL field).
+        let ipHdrLen = ipHeaderLen
         let payloadOfs = ethHeaderLen + ipHdrLen
         let payloadLen = frameLen - payloadOfs
         guard payloadLen > 0 else { return nil }
@@ -84,14 +85,31 @@ public struct FragmentReassembly {
 
         var slot = slots[slotIdx]!
 
-        // Add this fragment descriptor (stores frame index for later data copy).
-        slot.fragments.append((offsetBytes: offsetBytes, len: payloadLen, frameIdx: frameIndex))
-        if !mf { slot.lastFragmentSeen = true }
-
-        // If this is the last fragment, compute the total length.
-        if !mf {
-            slot.totalLen = offsetBytes + payloadLen
+        // RFC 1858: detect overlapping fragments before appending.
+        let newEnd = offsetBytes + payloadLen
+        for existing in slot.fragments {
+            let existEnd = existing.offsetBytes + existing.len
+            if offsetBytes < existEnd && newEnd > existing.offsetBytes {
+                slots[slotIdx] = nil  // abort reassembly
+                return nil
+            }
         }
+
+        // If this is a last fragment, guard against conflicting MF=0 fragments.
+        if !mf {
+            let newTotalLen = offsetBytes + payloadLen
+            if slot.lastFragmentSeen {
+                if newTotalLen != slot.totalLen {
+                    slots[slotIdx] = nil
+                    return nil
+                }
+            } else {
+                slot.lastFragmentSeen = true
+                slot.totalLen = newTotalLen
+            }
+        }
+
+        slot.fragments.append((offsetBytes: offsetBytes, len: payloadLen, frameIdx: frameIndex))
 
         slots[slotIdx] = slot
 

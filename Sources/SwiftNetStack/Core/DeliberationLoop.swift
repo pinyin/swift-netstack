@@ -32,6 +32,20 @@ public struct DeliberationLoop {
     /// Rate limiter for ICMP error messages (RFC 1812 §4.3.2.8).
     private var icmpErrorLimiter = RateLimiter<IPv4Address>(window: 1, maxRequests: 10)
 
+    /// Queue of reassembled datagrams awaiting re-injection as synthetic frames.
+    /// Capped at 16 to bound memory. Each entry holds the full reassembled
+    /// transport payload (no headers) plus metadata from the last fragment.
+    private var reassembledQueue: [ReassembledDatagram] = []
+
+    private struct ReassembledDatagram {
+        let payload: [UInt8]
+        let srcIP: IPv4Address
+        let dstIP: IPv4Address
+        let ipProtocol: UInt8
+        let srcMAC: MACAddress
+        let endpointID: Int
+    }
+
     // ── Pre-allocated SoA infrastructure ──
     private let io: IOBuffer
     private let parseOutput: ParseOutput
@@ -129,11 +143,60 @@ public struct DeliberationLoop {
         }
         phaseTiming.pollRead &+= cpuNanos() - tPoll
 
+        // ── Inject queued reassembled datagrams as synthetic frames ──
+        // Reassembled payloads are in io.output but parseAllFrames reads from
+        // io.input, so we copy each payload into a complete Ethernet+IPv4 frame
+        // in an unused io.input slot. The synthetic frame passes the MAC filter
+        // (dstMAC = hostMAC) and is naturally dispatched by the parse phases.
+        if !reassembledQueue.isEmpty {
+            var injected = 0
+            for datagram in reassembledQueue {
+                guard io.frameCount < io.maxFrames else { break }
+                guard let proto = IPProtocol(rawValue: datagram.ipProtocol) else { continue }
+                let frameIdx = io.frameCount
+                let framePtr = io.framePtr(frameIdx)
+
+                // Ethernet header
+                hostMAC.write(to: framePtr)
+                datagram.srcMAC.write(to: framePtr.advanced(by: 6))
+                writeUInt16BE(EtherType.ipv4.rawValue, to: framePtr.advanced(by: 12))
+
+                // IPv4 header
+                let ipPtr = framePtr.advanced(by: ethHeaderLen)
+                let totalLen = UInt16(ipv4HeaderLen + datagram.payload.count)
+                writeIPv4Header(to: ipPtr, totalLength: totalLen, protocol: proto,
+                                srcIP: datagram.srcIP, dstIP: datagram.dstIP)
+
+                // Copy transport payload
+                datagram.payload.withUnsafeBytes { buf in
+                    ipPtr.advanced(by: ipv4HeaderLen).copyMemory(
+                        from: buf.baseAddress!, byteCount: buf.count)
+                }
+
+                let frameLen = ethHeaderLen + ipv4HeaderLen + datagram.payload.count
+                io.frameLengths[frameIdx] = frameLen
+                io.frameEndpointIDs[frameIdx] = datagram.endpointID
+                io.frameCount += 1
+                injected += 1
+            }
+            reassembledQueue.removeFirst(injected)
+        }
+
         // ── Phase 2-6: Unified parse ──
         let tParse = cpuNanos()
         parseAllFrames(io: io, out: parseOutput, hostMAC: hostMAC,
                        arpMapping: arpMapping, fwdBatch: fwdBatch)
         phaseTiming.parse &+= cpuNanos() - tParse
+
+        // Accumulate parse-group overflow drop counters
+        natTable.stats.parseARPDropped &+= UInt64(parseOutput.dropARP)
+        natTable.stats.parseDHCPDropped &+= UInt64(parseOutput.dropDHCP)
+        natTable.stats.parseDNSDropped &+= UInt64(parseOutput.dropDNS)
+        natTable.stats.parseICMPEchoDropped &+= UInt64(parseOutput.dropICMPEcho)
+        natTable.stats.parseICMPUnreachDropped &+= UInt64(parseOutput.dropICMPUnreach)
+        natTable.stats.parseTCPDropped &+= UInt64(parseOutput.dropTCP)
+        natTable.stats.parseUDPDropped &+= UInt64(parseOutput.dropUDP)
+        natTable.stats.parseFragmentDropped &+= UInt64(parseOutput.dropFragment)
 
         // Write L2 forwarded frames
         if fwdBatch.count > 0 {
@@ -184,12 +247,18 @@ public struct DeliberationLoop {
                     now: nowSec, io: io,
                     ipHeaderLen: f.ipHeaderLen
                 )
-                // Reassembled datagram ready — re-inject into parse pipeline.
-                // The reassembled payload is in io.output; for now the caller
-                // could dispatch it directly. Future: re-parse the assembled datagram.
-                if let _ = result {
-                    // Reassembly complete. The assembled payload is in io.output.
-                    // TODO: dispatch to transport layer (e.g., via natTable).
+                // Reassembled datagram ready — queue for re-injection next round.
+                // Copy payload out of io.output (which gets reset next round)
+                // into a stable [UInt8] buffer.
+                if let (outPtr, outLen) = result {
+                    guard reassembledQueue.count < 16 else { continue }
+                    let payload = [UInt8](
+                        UnsafeRawBufferPointer(start: outPtr, count: outLen))
+                    reassembledQueue.append(ReassembledDatagram(
+                        payload: payload,
+                        srcIP: f.srcIP, dstIP: f.dstIP,
+                        ipProtocol: f.ipProtocol,
+                        srcMAC: f.srcMAC, endpointID: f.endpointID))
                 }
             }
             // Periodic reap of expired fragment reassemblies (every 30s)

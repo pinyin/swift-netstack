@@ -78,6 +78,15 @@ public struct NATStats {
     public var tcpConnRejected: UInt64 = 0
     /// Number of UDP mappings rejected at capacity.
     public var udpMappingRejected: UInt64 = 0
+    // ── Parse-group overflow drop counters ──
+    public var parseARPDropped: UInt64 = 0
+    public var parseDHCPDropped: UInt64 = 0
+    public var parseDNSDropped: UInt64 = 0
+    public var parseICMPEchoDropped: UInt64 = 0
+    public var parseICMPUnreachDropped: UInt64 = 0
+    public var parseTCPDropped: UInt64 = 0
+    public var parseUDPDropped: UInt64 = 0
+    public var parseFragmentDropped: UInt64 = 0
     // ── retransmitHole debug counters ──
     /// Total calls to retransmitHole.
     public var rtHoleCalled: UInt64 = 0
@@ -252,6 +261,13 @@ public func printStats(
     }
     if n.tcpConnRejected + n.udpMappingRejected > 0 {
         parts.append("reject[tcp=\(n.tcpConnRejected) udp=\(n.udpMappingRejected)]")
+    }
+    // ── Parse overflow drops ──
+    let parseDrops = n.parseARPDropped + n.parseDHCPDropped + n.parseDNSDropped
+        + n.parseICMPEchoDropped + n.parseICMPUnreachDropped
+        + n.parseTCPDropped + n.parseUDPDropped + n.parseFragmentDropped
+    if parseDrops > 0 {
+        parts.append("pDrop[arp=\(n.parseARPDropped) dhcp=\(n.parseDHCPDropped) dns=\(n.parseDNSDropped) icmpE=\(n.parseICMPEchoDropped) icmpU=\(n.parseICMPUnreachDropped) tcp=\(n.parseTCPDropped) udp=\(n.parseUDPDropped) frag=\(n.parseFragmentDropped)]")
     }
     // ── retransmitHole debug breakdown ──
     if n.rtHoleCalled > 0 {

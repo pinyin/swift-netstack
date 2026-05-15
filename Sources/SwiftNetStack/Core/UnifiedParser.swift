@@ -46,7 +46,7 @@ public func parseAllFrames(
                         let srcAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 12), count: 4))
                         let dstAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 16), count: 4))
                         let idx = out.unreach.count
-                        guard idx < out.unreach.capacity else { continue }
+                        guard idx < out.unreach.capacity else { out.dropICMPUnreach += 1; continue }
                         out.unreach.frames[idx] = ICMPUnreachParsedFrame(
                             endpointID: epID, srcMAC: srcMAC, gatewayIP: dstAddr, clientIP: srcAddr,
                             rawOfs: i * mtu + ethHeaderLen, rawLen: len - ethHeaderLen,
@@ -90,7 +90,7 @@ private func parseOneARP(
 ) {
     guard let arp = ARPFrame.parse(from: UnsafeRawPointer(ptr), len: len) else { return }
     let idx = out.arp.count
-    guard idx < out.arp.capacity else { return }
+    guard idx < out.arp.capacity else { out.dropARP += 1; return }
     out.arp.frames[idx] = ARPParsedFrame(endpointID: epID, frame: arp)
     out.arp.count += 1
 }
@@ -123,7 +123,7 @@ private func parseOneIPv4(
     let isFragment = (flagsFrag & 0x3FFF) != 0
     if isFragment {
         let idx = out.fragment.count
-        guard idx < out.fragment.capacity else { return }
+        guard idx < out.fragment.capacity else { out.dropFragment += 1; return }
         out.fragment.frames[idx] = FragmentParsedFrame(
             endpointID: epID, srcMAC: srcMAC, srcIP: srcAddr, dstIP: dstAddr,
             identification: readUInt16BE(ipPtr, 4), flagsFrag: flagsFrag,
@@ -163,7 +163,7 @@ private func parseOneIPv4(
     default:
         // Unknown protocol → ICMP unreachable
         let idx = out.unreach.count
-        guard idx < out.unreach.capacity else { return }
+        guard idx < out.unreach.capacity else { out.dropICMPUnreach += 1; return }
         out.unreach.frames[idx] = ICMPUnreachParsedFrame(
             endpointID: epID, srcMAC: srcMAC, gatewayIP: dstAddr, clientIP: srcAddr,
             rawOfs: baseOfs + ipOfs, rawLen: frameLen - ipOfs,
@@ -199,7 +199,7 @@ private func parseOneICMP(
         guard ~UInt16(fullSum & 0xFFFF) == 0 else { return }
 
         let idx = out.icmpEcho.count
-        guard idx < out.icmpEcho.capacity else { return }
+        guard idx < out.icmpEcho.capacity else { out.dropICMPEcho += 1; return }
         let totalPayloadOfs = baseOfs + ipPayloadOfs
         out.icmpEcho.frames[idx] = ICMPEchoParsedFrame(
             endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
@@ -254,7 +254,7 @@ private func parseOneTCP(
     }
 
     let idx = out.tcp.count
-    guard idx < out.tcp.capacity else { return }
+    guard idx < out.tcp.capacity else { out.dropTCP += 1; return }
 
     out.tcp.keys[idx] = NATKey(vmIP: srcIP, vmPort: srcPort,
                                dstIP: dstIP, dstPort: dstPort, protocol: .tcp)
@@ -291,13 +291,13 @@ private func parseOneUDP(
         guard let dhcp = DHCPPacket.parse(from: UnsafeRawPointer(ptr.advanced(by: 8)),
                                            len: payloadLen) else { return }
         let idx = out.dhcp.count
-        guard idx < out.dhcp.capacity else { return }
+        guard idx < out.dhcp.capacity else { out.dropDHCP += 1; return }
         out.dhcp.frames[idx] = DHCPParsedFrame(endpointID: epID, srcMAC: srcMAC, packet: dhcp)
         out.dhcp.count += 1
     } else if dstPort == 53 {
         // DNS
         let idx = out.dns.count
-        guard idx < out.dns.capacity else { return }
+        guard idx < out.dns.capacity else { out.dropDNS += 1; return }
         out.dns.frames[idx] = DNSParsedFrame(
             endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
             srcPort: srcPort, payloadOfs: totalPayloadOfs + 8, payloadLen: payloadLen)
@@ -305,7 +305,7 @@ private func parseOneUDP(
     } else {
         // Generic UDP
         let idx = out.udp.count
-        guard idx < out.udp.capacity else { return }
+        guard idx < out.udp.capacity else { out.dropUDP += 1; return }
         out.udp.frames[idx] = UDPParsedFrame(
             endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
             srcPort: srcPort, dstPort: dstPort,

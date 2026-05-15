@@ -282,6 +282,18 @@ public final class ParseOutput {
         dhcp     = DHCPParseGroup(capacity: max(4, n / 64))
     }
 
+    /// Per-round drop counters for parse-group capacity overflows.
+    /// Silently dropped frames are invisible to protocol handlers; these
+    /// counters make capacity pressure observable.
+    public var dropARP: Int = 0
+    public var dropDHCP: Int = 0
+    public var dropDNS: Int = 0
+    public var dropICMPEcho: Int = 0
+    public var dropICMPUnreach: Int = 0
+    public var dropTCP: Int = 0
+    public var dropUDP: Int = 0
+    public var dropFragment: Int = 0
+
     public func reset() {
         tcp.count = 0
         udp.count = 0
@@ -291,6 +303,14 @@ public final class ParseOutput {
         fragment.count = 0
         arp.count = 0
         dhcp.count = 0
+        dropARP = 0
+        dropDHCP = 0
+        dropDNS = 0
+        dropICMPEcho = 0
+        dropICMPUnreach = 0
+        dropTCP = 0
+        dropUDP = 0
+        dropFragment = 0
     }
 
     deinit {
@@ -387,6 +407,14 @@ public struct SendQueue {
     }
 
     /// Discard `len` bytes from the front.
+    ///
+    /// Compaction threshold: memmove when readPos > 16 KB (hard cap) or when
+    /// readPos has consumed more than half the buffer AND total buffer usage
+    /// exceeds 16 KB. The 16 KB floor avoids triggering compaction on small
+    /// idle-connection buffers (e.g., a keepalive ACK that advanced readPos
+    /// by a few hundred bytes). The "half consumed" check stops us from wasting
+    /// half the buffer before compacting. After compaction, readPos=0 and
+    /// writePos=count — contiguous space is restored.
     public mutating func dequeue(_ len: Int) {
         let n = Swift.min(len, count)
         readPos += n

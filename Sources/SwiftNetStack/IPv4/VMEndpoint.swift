@@ -4,7 +4,7 @@
 /// The bridge inside the VM works in transparent mode, so container MACs
 /// are visible through the vNIC. Container IPs are dynamically assigned
 /// by DHCP and tracked in ARPMapping, not here.
-public struct VMEndpoint {
+public struct VMEndpoint: @unchecked Sendable {
     public let id: Int
     public let fd: Int32
     public let subnet: IPv4Subnet

@@ -1,5 +1,5 @@
 /// 4-octet IPv4 address backed by UInt32 in network byte order.
-public struct IPv4Address: Equatable, Hashable, CustomStringConvertible {
+public struct IPv4Address: Equatable, Hashable, CustomStringConvertible, @unchecked Sendable {
     public var addr: UInt32  // network byte order
 
     public init(addr: UInt32) {
@@ -18,8 +18,7 @@ public struct IPv4Address: Equatable, Hashable, CustomStringConvertible {
         self.addr = (UInt32(a) << 24) | (UInt32(b) << 16) | (UInt32(c) << 8) | UInt32(d)
     }
 
-    // nonisolated(unsafe): BDP is single-threaded, no concurrent access.
-    public static nonisolated(unsafe) let zero = IPv4Address(0, 0, 0, 0)
+    public static let zero = IPv4Address(0, 0, 0, 0)
 
     public var description: String {
         let a = UInt8((addr >> 24) & 0xFF)

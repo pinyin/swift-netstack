@@ -7,7 +7,7 @@ import Darwin
 @Test func arpEntry_isExpired_respectsTimeout() {
     let ip = IPv4Address(10, 0, 0, 5)
     let mac = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
-    var entry = ARPEntry(ip: ip, mac: mac, endpointID: 0, createdAt: 1000)
+    let entry = ARPEntry(ip: ip, mac: mac, endpointID: 0, createdAt: 1000)
 
     // Not expired at creation time
     #expect(!entry.isExpired(now: 1000, timeout: 3600))
@@ -20,7 +20,7 @@ import Darwin
 @Test func arpEntry_isExpired_shortTimeout() {
     let ip = IPv4Address(10, 0, 0, 6)
     let mac = MACAddress(0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00)
-    var entry = ARPEntry(ip: ip, mac: mac, endpointID: 1, createdAt: 0)
+    let entry = ARPEntry(ip: ip, mac: mac, endpointID: 1, createdAt: 0)
 
     #expect(!entry.isExpired(now: 29, timeout: 30))
     #expect(entry.isExpired(now: 31, timeout: 30))
@@ -29,7 +29,7 @@ import Darwin
 @Test func arpEntry_defaultTimeoutIs3600() {
     let ip = IPv4Address(10, 0, 0, 7)
     let mac = MACAddress(0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11)
-    var entry = ARPEntry(ip: ip, mac: mac, endpointID: 2, createdAt: 0)
+    let entry = ARPEntry(ip: ip, mac: mac, endpointID: 2, createdAt: 0)
 
     #expect(!entry.isExpired(now: 3599))
     #expect(entry.isExpired(now: 3601))

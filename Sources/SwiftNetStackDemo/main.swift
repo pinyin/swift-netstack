@@ -306,6 +306,10 @@ if !externalNet {
         log("WARNING: invalid upstream DNS address: \(args.upstreamDNS), DNS forwarding disabled")
     }
 
+    // Local copies for nonisolated closure capture
+    let hMAC = hostMAC
+    let h = hosts
+
     let bdpQueue = DispatchQueue(label: "bdp.loop", qos: .userInitiated)
     bdpQueue.async {
         var shutdown = false
@@ -317,8 +321,8 @@ if !externalNet {
         )
         var loop = DeliberationLoop(
             endpoints: [endpoint],
-            hostMAC: hostMAC,
-            hosts: hosts,
+            hostMAC: hMAC,
+            hosts: h,
             upstreamDNS: upstreamDNS
         )
 

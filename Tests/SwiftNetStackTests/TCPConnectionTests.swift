@@ -5,7 +5,7 @@ import Darwin
 // MARK: - peekRetransmitData ignores sendQueueSent
 
 @Test func peekRetransmitData_ignores_sendQueueSent() {
-    var conn = makeTestConnection()
+    let conn = makeTestConnection()
 
     // Write known data into sendQueue
     let data: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
@@ -30,7 +30,7 @@ import Darwin
 }
 
 @Test func peekRetransmitData_respects_max() {
-    var conn = makeTestConnection()
+    let conn = makeTestConnection()
     let data = [UInt8](repeating: 0x42, count: 4096)
     conn.writeSendBuf(data, data.count)
     conn.sendQueueSent = 4096
@@ -45,7 +45,7 @@ import Darwin
 // MARK: - ackSendBuf + peekSendData interaction
 
 @Test func ackSendBuf_partial_ack_then_peek() {
-    var conn = makeTestConnection()
+    let conn = makeTestConnection()
 
     let data = [UInt8](repeating: 0x77, count: 3000)
     conn.writeSendBuf(data, data.count)
@@ -77,7 +77,7 @@ import Darwin
 // MARK: - sendQueueSent overflow protection
 
 @Test func ackSendBuf_large_delta_resets_sendQueueSent() {
-    var conn = makeTestConnection()
+    let conn = makeTestConnection()
     let data = [UInt8](repeating: 0x11, count: 1000)
     conn.writeSendBuf(data, data.count)
     conn.sendQueueSent = 500  // half sent

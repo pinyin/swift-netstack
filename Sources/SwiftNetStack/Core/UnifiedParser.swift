@@ -43,7 +43,6 @@ public func parseAllFrames(
                     let ttlOK = decrementTTL(at: ipPtr)
                     if !ttlOK {
                         // TTL expired → ICMP Time Exceeded (Type 11 Code 0)
-                        let ihl = Int(ipPtr.load(fromByteOffset: 0, as: UInt8.self) & 0x0F)
                         let srcAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 12), count: 4))
                         let dstAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 16), count: 4))
                         let idx = out.unreachCount

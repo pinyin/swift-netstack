@@ -746,7 +746,7 @@ func debugRunTCPFSMTests() {
 
     // ESTABLISHED + appClose → finWait1
     do {
-        var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
+        var (_, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
         let (newState, toSend) = tcpAppClose(state: .established, snd: &snd, rcv: &rcv)
         precondition(newState == .finWait1, "TCP FSM: ESTABLISHED + appClose → \(newState), expected .finWait1")
         precondition(!toSend.isEmpty && toSend.first!.flags.isFin, "TCP FSM: ESTABLISHED + appClose → no FIN sent")
@@ -769,7 +769,7 @@ func debugRunTCPFSMTests() {
 
     // closeWait + appClose → lastAck
     do {
-        var (seg, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
+        var (_, snd, rcv) = makeSeg(flags: .ack, seq: 2000, ack: 1000)
         let (newState, _) = tcpAppClose(state: .closeWait, snd: &snd, rcv: &rcv)
         precondition(newState == .lastAck, "TCP FSM: closeWait + appClose → \(newState), expected .lastAck")
     }

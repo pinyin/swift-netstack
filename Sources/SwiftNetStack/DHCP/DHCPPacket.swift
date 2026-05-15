@@ -94,7 +94,6 @@ public struct DHCPPacket {
             // BOOTP header is 236 bytes. Magic cookie starts at offset 236
             // (RFC 2131 §3). DHCP options follow at offset 240.
             guard buf[236] == 99, buf[237] == 130, buf[238] == 83, buf[239] == 99 else {
-                let mc = (buf[236], buf[237], buf[238], buf[239])
                 return nil // bad magic cookie
             }
 

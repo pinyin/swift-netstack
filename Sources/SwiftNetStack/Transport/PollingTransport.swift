@@ -270,13 +270,15 @@ public struct PollingTransport {
                 let idx = io.frameCount
                 let ptr = io.framePtr(idx)
                 var iov = iovec(iov_base: ptr, iov_len: mtu)
-                var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                 msg_iov: &iov, msg_iovlen: 1,
-                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
                 stats.recvmsgCalls += 1
-                let n = Darwin.recvmsg(fd, &msg, 0)
+                let (n, msgFlags) = withUnsafeMutablePointer(to: &iov) { iovPtr in
+                    var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                     msg_iov: iovPtr, msg_iovlen: 1,
+                                     msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                    return (Darwin.recvmsg(fd, &msg, 0), msg.msg_flags)
+                }
                 if n <= 0 { break }
-                if msg.msg_flags & Int32(MSG_TRUNC) != 0 { continue }
+                if msgFlags & Int32(MSG_TRUNC) != 0 { continue }
                 io.frameLengths[idx] = n
                 io.frameEndpointIDs[idx] = ep.id
                 io.frameCount += 1
@@ -297,10 +299,10 @@ public struct PollingTransport {
             let hdrLen = batch.hdrLen[i]
 
             if batch.payOfs[i] >= 0, batch.payLen[i] > 0 {
-                var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+                let iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
                 let payBase = batch.payBase[i] ?? io.input.baseAddress!
                 let payPtr = payBase + batch.payOfs[i]
-                var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: batch.payLen[i])
+                let iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: batch.payLen[i])
                 var iovs = (iov0, iov1)
                 _ = withUnsafeMutableBytes(of: &iovs) { buf in
                     var msg = msghdr(msg_name: nil, msg_namelen: 0,
@@ -316,16 +318,17 @@ public struct PollingTransport {
                 }
             } else {
                 var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
-                var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                                 msg_iov: &iov, msg_iovlen: 1,
-                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
                 stats.sendmsgCalls += 1
                 stats.sendBytes += UInt64(hdrLen)
-                let r = Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
+                let r = withUnsafeMutablePointer(to: &iov) { iovPtr in
+                    var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                     msg_iov: iovPtr, msg_iovlen: 1,
+                                     msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                    return Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL))
+                }
                 if r < 0, errno != EAGAIN, errno != ENOBUFS {
                     fputs("[POLL-WRITE] sendmsg fd=\(fd) failed: errno=\(errno) hdrLen=\(hdrLen)\n", stderr)
                 }
-                _ = r
             }
         }
     }
@@ -341,11 +344,11 @@ public struct PollingTransport {
         guard let fd = fdByEndpointID[endpointID] else { return false }
         let hdrPtr = io.output.baseAddress! + hdrOfs
         if let payPtr, payLen > 0 {
-            var iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
-            var iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: payLen)
+            let iov0 = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
+            let iov1 = iovec(iov_base: UnsafeMutableRawPointer(mutating: payPtr), iov_len: payLen)
             var iovs = (iov0, iov1)
             var ok = false
-            _ = withUnsafeMutableBytes(of: &iovs) { buf in
+            withUnsafeMutableBytes(of: &iovs) { buf in
                 var msg = msghdr(msg_name: nil, msg_namelen: 0,
                                  msg_iov: buf.baseAddress!.assumingMemoryBound(to: iovec.self), msg_iovlen: 2,
                                  msg_control: nil, msg_controllen: 0, msg_flags: 0)
@@ -356,12 +359,14 @@ public struct PollingTransport {
             return ok
         } else {
             var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: hdrPtr), iov_len: hdrLen)
-            var msg = msghdr(msg_name: nil, msg_namelen: 0,
-                             msg_iov: &iov, msg_iovlen: 1,
-                             msg_control: nil, msg_controllen: 0, msg_flags: 0)
             stats.sendmsgCalls += 1
             stats.sendBytes += UInt64(hdrLen)
-            return Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL)) >= 0
+            return withUnsafeMutablePointer(to: &iov) { iovPtr in
+                var msg = msghdr(msg_name: nil, msg_namelen: 0,
+                                 msg_iov: iovPtr, msg_iovlen: 1,
+                                 msg_control: nil, msg_controllen: 0, msg_flags: 0)
+                return Darwin.sendmsg(fd, &msg, Int32(MSG_DONTWAIT | MSG_NOSIGNAL)) >= 0
+            }
         }
     }
 
@@ -382,12 +387,16 @@ public struct PollingTransport {
         stats.sendmsgCalls += 1
         stats.sendBytes += UInt64(len)
         var iov = iovec(iov_base: UnsafeMutableRawPointer(mutating: ptr), iov_len: len)
-        var msg = msghdr(
-            msg_name: &sa, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
-            msg_iov: &iov, msg_iovlen: 1,
-            msg_control: nil, msg_controllen: 0, msg_flags: 0
-        )
-        return Darwin.sendmsg(fd, &msg, 0)
+        return withUnsafeMutableBytes(of: &sa) { saBuf in
+            withUnsafeMutablePointer(to: &iov) { iovPtr in
+                var msg = msghdr(
+                    msg_name: saBuf.baseAddress, msg_namelen: socklen_t(MemoryLayout<sockaddr_in>.size),
+                    msg_iov: iovPtr, msg_iovlen: 1,
+                    msg_control: nil, msg_controllen: 0, msg_flags: 0
+                )
+                return Darwin.sendmsg(fd, &msg, 0)
+            }
+        }
     }
 
     @discardableResult

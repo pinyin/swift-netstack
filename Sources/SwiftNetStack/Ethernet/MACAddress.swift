@@ -1,5 +1,5 @@
 /// 6-octet MAC address.
-public struct MACAddress: Equatable, Hashable, CustomStringConvertible {
+public struct MACAddress: Equatable, Hashable, CustomStringConvertible, @unchecked Sendable {
     public var octets: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
 
     public init(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8, _ e: UInt8, _ f: UInt8) {
@@ -12,9 +12,8 @@ public struct MACAddress: Equatable, Hashable, CustomStringConvertible {
         self.octets = (buf[0], buf[1], buf[2], buf[3], buf[4], buf[5])
     }
 
-    // nonisolated(unsafe): BDP is single-threaded, no concurrent access.
-    public static nonisolated(unsafe) let broadcast = MACAddress(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
-    public static nonisolated(unsafe) let zero = MACAddress(0, 0, 0, 0, 0, 0)
+    public static let broadcast = MACAddress(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+    public static let zero = MACAddress(0, 0, 0, 0, 0, 0)
 
     public static func == (lhs: MACAddress, rhs: MACAddress) -> Bool {
         lhs.octets.0 == rhs.octets.0

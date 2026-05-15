@@ -66,7 +66,6 @@ public struct FragmentReassembly {
 
         // Payload starts after Ethernet (14) + actual IP header (from IHL field).
         let ipHdrLen = ipHeaderLen
-        let payloadOfs = ethHeaderLen + ipHdrLen
         // Read totalLength from IP header to get actual datagram size
         // (frameLen may include Ethernet padding, inflating the payload).
         let ipTotalLen = Int(readUInt16BE(UnsafeRawPointer(framePtr), ethHeaderLen + 2))

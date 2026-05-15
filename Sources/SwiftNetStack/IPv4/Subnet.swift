@@ -1,5 +1,5 @@
 /// CIDR subnet, e.g. 100.64.1.0/24.
-public struct IPv4Subnet: Equatable, CustomStringConvertible {
+public struct IPv4Subnet: Equatable, CustomStringConvertible, @unchecked Sendable {
     public let network: IPv4Address
     public let prefixLength: UInt8
 

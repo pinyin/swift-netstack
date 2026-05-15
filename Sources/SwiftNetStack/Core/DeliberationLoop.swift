@@ -389,7 +389,6 @@ public struct DeliberationLoop {
                     outBatch: outBatch, io: io
                 )
             } else {
-                let key = NATKey(vmIP: srcIP, vmPort: srcPort, dstIP: dstIP, dstPort: dstPort, protocol: .udp)
                 let handled = natTable.processUDP(
                     srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
                     srcPort: srcPort, dstPort: dstPort,

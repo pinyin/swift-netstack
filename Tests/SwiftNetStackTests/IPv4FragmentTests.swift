@@ -6,7 +6,7 @@ import Darwin
 
 @Test func fragmentDetection_mfFlagPreventsTransportDispatch() {
     let io = IOBuffer(maxFrames: 4, mtu: 2048)
-    let out = ParseOutput(maxFrames: 4)
+    let out = ParseOutput()
     let fwd = OutBatch(maxFrames: 4)
     let hostMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
     let arp = ARPMapping(hostMAC: hostMAC, endpoints: [])
@@ -26,14 +26,14 @@ import Darwin
     parseAllFrames(io: io, out: out, hostMAC: hostMAC, arpMapping: arp, fwdBatch: fwd)
 
     // Fragment should NOT reach TCP
-    #expect(out.tcpCount == 0, "MF=1 packet not handed to TCP")
+    #expect(out.tcp.count == 0, "MF=1 packet not handed to TCP")
     // Fragment should be recorded
-    #expect(out.fragmentCount == 1, "fragment tracked in ParseOutput")
+    #expect(out.fragment.count == 1, "fragment tracked in ParseOutput")
 }
 
 @Test func fragmentDetection_nonZeroOffsetPreventsTransportDispatch() {
     let io = IOBuffer(maxFrames: 4, mtu: 2048)
-    let out = ParseOutput(maxFrames: 4)
+    let out = ParseOutput()
     let fwd = OutBatch(maxFrames: 4)
     let hostMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
     let arp = ARPMapping(hostMAC: hostMAC, endpoints: [])
@@ -51,14 +51,14 @@ import Darwin
 
     parseAllFrames(io: io, out: out, hostMAC: hostMAC, arpMapping: arp, fwdBatch: fwd)
 
-    #expect(out.udpCount == 0, "offset>0 packet not handed to UDP")
-    #expect(out.fragmentCount == 1, "fragment tracked in ParseOutput")
+    #expect(out.udp.count == 0, "offset>0 packet not handed to UDP")
+    #expect(out.fragment.count == 1, "fragment tracked in ParseOutput")
 }
 
 @Test func fragmentDetection_nonFragmentedStillWorks() {
     // Regression: non-fragmented packets should still work normally
     let io = IOBuffer(maxFrames: 4, mtu: 2048)
-    let out = ParseOutput(maxFrames: 4)
+    let out = ParseOutput()
     let fwd = OutBatch(maxFrames: 4)
     let hostMAC = MACAddress(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF)
     let arp = ARPMapping(hostMAC: hostMAC, endpoints: [])
@@ -85,8 +85,8 @@ import Darwin
 
     parseAllFrames(io: io, out: out, hostMAC: hostMAC, arpMapping: arp, fwdBatch: fwd)
 
-    #expect(out.udpCount == 1, "non-fragmented packet reaches UDP parser")
-    #expect(out.fragmentCount == 0, "no fragments for non-fragmented packet")
+    #expect(out.udp.count == 1, "non-fragmented packet reaches UDP parser")
+    #expect(out.fragment.count == 0, "no fragments for non-fragmented packet")
 }
 
 // MARK: - Fragment Reassembly State Machine

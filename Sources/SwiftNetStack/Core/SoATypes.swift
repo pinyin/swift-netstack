@@ -67,226 +67,241 @@ public struct TCPSegmentInfo {
     }
 }
 
-// MARK: - Pre-allocated SoA buffers for parsing output
+// MARK: - Per-protocol parsed frame types (dense struct arrays)
 
-/// Holds all parse-output arrays. One-time allocation at init, zero allocs per round.
-/// Uses UnsafeMutableBufferPointer — no ARC, no CoW, no reallocation.
-public final class ParseOutput {
-    public let maxFrames: Int
+public struct ARPParsedFrame {
+    public var endpointID: Int
+    public var frame: ARPFrame
+}
 
-    // ── TCP ──
-    public let tcpKeys: UnsafeMutableBufferPointer<NATKey>
-    public let tcpSegs: UnsafeMutableBufferPointer<TCPSegmentInfo>
-    public let tcpPayloadOfs: UnsafeMutableBufferPointer<Int>
-    public let tcpPayloadLen: UnsafeMutableBufferPointer<Int>
-    public let tcpEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let tcpSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public var tcpCount: Int = 0
+public struct DHCPParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var packet: DHCPPacket
+}
 
-    // ── ARP ──
-    public let arpEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let arpFrames: UnsafeMutableBufferPointer<ARPFrame>
-    public var arpCount: Int = 0
+public struct DNSParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var srcIP: IPv4Address
+    public var dstIP: IPv4Address
+    public var srcPort: UInt16
+    public var payloadOfs: Int
+    public var payloadLen: Int
+}
 
-    // ── ICMP Echo ──
-    public let icmpEchoEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let icmpEchoSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let icmpEchoSrcIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let icmpEchoDstIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let icmpEchoIDs: UnsafeMutableBufferPointer<UInt16>
-    public let icmpEchoSeqNums: UnsafeMutableBufferPointer<UInt16>
-    public let icmpEchoPayloadOfs: UnsafeMutableBufferPointer<Int>
-    public let icmpEchoPayloadLen: UnsafeMutableBufferPointer<Int>
-    /// Pre-computed one's complement sum of ICMP echo payload (RFC 792).
-    /// Computed once during parse, folded with header checksum during build.
-    public let icmpEchoPayloadSum: UnsafeMutableBufferPointer<UInt32>
-    public var icmpEchoCount: Int = 0
+public struct ICMPEchoParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var srcIP: IPv4Address
+    public var dstIP: IPv4Address
+    public var identifier: UInt16
+    public var sequenceNumber: UInt16
+    public var payloadOfs: Int
+    public var payloadLen: Int
+    public var payloadSum: UInt32
+}
 
-    // ── ICMP Unreachable ──
-    public let unreachEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let unreachSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let unreachGatewayIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let unreachClientIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let unreachRawOfs: UnsafeMutableBufferPointer<Int>
-    public let unreachRawLen: UnsafeMutableBufferPointer<Int>
-    /// ICMP code per unreachable entry (2=Protocol, 3=Port, 4=Frag Needed).
-    public let unreachCodes: UnsafeMutableBufferPointer<UInt8>
-    /// ICMP type per unreachable entry (3=Dest Unreachable, 11=Time Exceeded).
-    public let unreachTypes: UnsafeMutableBufferPointer<UInt8>
-    public var unreachCount: Int = 0
+public struct ICMPUnreachParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var gatewayIP: IPv4Address
+    public var clientIP: IPv4Address
+    public var rawOfs: Int
+    public var rawLen: Int
+    public var code: UInt8
+    public var type: UInt8
+}
 
-    // ── UDP ──
-    public let udpEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let udpSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let udpSrcIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let udpDstIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let udpSrcPorts: UnsafeMutableBufferPointer<UInt16>
-    public let udpDstPorts: UnsafeMutableBufferPointer<UInt16>
-    public let udpPayloadOfs: UnsafeMutableBufferPointer<Int>
-    public let udpPayloadLen: UnsafeMutableBufferPointer<Int>
-    /// IP header length per UDP entry (from IHL field). Used for ICMP Port Unreachable
-    /// where the IP header offset must be computed correctly even when IP options exist.
-    public let udpIPHeaderLens: UnsafeMutableBufferPointer<Int>
-    public var udpCount: Int = 0
+public struct FragmentParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var srcIP: IPv4Address
+    public var dstIP: IPv4Address
+    public var identification: UInt16
+    public var flagsFrag: UInt16
+    public var ipProtocol: UInt8
+    public var frameIdx: Int
+    public var frameLen: Int
+    public var ipHeaderLen: Int
+}
 
-    // ── DNS ──
-    public let dnsEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let dnsSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let dnsSrcIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let dnsDstIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let dnsSrcPorts: UnsafeMutableBufferPointer<UInt16>
-    public let dnsPayloadOfs: UnsafeMutableBufferPointer<Int>
-    public let dnsPayloadLen: UnsafeMutableBufferPointer<Int>
-    public var dnsCount: Int = 0
+public struct UDPParsedFrame {
+    public var endpointID: Int
+    public var srcMAC: MACAddress
+    public var srcIP: IPv4Address
+    public var dstIP: IPv4Address
+    public var srcPort: UInt16
+    public var dstPort: UInt16
+    public var payloadOfs: Int
+    public var payloadLen: Int
+    public var ipHeaderLen: Int
+}
 
-    // ── IPv4 Fragment ──
-    public let fragmentEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let fragmentSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let fragmentSrcIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let fragmentDstIPs: UnsafeMutableBufferPointer<IPv4Address>
-    public let fragmentIdentifications: UnsafeMutableBufferPointer<UInt16>
-    public let fragmentFlagsFrags: UnsafeMutableBufferPointer<UInt16>
-    public let fragmentProtocols: UnsafeMutableBufferPointer<UInt8>
-    public let fragmentFrameIdxs: UnsafeMutableBufferPointer<Int>
-    public let fragmentFrameLens: UnsafeMutableBufferPointer<Int>
-    public let fragmentIPHeaderLens: UnsafeMutableBufferPointer<Int>
-    public var fragmentCount: Int = 0
+// MARK: - Protocol-grouped parse output
 
-    // ── DHCP ──
-    public let dhcpEndpointIDs: UnsafeMutableBufferPointer<Int>
-    public let dhcpSrcMACs: UnsafeMutableBufferPointer<MACAddress>
-    public let dhcpPackets: UnsafeMutableBufferPointer<DHCPPacket>
-    public var dhcpCount: Int = 0
+/// TCP keeps internal SoA — processed column-by-column in processTCPRound.
+/// Class (not struct) so ParseOutput can use `let` — avoids Swift exclusivity
+/// checking overhead on `var` struct properties in the hot path.
+public final class TCPParseGroup {
+    public let keys: UnsafeMutableBufferPointer<NATKey>
+    public let segs: UnsafeMutableBufferPointer<TCPSegmentInfo>
+    public let payloadOfs: UnsafeMutableBufferPointer<Int>
+    public let payloadLen: UnsafeMutableBufferPointer<Int>
+    public let endpointIDs: UnsafeMutableBufferPointer<Int>
+    public let srcMACs: UnsafeMutableBufferPointer<MACAddress>
+    public let capacity: Int
+    public var count: Int = 0
 
-    public init(maxFrames: Int) {
-        self.maxFrames = maxFrames
-        let n = maxFrames
-
-        tcpKeys = .allocate(capacity: n)
-        tcpSegs = .allocate(capacity: n)
-        tcpPayloadOfs = .allocate(capacity: n)
-        tcpPayloadLen = .allocate(capacity: n)
-        tcpEndpointIDs = .allocate(capacity: n)
-        tcpSrcMACs = .allocate(capacity: n)
-
-        arpEndpointIDs = .allocate(capacity: n)
-        arpFrames = .allocate(capacity: n)
-
-        icmpEchoEndpointIDs = .allocate(capacity: n)
-        icmpEchoSrcMACs = .allocate(capacity: n)
-        icmpEchoSrcIPs = .allocate(capacity: n)
-        icmpEchoDstIPs = .allocate(capacity: n)
-        icmpEchoIDs = .allocate(capacity: n)
-        icmpEchoSeqNums = .allocate(capacity: n)
-        icmpEchoPayloadOfs = .allocate(capacity: n)
-        icmpEchoPayloadLen = .allocate(capacity: n)
-        icmpEchoPayloadSum = .allocate(capacity: n)
-
-        unreachEndpointIDs = .allocate(capacity: n)
-        unreachSrcMACs = .allocate(capacity: n)
-        unreachGatewayIPs = .allocate(capacity: n)
-        unreachClientIPs = .allocate(capacity: n)
-        unreachRawOfs = .allocate(capacity: n)
-        unreachRawLen = .allocate(capacity: n)
-        unreachCodes = .allocate(capacity: n)
-        unreachTypes = .allocate(capacity: n)
-
-        udpEndpointIDs = .allocate(capacity: n)
-        udpSrcMACs = .allocate(capacity: n)
-        udpSrcIPs = .allocate(capacity: n)
-        udpDstIPs = .allocate(capacity: n)
-        udpSrcPorts = .allocate(capacity: n)
-        udpDstPorts = .allocate(capacity: n)
-        udpPayloadOfs = .allocate(capacity: n)
-        udpPayloadLen = .allocate(capacity: n)
-        udpIPHeaderLens = .allocate(capacity: n)
-
-        dnsEndpointIDs = .allocate(capacity: n)
-        dnsSrcMACs = .allocate(capacity: n)
-        dnsSrcIPs = .allocate(capacity: n)
-        dnsDstIPs = .allocate(capacity: n)
-        dnsSrcPorts = .allocate(capacity: n)
-        dnsPayloadOfs = .allocate(capacity: n)
-        dnsPayloadLen = .allocate(capacity: n)
-
-        fragmentEndpointIDs = .allocate(capacity: n)
-        fragmentSrcMACs = .allocate(capacity: n)
-        fragmentSrcIPs = .allocate(capacity: n)
-        fragmentDstIPs = .allocate(capacity: n)
-        fragmentIdentifications = .allocate(capacity: n)
-        fragmentFlagsFrags = .allocate(capacity: n)
-        fragmentProtocols = .allocate(capacity: n)
-        fragmentFrameIdxs = .allocate(capacity: n)
-        fragmentFrameLens = .allocate(capacity: n)
-        fragmentIPHeaderLens = .allocate(capacity: n)
-
-        dhcpEndpointIDs = .allocate(capacity: n)
-        dhcpSrcMACs = .allocate(capacity: n)
-        dhcpPackets = .allocate(capacity: n)
+    public init(capacity: Int) {
+        self.capacity = capacity
+        keys = .allocate(capacity: capacity)
+        segs = .allocate(capacity: capacity)
+        payloadOfs = .allocate(capacity: capacity)
+        payloadLen = .allocate(capacity: capacity)
+        endpointIDs = .allocate(capacity: capacity)
+        srcMACs = .allocate(capacity: capacity)
     }
 
-    /// Zero all counters. No memory ops — just integer writes.
+    public func deinitAll() {
+        keys.deallocate()
+        segs.deallocate()
+        payloadOfs.deallocate()
+        payloadLen.deallocate()
+        endpointIDs.deallocate()
+        srcMACs.deallocate()
+    }
+}
+
+/// Dense-struct-array group for protocols processed as whole frames.
+public final class UDPParseGroup {
+    public let frames: UnsafeMutableBufferPointer<UDPParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class DNSParseGroup {
+    public let frames: UnsafeMutableBufferPointer<DNSParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class ICMPEchoParseGroup {
+    public let frames: UnsafeMutableBufferPointer<ICMPEchoParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class ICMPUnreachParseGroup {
+    public let frames: UnsafeMutableBufferPointer<ICMPUnreachParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class FragmentParseGroup {
+    public let frames: UnsafeMutableBufferPointer<FragmentParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class ARPParseGroup {
+    public let frames: UnsafeMutableBufferPointer<ARPParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+public final class DHCPParseGroup {
+    public let frames: UnsafeMutableBufferPointer<DHCPParsedFrame>
+    public let capacity: Int
+    public var count: Int = 0
+
+    public init(capacity: Int) {
+        self.capacity = capacity
+        frames = .allocate(capacity: capacity)
+    }
+    public func deinitAll() { frames.deallocate() }
+}
+
+// MARK: - Parse output (owns all protocol groups)
+
+public final class ParseOutput {
+    public let tcp: TCPParseGroup
+    public let udp: UDPParseGroup
+    public let dns: DNSParseGroup
+    public let icmpEcho: ICMPEchoParseGroup
+    public let unreach: ICMPUnreachParseGroup
+    public let fragment: FragmentParseGroup
+    public let arp: ARPParseGroup
+    public let dhcp: DHCPParseGroup
+
+    public init(maxFrames: Int = 256) {
+        let n = maxFrames
+        tcp      = TCPParseGroup(capacity: n)
+        udp      = UDPParseGroup(capacity: max(32, n / 8))
+        dns      = DNSParseGroup(capacity: max(32, n / 8))
+        icmpEcho = ICMPEchoParseGroup(capacity: max(8, n / 32))
+        unreach  = ICMPUnreachParseGroup(capacity: max(16, n / 16))
+        fragment = FragmentParseGroup(capacity: max(16, n / 16))
+        arp      = ARPParseGroup(capacity: max(8, n / 32))
+        dhcp     = DHCPParseGroup(capacity: max(4, n / 64))
+    }
+
     public func reset() {
-        tcpCount = 0; arpCount = 0; icmpEchoCount = 0; unreachCount = 0
-        udpCount = 0; dnsCount = 0; dhcpCount = 0; fragmentCount = 0
+        tcp.count = 0
+        udp.count = 0
+        dns.count = 0
+        icmpEcho.count = 0
+        unreach.count = 0
+        fragment.count = 0
+        arp.count = 0
+        dhcp.count = 0
     }
 
     deinit {
-        tcpKeys.deallocate()
-        tcpSegs.deallocate()
-        tcpPayloadOfs.deallocate()
-        tcpPayloadLen.deallocate()
-        tcpEndpointIDs.deallocate()
-        tcpSrcMACs.deallocate()
-        arpEndpointIDs.deallocate()
-        arpFrames.deallocate()
-        icmpEchoEndpointIDs.deallocate()
-        icmpEchoSrcMACs.deallocate()
-        icmpEchoSrcIPs.deallocate()
-        icmpEchoDstIPs.deallocate()
-        icmpEchoIDs.deallocate()
-        icmpEchoSeqNums.deallocate()
-        icmpEchoPayloadOfs.deallocate()
-        icmpEchoPayloadLen.deallocate()
-        icmpEchoPayloadSum.deallocate()
-        unreachEndpointIDs.deallocate()
-        unreachSrcMACs.deallocate()
-        unreachGatewayIPs.deallocate()
-        unreachClientIPs.deallocate()
-        unreachRawOfs.deallocate()
-        unreachRawLen.deallocate()
-        unreachCodes.deallocate()
-        unreachTypes.deallocate()
-        udpEndpointIDs.deallocate()
-        udpSrcMACs.deallocate()
-        udpSrcIPs.deallocate()
-        udpDstIPs.deallocate()
-        udpSrcPorts.deallocate()
-        udpDstPorts.deallocate()
-        udpPayloadOfs.deallocate()
-        udpPayloadLen.deallocate()
-        udpIPHeaderLens.deallocate()
-        dnsEndpointIDs.deallocate()
-        dnsSrcMACs.deallocate()
-        dnsSrcIPs.deallocate()
-        dnsDstIPs.deallocate()
-        dnsSrcPorts.deallocate()
-        dnsPayloadOfs.deallocate()
-        dnsPayloadLen.deallocate()
-        fragmentEndpointIDs.deallocate()
-        fragmentSrcMACs.deallocate()
-        fragmentSrcIPs.deallocate()
-        fragmentDstIPs.deallocate()
-        fragmentIdentifications.deallocate()
-        fragmentFlagsFrags.deallocate()
-        fragmentProtocols.deallocate()
-        fragmentFrameIdxs.deallocate()
-        fragmentFrameLens.deallocate()
-        fragmentIPHeaderLens.deallocate()
-
-        dhcpEndpointIDs.deallocate()
-        dhcpSrcMACs.deallocate()
-        dhcpPackets.deallocate()
+        tcp.deinitAll()
+        udp.deinitAll()
+        dns.deinitAll()
+        icmpEcho.deinitAll()
+        unreach.deinitAll()
+        fragment.deinitAll()
+        arp.deinitAll()
+        dhcp.deinitAll()
     }
 }
 

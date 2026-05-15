@@ -58,7 +58,7 @@ public struct DeliberationLoop {
         self.dnsServer = DNSServer(hosts: hosts, upstream: upstreamDNS)
         self.pcapWriter = pcapWriter
 
-        let maxFrames = 256
+        let maxFrames = 4096
         let mtu = endpoints.map { $0.mtu }.max() ?? 1500
         self.io = IOBuffer(maxFrames: maxFrames, mtu: mtu)
         self.parseOutput = ParseOutput(maxFrames: maxFrames)
@@ -171,21 +171,21 @@ public struct DeliberationLoop {
         phaseTiming.icmp &+= cpuNanos() - tICMP
 
         // ── Phase 8.5: IPv4 Fragment Reassembly ──
-        if parseOutput.fragmentCount > 0 {
-            for i in 0..<parseOutput.fragmentCount {
-                let frameIdx = parseOutput.fragmentFrameIdxs[i]
-                let framePtr = io.framePtr(frameIdx)
+        if parseOutput.fragment.count > 0 {
+            for i in 0..<parseOutput.fragment.count {
+                let f = parseOutput.fragment.frames[i]
+                let framePtr = io.framePtr(f.frameIdx)
                 let result = fragmentReassembly.processFragment(
                     framePtr: framePtr,
-                    frameLen: parseOutput.fragmentFrameLens[i],
-                    frameIndex: frameIdx,
-                    identification: parseOutput.fragmentIdentifications[i],
-                    flagsFrag: parseOutput.fragmentFlagsFrags[i],
-                    srcIP: parseOutput.fragmentSrcIPs[i],
-                    dstIP: parseOutput.fragmentDstIPs[i],
-                    protocol: parseOutput.fragmentProtocols[i],
+                    frameLen: f.frameLen,
+                    frameIndex: f.frameIdx,
+                    identification: f.identification,
+                    flagsFrag: f.flagsFrag,
+                    srcIP: f.srcIP,
+                    dstIP: f.dstIP,
+                    protocol: f.ipProtocol,
                     now: nowSec, io: io,
-                    ipHeaderLen: parseOutput.fragmentIPHeaderLens[i]
+                    ipHeaderLen: f.ipHeaderLen
                 )
                 // Reassembled datagram ready — re-inject into parse pipeline.
                 // The reassembled payload is in io.output; for now the caller
@@ -308,49 +308,50 @@ public struct DeliberationLoop {
     // MARK: - Protocol processing (inline for simple protocols)
 
     private mutating func processICMPEcho(outBatch: OutBatch) {
-        for i in 0..<parseOutput.icmpEchoCount {
+        for i in 0..<parseOutput.icmpEcho.count {
+            let f = parseOutput.icmpEcho.frames[i]
             let hdrOfs = buildICMPEchoReplyHeader(
                 io: io,
                 hostMAC: hostMAC,
-                dstMAC: parseOutput.icmpEchoSrcMACs[i],
-                srcIP: parseOutput.icmpEchoDstIPs[i],
-                dstIP: parseOutput.icmpEchoSrcIPs[i],
-                identifier: parseOutput.icmpEchoIDs[i],
-                sequenceNumber: parseOutput.icmpEchoSeqNums[i],
-                payloadLen: parseOutput.icmpEchoPayloadLen[i],
-                payloadSum: parseOutput.icmpEchoPayloadSum[i]
+                dstMAC: f.srcMAC,
+                srcIP: f.dstIP,
+                dstIP: f.srcIP,
+                identifier: f.identifier,
+                sequenceNumber: f.sequenceNumber,
+                payloadLen: f.payloadLen,
+                payloadSum: f.payloadSum
             )
             guard hdrOfs >= 0 else { break }
             let idx = outBatch.count
             guard idx < outBatch.maxFrames else { break }
             outBatch.hdrOfs[idx] = hdrOfs
             outBatch.hdrLen[idx] = ethHeaderLen + ipv4HeaderLen + 8  // 42
-            outBatch.payOfs[idx] = parseOutput.icmpEchoPayloadOfs[i]
-            outBatch.payLen[idx] = parseOutput.icmpEchoPayloadLen[i]
-            outBatch.epIDs[idx] = parseOutput.icmpEchoEndpointIDs[i]
+            outBatch.payOfs[idx] = f.payloadOfs
+            outBatch.payLen[idx] = f.payloadLen
+            outBatch.epIDs[idx] = f.endpointID
             outBatch.payBase[idx] = nil
             outBatch.count += 1
         }
     }
 
     private mutating func processICMPUnreachable(outBatch: OutBatch) {
-        for i in 0..<parseOutput.unreachCount {
+        for i in 0..<parseOutput.unreach.count {
+            let f = parseOutput.unreach.frames[i]
             // Rate limit per destination IP to prevent ICMP error floods.
-            let clientIP = parseOutput.unreachClientIPs[i]
-            guard icmpErrorLimiter.allow(clientIP) else { continue }
+            guard icmpErrorLimiter.allow(f.clientIP) else { continue }
 
             // Compute payload length first so the IPv4 totalLength is accurate.
-            let copyLen = min(28, parseOutput.unreachRawLen[i])
+            let copyLen = min(28, f.rawLen)
             let payloadPtr = copyLen > 0
-                ? UnsafeRawPointer(io.inputBase.advanced(by: parseOutput.unreachRawOfs[i])) : nil
+                ? UnsafeRawPointer(io.inputBase.advanced(by: f.rawOfs)) : nil
             let hdrOfs = buildICMPUnreachableHeader(
                 io: io,
                 hostMAC: hostMAC,
-                clientMAC: parseOutput.unreachSrcMACs[i],
-                gatewayIP: parseOutput.unreachGatewayIPs[i],
-                clientIP: parseOutput.unreachClientIPs[i],
-                code: parseOutput.unreachCodes[i],
-                type: parseOutput.unreachTypes[i],
+                clientMAC: f.srcMAC,
+                gatewayIP: f.gatewayIP,
+                clientIP: f.clientIP,
+                code: f.code,
+                type: f.type,
                 payloadPtr: payloadPtr,
                 payloadLen: copyLen
             )
@@ -359,9 +360,9 @@ public struct DeliberationLoop {
             guard idx < outBatch.maxFrames else { break }
             outBatch.hdrOfs[idx] = hdrOfs
             outBatch.hdrLen[idx] = ethHeaderLen + ipv4HeaderLen + 8  // 42
-            outBatch.payOfs[idx] = parseOutput.unreachRawOfs[i]
+            outBatch.payOfs[idx] = f.rawOfs
             outBatch.payLen[idx] = copyLen
-            outBatch.epIDs[idx] = parseOutput.unreachEndpointIDs[i]
+            outBatch.epIDs[idx] = f.endpointID
             outBatch.payBase[idx] = nil
             outBatch.count += 1
         }
@@ -370,33 +371,26 @@ public struct DeliberationLoop {
     private mutating func processUDP(outBatch: OutBatch,
                                       transport: inout PollingTransport,
                                       nowSec: UInt64) {
-        for i in 0..<parseOutput.udpCount {
-            let srcMAC = parseOutput.udpSrcMACs[i]
-            let srcIP = parseOutput.udpSrcIPs[i]
-            let dstIP = parseOutput.udpDstIPs[i]
-            let srcPort = parseOutput.udpSrcPorts[i]
-            let dstPort = parseOutput.udpDstPorts[i]
-            let payloadOfs = parseOutput.udpPayloadOfs[i]
-            let payloadLen = parseOutput.udpPayloadLen[i]
-            let epID = parseOutput.udpEndpointIDs[i]
+        for i in 0..<parseOutput.udp.count {
+            let f = parseOutput.udp.frames[i]
 
-            if let socket = socketRegistry.lookup(port: dstPort) {
+            if let socket = socketRegistry.lookup(port: f.dstPort) {
                 socket.handleDatagram(
-                    payloadPtr: io.inputBase.advanced(by: payloadOfs),
-                    payloadLen: payloadLen,
-                    srcIP: srcIP, dstIP: dstIP,
-                    srcPort: srcPort, dstPort: dstPort,
-                    srcMAC: srcMAC,
-                    endpointID: epID,
+                    payloadPtr: io.inputBase.advanced(by: f.payloadOfs),
+                    payloadLen: f.payloadLen,
+                    srcIP: f.srcIP, dstIP: f.dstIP,
+                    srcPort: f.srcPort, dstPort: f.dstPort,
+                    srcMAC: f.srcMAC,
+                    endpointID: f.endpointID,
                     hostMAC: hostMAC,
                     outBatch: outBatch, io: io
                 )
             } else {
                 let handled = natTable.processUDP(
-                    srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
-                    srcPort: srcPort, dstPort: dstPort,
-                    payloadOfs: payloadOfs, payloadLen: payloadLen,
-                    endpointID: epID,
+                    srcMAC: f.srcMAC, srcIP: f.srcIP, dstIP: f.dstIP,
+                    srcPort: f.srcPort, dstPort: f.dstPort,
+                    payloadOfs: f.payloadOfs, payloadLen: f.payloadLen,
+                    endpointID: f.endpointID,
                     hostMAC: hostMAC,
                     transport: &transport,
                     io: io,
@@ -404,20 +398,15 @@ public struct DeliberationLoop {
                 )
                 if !handled {
                     // No socket listener and NAT table at capacity → Port Unreachable
-                    let idx = parseOutput.unreachCount
-                    if idx < parseOutput.maxFrames {
-                        // Use actual IP header length from parse (may be >20 with IP options).
-                        let ipHdrLen = parseOutput.udpIPHeaderLens[i]
-                        let ipHdrOfs = payloadOfs - ipHdrLen - udpHeaderLen
-                        parseOutput.unreachEndpointIDs[idx] = epID
-                        parseOutput.unreachSrcMACs[idx] = srcMAC
-                        parseOutput.unreachGatewayIPs[idx] = dstIP
-                        parseOutput.unreachClientIPs[idx] = srcIP
-                        parseOutput.unreachRawOfs[idx] = ipHdrOfs
-                        parseOutput.unreachRawLen[idx] = ipHdrLen + udpHeaderLen + payloadLen
-                        parseOutput.unreachCodes[idx] = 3   // Port Unreachable
-                        parseOutput.unreachTypes[idx] = 3   // Destination Unreachable
-                        parseOutput.unreachCount += 1
+                    let idx = parseOutput.unreach.count
+                    if idx < parseOutput.unreach.capacity {
+                        let ipHdrOfs = f.payloadOfs - f.ipHeaderLen - udpHeaderLen
+                        parseOutput.unreach.frames[idx] = ICMPUnreachParsedFrame(
+                            endpointID: f.endpointID, srcMAC: f.srcMAC,
+                            gatewayIP: f.dstIP, clientIP: f.srcIP,
+                            rawOfs: ipHdrOfs, rawLen: f.ipHeaderLen + udpHeaderLen + f.payloadLen,
+                            code: 3, type: 3)
+                        parseOutput.unreach.count += 1
                     }
                 }
             }
@@ -426,16 +415,17 @@ public struct DeliberationLoop {
 
     private mutating func processDNS(outBatch: OutBatch,
                                       transport: inout PollingTransport) {
-        for i in 0..<parseOutput.dnsCount {
+        for i in 0..<parseOutput.dns.count {
+            let f = parseOutput.dns.frames[i]
             dnsServer.processQuery(
-                payloadPtr: io.inputBase.advanced(by: parseOutput.dnsPayloadOfs[i]),
-                payloadLen: parseOutput.dnsPayloadLen[i],
-                srcIP: parseOutput.dnsSrcIPs[i],
-                dstIP: parseOutput.dnsDstIPs[i],
-                srcPort: parseOutput.dnsSrcPorts[i],
+                payloadPtr: io.inputBase.advanced(by: f.payloadOfs),
+                payloadLen: f.payloadLen,
+                srcIP: f.srcIP,
+                dstIP: f.dstIP,
+                srcPort: f.srcPort,
                 dstPort: 53,
-                srcMAC: parseOutput.dnsSrcMACs[i],
-                endpointID: parseOutput.dnsEndpointIDs[i],
+                srcMAC: f.srcMAC,
+                endpointID: f.endpointID,
                 hostMAC: hostMAC,
                 transport: &transport,
                 outBatch: outBatch, io: io
@@ -444,12 +434,13 @@ public struct DeliberationLoop {
     }
 
     private mutating func processDHCP(outBatch: OutBatch) {
-        for i in 0..<parseOutput.dhcpCount {
-            guard parseOutput.dhcpPackets[i].op == 1 else { continue }
+        for i in 0..<parseOutput.dhcp.count {
+            let f = parseOutput.dhcp.frames[i]
+            guard f.packet.op == 1 else { continue }
             if let (hdrOfs, hdrLen, epID) = dhcpServer.process(
-                packet: parseOutput.dhcpPackets[i],
-                srcMAC: parseOutput.dhcpSrcMACs[i],
-                endpointID: parseOutput.dhcpEndpointIDs[i],
+                packet: f.packet,
+                srcMAC: f.srcMAC,
+                endpointID: f.endpointID,
                 hostMAC: hostMAC,
                 arpMapping: &arpMapping,
                 io: io
@@ -468,9 +459,10 @@ public struct DeliberationLoop {
     }
 
     private mutating func processARP(outBatch: OutBatch) {
-        for i in 0..<parseOutput.arpCount {
+        for i in 0..<parseOutput.arp.count {
+            let f = parseOutput.arp.frames[i]
             guard let (hdrOfs, hdrLen) = arpMapping.processARPRequest(
-                parseOutput.arpFrames[i], io: io
+                f.frame, io: io
             ) else { continue }
             let idx = outBatch.count
             guard idx < outBatch.maxFrames else { break }
@@ -478,7 +470,7 @@ public struct DeliberationLoop {
             outBatch.hdrLen[idx] = hdrLen
             outBatch.payOfs[idx] = -1
             outBatch.payLen[idx] = 0
-            outBatch.epIDs[idx] = parseOutput.arpEndpointIDs[i]
+            outBatch.epIDs[idx] = f.endpointID
             outBatch.payBase[idx] = nil
             outBatch.count += 1
         }

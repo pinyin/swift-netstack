@@ -520,14 +520,20 @@ public struct NATTable {
 
         // ── Step 2: Process VM→external segments ──
         let tFSM = cpuNanos()
-        for i in 0..<out.tcpCount {
-            let key = out.tcpKeys[i]
-            let seg = out.tcpSegs[i]
-            let ep = out.tcpEndpointIDs[i]
-            let srcMAC = out.tcpSrcMACs[i]
-            let payloadPtr: UnsafeRawPointer? = out.tcpPayloadLen[i] > 0
-                ? UnsafeRawPointer(io.inputBase.advanced(by: out.tcpPayloadOfs[i])) : nil
-            let payloadLen = out.tcpPayloadLen[i]
+        let tKeys = out.tcp.keys
+        let tSegs = out.tcp.segs
+        let tEPs = out.tcp.endpointIDs
+        let tMACs = out.tcp.srcMACs
+        let tPayLens = out.tcp.payloadLen
+        let tPayOfs = out.tcp.payloadOfs
+        for i in 0..<out.tcp.count {
+            let key = tKeys[i]
+            let seg = tSegs[i]
+            let ep = tEPs[i]
+            let srcMAC = tMACs[i]
+            let payloadPtr: UnsafeRawPointer? = tPayLens[i] > 0
+                ? UnsafeRawPointer(io.inputBase.advanced(by: tPayOfs[i])) : nil
+            let payloadLen = tPayLens[i]
 
             // New outbound connection
             if seg.flags.isSyn, !seg.flags.isAck {

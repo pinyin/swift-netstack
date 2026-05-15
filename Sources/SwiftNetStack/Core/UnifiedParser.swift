@@ -2,12 +2,12 @@ import Darwin
 
 // MARK: - Unified single-pass parser
 
-/// Parse all frames in IOBuffer.input into ParseOutput SoA arrays.
-/// Replaces the old 5-phase parse (Ethernet → dispatch → IPv4 → ARP → transport).
+/// Parse all frames in IOBuffer.input into protocol-grouped parse output.
 ///
 /// For each frame, the parser reads Ethernet/IPv4/transport headers directly from
-/// the raw pointer and writes categorized results into ParseOutput arrays. No
-/// intermediate allocations, no PacketBuffer, no per-frame heap objects.
+/// the raw pointer and writes categorized results into per-protocol groups.
+/// TCP uses internal SoA (column-by-column access in processTCPRound).
+/// All other protocols use dense struct arrays (whole-frame processing).
 ///
 /// L2-forwarded frames (dstMAC is another VM endpoint) are added to `fwdBatch`
 /// for immediate writing by the caller.
@@ -45,18 +45,13 @@ public func parseAllFrames(
                         // TTL expired → ICMP Time Exceeded (Type 11 Code 0)
                         let srcAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 12), count: 4))
                         let dstAddr = IPv4Address(UnsafeRawBufferPointer(start: ipPtr.advanced(by: 16), count: 4))
-                        let idx = out.unreachCount
-                        if idx < out.maxFrames {
-                            out.unreachEndpointIDs[idx] = epID
-                            out.unreachSrcMACs[idx] = srcMAC
-                            out.unreachGatewayIPs[idx] = dstAddr
-                            out.unreachClientIPs[idx] = srcAddr
-                            out.unreachRawOfs[idx] = i * mtu + ethHeaderLen
-                            out.unreachRawLen[idx] = len - ethHeaderLen
-                            out.unreachCodes[idx] = 0    // Time Exceeded
-                            out.unreachTypes[idx] = 11   // Type 11
-                            out.unreachCount += 1
-                        }
+                        let idx = out.unreach.count
+                        guard idx < out.unreach.capacity else { continue }
+                        out.unreach.frames[idx] = ICMPUnreachParsedFrame(
+                            endpointID: epID, srcMAC: srcMAC, gatewayIP: dstAddr, clientIP: srcAddr,
+                            rawOfs: i * mtu + ethHeaderLen, rawLen: len - ethHeaderLen,
+                            code: 0, type: 11)
+                        out.unreach.count += 1
                         continue
                     }
                 }
@@ -94,11 +89,10 @@ private func parseOneARP(
     ptr: UnsafeMutableRawPointer, len: Int, epID: Int, out: ParseOutput
 ) {
     guard let arp = ARPFrame.parse(from: UnsafeRawPointer(ptr), len: len) else { return }
-    let idx = out.arpCount
-    guard idx < out.maxFrames else { return }
-    out.arpEndpointIDs[idx] = epID
-    out.arpFrames[idx] = arp
-    out.arpCount += 1
+    let idx = out.arp.count
+    guard idx < out.arp.capacity else { return }
+    out.arp.frames[idx] = ARPParsedFrame(endpointID: epID, frame: arp)
+    out.arp.count += 1
 }
 
 @inline(__always)
@@ -128,19 +122,14 @@ private func parseOneIPv4(
     // Fragment detection: MF=1 (0x2000) or offset>0 (0x1FFF)
     let isFragment = (flagsFrag & 0x3FFF) != 0
     if isFragment {
-        let idx = out.fragmentCount
-        guard idx < out.maxFrames else { return }
-        out.fragmentEndpointIDs[idx] = epID
-        out.fragmentSrcMACs[idx] = srcMAC
-        out.fragmentSrcIPs[idx] = srcAddr
-        out.fragmentDstIPs[idx] = dstAddr
-        out.fragmentIdentifications[idx] = readUInt16BE(ipPtr, 4)
-        out.fragmentFlagsFrags[idx] = flagsFrag
-        out.fragmentProtocols[idx] = rawProtocol
-        out.fragmentFrameIdxs[idx] = frameIdx
-        out.fragmentFrameLens[idx] = frameLen
-        out.fragmentIPHeaderLens[idx] = ihl * 4
-        out.fragmentCount += 1
+        let idx = out.fragment.count
+        guard idx < out.fragment.capacity else { return }
+        out.fragment.frames[idx] = FragmentParsedFrame(
+            endpointID: epID, srcMAC: srcMAC, srcIP: srcAddr, dstIP: dstAddr,
+            identification: readUInt16BE(ipPtr, 4), flagsFrag: flagsFrag,
+            ipProtocol: rawProtocol, frameIdx: frameIdx, frameLen: frameLen,
+            ipHeaderLen: ihl * 4)
+        out.fragment.count += 1
         return
     }
 
@@ -170,17 +159,13 @@ private func parseOneIPv4(
 
     default:
         // Unknown protocol → ICMP unreachable
-        let idx = out.unreachCount
-        guard idx < out.maxFrames else { return }
-        out.unreachEndpointIDs[idx] = epID
-        out.unreachSrcMACs[idx] = srcMAC
-        out.unreachGatewayIPs[idx] = dstAddr
-        out.unreachClientIPs[idx] = srcAddr
-        out.unreachRawOfs[idx] = baseOfs + ipOfs
-        out.unreachRawLen[idx] = frameLen - ipOfs
-        out.unreachCodes[idx] = 2   // Protocol Unreachable
-        out.unreachTypes[idx] = 3   // Destination Unreachable
-        out.unreachCount += 1
+        let idx = out.unreach.count
+        guard idx < out.unreach.capacity else { return }
+        out.unreach.frames[idx] = ICMPUnreachParsedFrame(
+            endpointID: epID, srcMAC: srcMAC, gatewayIP: dstAddr, clientIP: srcAddr,
+            rawOfs: baseOfs + ipOfs, rawLen: frameLen - ipOfs,
+            code: 2, type: 3)
+        out.unreach.count += 1
     }
 }
 
@@ -198,19 +183,15 @@ private func parseOneICMP(
     let sequenceNumber = readUInt16BE(ptr, 6)
 
     if icmpType == 8, icmpCode == 0 {
-        let idx = out.icmpEchoCount
-        guard idx < out.maxFrames else { return }
+        let idx = out.icmpEcho.count
+        guard idx < out.icmpEcho.capacity else { return }
         let totalPayloadOfs = baseOfs + ipPayloadOfs
-        out.icmpEchoEndpointIDs[idx] = epID
-        out.icmpEchoSrcMACs[idx] = srcMAC
-        out.icmpEchoSrcIPs[idx] = srcIP
-        out.icmpEchoDstIPs[idx] = dstIP
-        out.icmpEchoIDs[idx] = identifier
-        out.icmpEchoSeqNums[idx] = sequenceNumber
-        out.icmpEchoPayloadOfs[idx] = totalPayloadOfs + 8
-        out.icmpEchoPayloadLen[idx] = len - 8
-        out.icmpEchoPayloadSum[idx] = checksumAdd(0, UnsafeRawPointer(ptr.advanced(by: 8)), len - 8)
-        out.icmpEchoCount += 1
+        out.icmpEcho.frames[idx] = ICMPEchoParsedFrame(
+            endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
+            identifier: identifier, sequenceNumber: sequenceNumber,
+            payloadOfs: totalPayloadOfs + 8, payloadLen: len - 8,
+            payloadSum: checksumAdd(0, UnsafeRawPointer(ptr.advanced(by: 8)), len - 8))
+        out.icmpEcho.count += 1
     }
     // Non-echo ICMP is silently ignored
 }
@@ -257,19 +238,19 @@ private func parseOneTCP(
         }
     }
 
-    let idx = out.tcpCount
-    guard idx < out.maxFrames else { return }
+    let idx = out.tcp.count
+    guard idx < out.tcp.capacity else { return }
 
-    out.tcpKeys[idx] = NATKey(vmIP: srcIP, vmPort: srcPort,
+    out.tcp.keys[idx] = NATKey(vmIP: srcIP, vmPort: srcPort,
                                dstIP: dstIP, dstPort: dstPort, protocol: .tcp)
-    out.tcpSegs[idx] = TCPSegmentInfo(seq: seqNum, ack: ackNum,
+    out.tcp.segs[idx] = TCPSegmentInfo(seq: seqNum, ack: ackNum,
                                         flags: flags, window: window,
                                         peerWindowScale: peerWindowScale)
-    out.tcpPayloadOfs[idx] = baseOfs + ipPayloadOfs + tcpHeaderLen
-    out.tcpPayloadLen[idx] = len - tcpHeaderLen
-    out.tcpEndpointIDs[idx] = epID
-    out.tcpSrcMACs[idx] = srcMAC
-    out.tcpCount += 1
+    out.tcp.payloadOfs[idx] = baseOfs + ipPayloadOfs + tcpHeaderLen
+    out.tcp.payloadLen[idx] = len - tcpHeaderLen
+    out.tcp.endpointIDs[idx] = epID
+    out.tcp.srcMACs[idx] = srcMAC
+    out.tcp.count += 1
 }
 
 @inline(__always)
@@ -294,37 +275,27 @@ private func parseOneUDP(
         // DHCP
         guard let dhcp = DHCPPacket.parse(from: UnsafeRawPointer(ptr.advanced(by: 8)),
                                            len: payloadLen) else { return }
-        let idx = out.dhcpCount
-        guard idx < out.maxFrames else { return }
-        out.dhcpEndpointIDs[idx] = epID
-        out.dhcpSrcMACs[idx] = srcMAC
-        out.dhcpPackets[idx] = dhcp
-        out.dhcpCount += 1
+        let idx = out.dhcp.count
+        guard idx < out.dhcp.capacity else { return }
+        out.dhcp.frames[idx] = DHCPParsedFrame(endpointID: epID, srcMAC: srcMAC, packet: dhcp)
+        out.dhcp.count += 1
     } else if dstPort == 53 {
         // DNS
-        let idx = out.dnsCount
-        guard idx < out.maxFrames else { return }
-        out.dnsEndpointIDs[idx] = epID
-        out.dnsSrcMACs[idx] = srcMAC
-        out.dnsSrcIPs[idx] = srcIP
-        out.dnsDstIPs[idx] = dstIP
-        out.dnsSrcPorts[idx] = srcPort
-        out.dnsPayloadOfs[idx] = totalPayloadOfs + 8
-        out.dnsPayloadLen[idx] = payloadLen
-        out.dnsCount += 1
+        let idx = out.dns.count
+        guard idx < out.dns.capacity else { return }
+        out.dns.frames[idx] = DNSParsedFrame(
+            endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
+            srcPort: srcPort, payloadOfs: totalPayloadOfs + 8, payloadLen: payloadLen)
+        out.dns.count += 1
     } else {
         // Generic UDP
-        let idx = out.udpCount
-        guard idx < out.maxFrames else { return }
-        out.udpEndpointIDs[idx] = epID
-        out.udpSrcMACs[idx] = srcMAC
-        out.udpSrcIPs[idx] = srcIP
-        out.udpDstIPs[idx] = dstIP
-        out.udpSrcPorts[idx] = srcPort
-        out.udpDstPorts[idx] = dstPort
-        out.udpPayloadOfs[idx] = totalPayloadOfs + 8
-        out.udpPayloadLen[idx] = payloadLen
-        out.udpIPHeaderLens[idx] = ipHeaderLen
-        out.udpCount += 1
+        let idx = out.udp.count
+        guard idx < out.udp.capacity else { return }
+        out.udp.frames[idx] = UDPParsedFrame(
+            endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
+            srcPort: srcPort, dstPort: dstPort,
+            payloadOfs: totalPayloadOfs + 8, payloadLen: payloadLen,
+            ipHeaderLen: ipHeaderLen)
+        out.udp.count += 1
     }
 }

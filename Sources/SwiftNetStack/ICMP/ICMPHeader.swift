@@ -55,7 +55,7 @@ public struct ICMPHeader {
 ///
 /// The ICMP checksum covers header + payload per RFC 792.  The payload's
 /// one's complement sum is pre-computed during parse and stored in
-/// ParseOutput.icmpEchoPayloadSum, so the build phase only folds the 8-byte
+/// ICMPEchoParsedFrame.payloadSum, so the build phase only folds the 8-byte
 /// header into it — zero payload touch in the hot path.
 public func buildICMPEchoReplyHeader(
     io: IOBuffer,

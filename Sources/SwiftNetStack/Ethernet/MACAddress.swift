@@ -37,13 +37,13 @@ public struct MACAddress: Equatable, Hashable, CustomStringConvertible, @uncheck
     }
 
     /// Write into 6 bytes at pointer.
+    /// Uses two wide writes (UInt32 + UInt16) instead of six byte writes.
     public func write(to ptr: UnsafeMutableRawPointer) {
-        ptr.storeBytes(of: octets.0, toByteOffset: 0, as: UInt8.self)
-        ptr.storeBytes(of: octets.1, toByteOffset: 1, as: UInt8.self)
-        ptr.storeBytes(of: octets.2, toByteOffset: 2, as: UInt8.self)
-        ptr.storeBytes(of: octets.3, toByteOffset: 3, as: UInt8.self)
-        ptr.storeBytes(of: octets.4, toByteOffset: 4, as: UInt8.self)
-        ptr.storeBytes(of: octets.5, toByteOffset: 5, as: UInt8.self)
+        let hi = (UInt32(octets.0) << 24) | (UInt32(octets.1) << 16)
+                | (UInt32(octets.2) << 8)  |  UInt32(octets.3)
+        let lo = (UInt16(octets.4) << 8) | UInt16(octets.5)
+        ptr.storeBytes(of: hi.bigEndian, as: UInt32.self)
+        ptr.advanced(by: 4).storeBytes(of: lo.bigEndian, as: UInt16.self)
     }
 }
 

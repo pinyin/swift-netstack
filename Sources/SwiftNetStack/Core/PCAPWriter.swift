@@ -35,20 +35,31 @@ public final class PCAPWriter {
     }
 
     /// Write a split frame (header + payload from separate buffers) to the capture.
-    /// Copies both parts into a stack buffer then writes as a single record.
+    /// Uses writev to avoid heap allocation — pcap record header + hdr + pay in one syscall.
     public func writeRawSplit(hdr: UnsafeMutableRawPointer, hdrLen: Int,
                                pay: UnsafeMutableRawPointer, payLen: Int) {
         guard fd >= 0 else { return }
         let total = hdrLen + payLen
         guard total > 0 else { return }
-        // Stack-allocate for small frames (typical MTU is 1500)
-        var buf = [UInt8](repeating: 0, count: total)
-        buf.withUnsafeMutableBytes { ptr in
-            ptr.baseAddress!.copyMemory(from: hdr, byteCount: hdrLen)
-            ptr.baseAddress!.advanced(by: hdrLen).copyMemory(from: pay, byteCount: payLen)
-        }
-        buf.withUnsafeBytes { ptr in
-            write(raw: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self), length: total)
+
+        var tv = timeval()
+        gettimeofday(&tv, nil)
+
+        var pcapHdr = pcaprec_hdr(
+            ts_sec: UInt32(tv.tv_sec),
+            ts_usec: UInt32(tv.tv_usec),
+            incl_len: UInt32(total),
+            orig_len: UInt32(total)
+        )
+
+        withUnsafeMutablePointer(to: &pcapHdr) { pcapHdrPtr in
+            let iov0 = iovec(iov_base: pcapHdrPtr, iov_len: MemoryLayout<pcaprec_hdr>.size)
+            let iov1 = iovec(iov_base: hdr, iov_len: hdrLen)
+            let iov2 = iovec(iov_base: pay, iov_len: payLen)
+            var iovs = (iov0, iov1, iov2)
+            _ = withUnsafeMutableBytes(of: &iovs) { buf in
+                Darwin.writev(fd, buf.baseAddress!.assumingMemoryBound(to: iovec.self), 3)
+            }
         }
     }
 

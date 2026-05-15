@@ -465,16 +465,14 @@ public struct NATTable {
         transport: inout PollingTransport,
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
-        nowSec: UInt64,
-        nowUs: UInt64
+        nowSec: UInt64
     ) {
 #if DEBUG
         // debug round tracking; caller can update via debugRound if desired
 #endif
 
-        // Capture fresh timestamp for deadline computations (the caller's
-        // nowUs may be many milliseconds stale — poll() + parse phases
-        // 2-10 complete between its capture and processTCPRound).
+        // Capture fresh timestamp for deadline computations — poll() + parse
+        // phases 2-10 complete between runOneRound's timestamp and here.
         let freshNowUs = monotonicMicros()
 
         // ── Step 0: Process TCP timers (RTO, delayed ACK, persist) in one pass ──

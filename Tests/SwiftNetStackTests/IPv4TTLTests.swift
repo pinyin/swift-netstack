@@ -55,3 +55,37 @@ import Darwin
         #expect(ck == 0, "checksum valid at TTL \(expectedTTL), got \(ck)")
     }
 }
+
+// MARK: - IPv4 totalLength incremental checksum (RFC 1624)
+
+@Test func incrementalIPv4Checksum_totalLengthChange() {
+    /// Full recomputation: zero checksum, compute over 20 bytes.
+    func fullCK(_ ptr: UnsafeMutableRawPointer) -> UInt16 {
+        writeUInt16BE(0, to: ptr.advanced(by: 10))
+        let ck = internetChecksum(UnsafeRawBufferPointer(start: ptr, count: 20))
+        writeUInt16BE(ck, to: ptr.advanced(by: 10))
+        return ck
+    }
+
+    /// Incremental: HC' = ~(~HC + delta). Only totalLength changed.
+    func incCK(_ ptr: UnsafeMutableRawPointer, oldCK: UInt16, delta: Int) -> UInt16 {
+        var sum = UInt32(~oldCK) &+ UInt32(delta)
+        sum = (sum & 0xFFFF) &+ (sum >> 16)
+        sum = (sum & 0xFFFF) &+ (sum >> 16)
+        let ck = ~UInt16(sum & 0xFFFF)
+        writeUInt16BE(ck, to: ptr.advanced(by: 10))
+        return ck
+    }
+
+    for pl in [1, 40, 256, 512, 1024, 1460, 32767, 65535 - 40] {
+        let buf = UnsafeMutableRawBufferPointer.allocate(byteCount: 20, alignment: 4)
+        defer { buf.deallocate() }
+        writeIPv4Header(to: buf.baseAddress!, totalLength: 40, protocol: .tcp,
+                        srcIP: IPv4Address(10, 0, 0, 1), dstIP: IPv4Address(10, 0, 0, 2))
+        let old = readUInt16BE(buf.baseAddress!, 10)
+        writeUInt16BE(UInt16(40 + pl), to: buf.baseAddress!.advanced(by: 2))
+        let inc = incCK(buf.baseAddress!, oldCK: old, delta: pl)
+        let full = fullCK(buf.baseAddress!)
+        #expect(inc == full, "payloadLen=\(pl): inc \(inc) != full \(full)")
+    }
+}

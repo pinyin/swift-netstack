@@ -127,7 +127,7 @@ public struct DeliberationLoop {
             let deltaUs = deadline > nowUs ? deadline - nowUs : 0
             transport.pollTimeout = Int32(max(1, Int(deltaUs / 1000)))
         } else {
-            transport.pollTimeout = 5  // 5ms fallback (was 100ms)
+            transport.pollTimeout = 50  // 50ms idle fallback (was 5ms)
         }
 
         // ── Phase 1: Poll ──
@@ -302,8 +302,7 @@ public struct DeliberationLoop {
             transport: &transport,
             hostMAC: hostMAC,
             arpMapping: arpMapping,
-            nowSec: nowSec,
-            nowUs: nowUs
+            nowSec: nowSec
         )
         phaseTiming.tcp &+= cpuNanos() - tTCP
 

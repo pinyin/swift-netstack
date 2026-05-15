@@ -11,7 +11,7 @@ import Testing
     let (newState, toSend, _, dataLen) = tcpProcess(
         state: .closeWait, seg: seg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     // snd.una should advance from 100 → 500
@@ -31,7 +31,7 @@ import Testing
     let (_, _, _, _) = tcpProcess(
         state: .closeWait, seg: oldSeg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     // snd.una must NOT rewind from 1500 back to 1000
@@ -48,7 +48,7 @@ import Testing
     let (newState, toSend, _, dataLen) = tcpProcess(
         state: .finWait2, seg: seg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     #expect(snd.una == 800, "finWait2 pure ACK must advance snd.una")
@@ -69,7 +69,7 @@ import Testing
     let (_, _, _, _) = tcpProcess(
         state: .established, seg: oldSeg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     #expect(snd.una == 3000, "established must not rewind snd.una on old/reordered ACK")
@@ -84,7 +84,7 @@ import Testing
     let (_, _, _, _) = tcpProcess(
         state: .established, seg: seg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     #expect(snd.una == 4000, "established pure ACK must advance snd.una forward")
@@ -102,7 +102,7 @@ import Testing
     let (_, _, _, _) = tcpProcess(
         state: .closeWait, seg: seg,
         payloadPtr: nil, payloadLen: 0,
-        snd: &snd, rcv: &rcv, appClose: false
+        snd: &snd, rcv: &rcv
     )
 
     // ack=50 is ahead of una=(max-100) in 32-bit wrap space

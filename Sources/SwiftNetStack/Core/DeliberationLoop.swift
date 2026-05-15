@@ -100,11 +100,11 @@ public struct DeliberationLoop {
             arpMapping.reapExpired(now: nowSec)
             lastARPReapSec = nowSec
         }
-        // Pick the earliest deadline among delayed ACKs, RTO, and persist timers
+        // Pick the earliest deadline among RTO and persist timers
         let deadlines = natTable.nextDeadlines()
-        var earliestDeadline = deadlines.ack
+        var earliestDeadline: UInt64?
         if let rtoDL = deadlines.rto {
-            if earliestDeadline == nil || rtoDL < earliestDeadline! { earliestDeadline = rtoDL }
+            earliestDeadline = rtoDL
         }
         if let persistDL = deadlines.persist {
             if earliestDeadline == nil || persistDL < earliestDeadline! { earliestDeadline = persistDL }

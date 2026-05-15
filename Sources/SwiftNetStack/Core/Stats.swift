@@ -39,15 +39,9 @@ public struct TransportStats {
 
 // MARK: - NATStats
 
-/// NAT-level delayed ACK and checksum counters.
+/// NAT-level ACK and checksum counters.
 public struct NATStats {
-    /// Number of pure ACK segments deferred (delayed ACK).
-    public var ackDeferred: UInt64 = 0
-    /// Number of deferred ACKs replaced by a newer ACK before being sent.
-    public var ackOverwritten: UInt64 = 0
-    /// Number of deferred ACKs sent via timer expiry (flushExpiredDelayedACKs).
-    public var ackFlushedTimer: UInt64 = 0
-    /// Number of deferred ACKs sent immediately (before a non-ACK segment).
+    /// Number of proactive ACKs sent (window updates, etc.).
     public var ackFlushedImmediate: UInt64 = 0
     /// Number of ACK frames built from the pre-built 54-byte template.
     public var ackTemplateUsed: UInt64 = 0
@@ -232,11 +226,8 @@ public func printStats(
     if t.sendBytes > 0     { parts.append("sendMB=\(t.sendBytes / 1_000_000)") }
 
     // ── NAT counters ──
-    if n.ackDeferred > 0 {
-        let flushed = n.ackFlushedTimer + n.ackFlushedImmediate
-        let remaining = flushed >= n.ackDeferred ? UInt64(0) : n.ackDeferred - flushed
-        let coalesce = Int(Double(remaining) / Double(n.ackDeferred) * 100)
-        parts.append("ackDef=\(n.ackDeferred) ovrw=\(n.ackOverwritten) timer=\(n.ackFlushedTimer) imm=\(n.ackFlushedImmediate) coalesce=\(coalesce)%")
+    if n.ackFlushedImmediate > 0 {
+        parts.append("ackImm=\(n.ackFlushedImmediate)")
     }
     if n.ackTemplateUsed + n.ackTemplateFallback > 0 {
         parts.append("ackTmpl=\(n.ackTemplateUsed)/\(n.ackTemplateUsed + n.ackTemplateFallback)")

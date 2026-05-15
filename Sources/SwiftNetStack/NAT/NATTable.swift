@@ -239,22 +239,17 @@ public struct NATTable {
 
     /// Returns the earliest deadline for each timer category, or nil if none.
     /// Scans tcpEntries once instead of three separate passes.
-    public func nextDeadlines() -> (ack: UInt64?, rto: UInt64?, persist: UInt64?) {
-        var ackDL: UInt64?
+    public func nextDeadlines() -> (rto: UInt64?, persist: UInt64?) {
         var rtoDL: UInt64?
         var persistDL: UInt64?
         for entry in tcpEntries.values {
             let c = entry.connection
-            if c.pendingDelayedACK {
-                let dl = c.delayedACKDeadline
-                if ackDL == nil || dl < ackDL! { ackDL = dl }
-            }
             let rdl = c.rtoDeadline
             if rdl != 0, rtoDL == nil || rdl < rtoDL! { rtoDL = rdl }
             let pdl = c.persistDeadline
             if pdl != 0, persistDL == nil || pdl < persistDL! { persistDL = pdl }
         }
-        return (ackDL, rtoDL, persistDL)
+        return (rtoDL, persistDL)
     }
 
     // MARK: - Unified timer processing (single pass over tcpEntries)
@@ -272,7 +267,7 @@ public struct NATTable {
                 if let epFD = transport.fdForEndpoint(c.endpointID) {
                     let inFlight = c.snd.nxt &- c.snd.una
                     if inFlight > 0 {
-                        // Loss-tolerant: retransmit without reducing cwnd.
+                        // Loss-tolerant: retransmit without congestion backoff.
                         c.dupAckCount = 0
                         c.lastAckValue = 0
                         let oldRTO = c.rtoValue
@@ -282,11 +277,7 @@ public struct NATTable {
                         c.rtoIsRetransmit = true
 
                         if let rtData = c.peekRetransmitData(max: min(mss, c.totalQueuedBytes)) {
-                            var rtLen = rtData.len
-                            if let firstSacked = c.sackBlocks.firstSackedAfter(from: c.snd.una) {
-                                let sackedOffset = Int(firstSacked &- c.snd.una)
-                                if sackedOffset > 0, sackedOffset < rtLen { rtLen = sackedOffset }
-                            }
+                            let rtLen = rtData.len
                             if rtLen > 0 {
                                 stats.rtoExpired += 1
                                 let rr = sendOneDataSegment(
@@ -304,18 +295,6 @@ public struct NATTable {
                         c.rtoDeadline = 0  // all data ACKed
                     }
                 }
-            }
-
-            // ── Delayed ACK flush ──
-            if c.pendingDelayedACK, c.delayedACKDeadline <= nowUs {
-                if buildAckFrame(
-                    conn: c, seq: c.delayedACKSeq, ack: c.delayedACKAck,
-                    window: wireWindow(c.availableWindow, scale: c.ourWindowScale),
-                    io: io, transport: &transport
-                ) {
-                    stats.ackFlushedTimer += 1
-                }
-                c.pendingDelayedACK = false
             }
 
             // ── Persist timer (RFC 1122 §4.2.2.17) ──
@@ -357,49 +336,7 @@ public struct NATTable {
         let hdrOfs: Int
         let hdrLen: Int
 
-        // SACK path: scoreboard has blocks and peer supports SACK.
-        // Variable-length frame — template-based paths cannot be used.
-        if conn.sackOK, conn.sackBlocks.count > 0 {
-            stats.ackChecksumFull += 1
-            var opts: [UInt8] = []
-            if conn.tsOK {
-                let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
-                let tsecr = conn.tsRecent
-                opts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: tsecr))
-            }
-            opts.append(contentsOf: conn.sackBlocks.buildSACKOption(limit: conn.tsOK ? 3 : 4))
-            while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
-
-            let tcpHdrLen = 20 + opts.count
-            hdrLen = 14 + 20 + tcpHdrLen
-            hdrOfs = buildTCPHeaderWithOptions(
-                io: io, hostMAC: conn.hostMAC, dstMAC: conn.vmMAC,
-                srcIP: conn.dstIP, dstIP: conn.vmIP,
-                srcPort: conn.dstPort, dstPort: conn.vmPort,
-                seqNumber: seq, ackNumber: ack,
-                flags: .ack, window: window,
-                options: opts
-            )
-            if hdrOfs >= 0 {
-                finalizeTCPChecksumEx(io: io, hdrOfs: hdrOfs,
-                    srcIP: conn.dstIP, dstIP: conn.vmIP,
-                    tcpHdrLen: tcpHdrLen,
-                    payloadPtr: nil, payloadLen: 0)
-            }
-            // SACK blocks change every ACK — checksum caching is useless
-            conn.ackChecksumValid = false
-        } else if let tmpl = conn.ackTemplateExt {
-            // 66-byte template with TSopt — always full checksum
-            stats.ackTemplateUsed += 1
-            stats.ackChecksumFull += 1
-            let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
-            let tsecr = conn.tsRecent
-            hdrOfs = writeAckFromTemplateExt(io: io, template: tmpl,
-                seq: seq, ack: ack,
-                srcIP: conn.dstIP, dstIP: conn.vmIP,
-                window: window, tsval: tsval, tsecr: tsecr, outCK: &outCK)
-            hdrLen = 66
-        } else if let tmpl = conn.ackTemplate {
+        if let tmpl = conn.ackTemplate {
             // 54-byte template — incremental checksum when possible
             stats.ackTemplateUsed += 1
             let incCK: UInt16?
@@ -447,13 +384,8 @@ public struct NATTable {
         conn.lastACKAck = ack
         conn.lastACKWindow = window
         conn.lastAdvertisedWindow = UInt32(window) << conn.ourWindowScale
-        // Only cache checksum for 54-byte template (incremental reuse).
-        // SACK and TSopt paths are excluded — they use full checksum.
         if conn.ackChecksumValid {
-            // still valid — maintained by 54-byte template path
-        } else if conn.sackBlocks.count == 0,
-                  conn.ackTemplateExt == nil,
-                  conn.ackTemplate != nil {
+        } else if conn.ackTemplate != nil {
             conn.ackChecksumValid = true
             conn.lastACKChecksum = outCK
         }
@@ -628,13 +560,6 @@ public struct NATTable {
                 }
             }
 
-            // PAWS check (RFC 7323 §4.2.1): drop if TSval is too old.
-            if entry.connection.tsOK, seg.tsOK,
-               entry.connection.tsRecent != 0,
-               seg.tsval < entry.connection.tsRecent {
-                continue
-            }
-
             let oldState = entry.connection.state
             let oldUna = entry.connection.snd.una
             let oldRcvNxt = entry.connection.rcv.nxt
@@ -653,7 +578,7 @@ public struct NATTable {
             let (newState, toSend, dataPtr, dataLen) = tcpProcess(
                 state: entry.connection.state, seg: seg,
                 payloadPtr: payloadPtr, payloadLen: payloadLen,
-                snd: &entry.connection.snd, rcv: &entry.connection.rcv, appClose: false
+                snd: &entry.connection.snd, rcv: &entry.connection.rcv
             )
             entry.connection.state = newState
             // Apply peer window scaling (FSM stores raw wire window from seg.window)
@@ -664,23 +589,10 @@ public struct NATTable {
                 entry.connection.persistBackoffCount = 0
             }
 
-            // Record TSval for next PAWS check
-            if entry.connection.tsOK, seg.tsOK {
-                entry.connection.tsRecent = seg.tsval
-                entry.connection.tsRecentAge = nowUs
-            }
-
-            // Record out-of-order data in SACK scoreboard
-            if payloadLen > 0, seg.seq > oldRcvNxt {
-                entry.connection.sackBlocks.record(seg.seq, seg.seq &+ UInt32(payloadLen))
-            }
-
             if newState == .established && entry.connection.ackTemplate == nil {
                 // For inbound connections, learn VM capabilities from SYN-ACK
                 if entry.isInbound, seg.flags.isSyn {
                     entry.connection.peerWindowScale = seg.peerWindowScale
-                    entry.connection.sackOK = seg.sackOK
-                    entry.connection.tsOK = seg.tsOK && entry.connection.ourTSOK
                 }
                 entry.connection.ackTemplate = makeAckTemplate(
                     hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
@@ -688,14 +600,6 @@ public struct NATTable {
                     srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
                     window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale)
                 )
-                if entry.connection.tsOK {
-                    entry.connection.ackTemplateExt = makeAckTemplateWithTSopt(
-                        hostMAC: entry.connection.hostMAC, vmMAC: entry.connection.vmMAC,
-                        srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,
-                        srcPort: entry.connection.dstPort, dstPort: entry.connection.vmPort,
-                        window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale)
-                    )
-                }
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
             if unaDelta > 0 {
@@ -710,7 +614,6 @@ public struct NATTable {
 
                 // RFC 6298 RTT measurement: compute sample if we have a valid send timestamp
                 // and this ACK acknowledges new (non-retransmitted) data.
-                let rtoWasArmed = entry.connection.rtoDeadline != 0
                 let measurable = entry.connection.rtoMeasuredSeq != 0
                     && (entry.connection.snd.una &- entry.connection.rtoMeasuredSeq) < (1 << 31)
                 if measurable, !entry.connection.rtoIsRetransmit {
@@ -757,77 +660,41 @@ public struct NATTable {
                     entry.connection.dupAckCount = 1
                 }
             }
-            // Loss-tolerant fast retransmit (no cwnd reduction).
+            // Loss-tolerant fast retransmit.
             // virtio-net has zero real congestion — all apparent "loss" is
-            // artificial netem injection. Reducing cwnd on loss is actively
-            // harmful: it throttles the sender for no reason.
-            //
-            // On 3 dup ACKs, retransmit snd.una immediately. If the
-            // retransmit is also lost, retransmit again with exponential
-            // backoff (srtt-based). cwnd is never reduced; it only grows
-            // via slow-start / congestion-avoidance on new ACKs.
-            //
-            // The old RFC 5681 recovery state machine is retained in the
-            // `else` branch for the unlikely case another path sets
-            // inRecovery, but the primary path no longer enters recovery.
+            // buffer pressure, not network congestion. On 3 dup ACKs,
+            // retransmit snd.una immediately.
             let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
             let unaAdvanced = unaDelta > 0
             var doRetransmit = false
-            if !entry.connection.snd.inRecovery {
-                if entry.connection.dupAckCount >= 3 && !unaAdvanced, inFlight > 0 {
-                    if entry.connection.snd.nonRecoveryRtxCount == 0 {
-                        // First retransmit for this hole: immediate.
-                        entry.connection.snd.nonRecoveryRtxCount = 1
+            if entry.connection.dupAckCount >= 3 && !unaAdvanced, inFlight > 0 {
+                if entry.connection.snd.nonRecoveryRtxCount == 0 {
+                    // First retransmit for this hole: immediate.
+                    entry.connection.snd.nonRecoveryRtxCount = 1
+                    entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
+                    stats.tcpFastRecovery += 1
+                    doRetransmit = true
+                } else {
+                    // Already retransmitted this hole. Retransmit again
+                    // at most once per RTT (srtt-based interval).
+                    let elapsed = freshNowUs &- entry.connection.snd.lastNonRecoveryRtxTime
+                    let minInterval = entry.connection.srtt > 0
+                        ? entry.connection.srtt
+                        : 200_000
+                    if elapsed > minInterval {
+                        entry.connection.snd.nonRecoveryRtxCount += 1
                         entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
                         stats.tcpFastRecovery += 1
                         doRetransmit = true
-                    } else {
-                        // Already retransmitted this hole. Retransmit again
-                        // at most once per RTT (srtt-based interval, no
-                        // exponential growth — loss-tolerant, not congestion).
-                        let elapsed = freshNowUs &- entry.connection.snd.lastNonRecoveryRtxTime
-                        let minInterval = entry.connection.srtt > 0
-                            ? entry.connection.srtt
-                            : 200_000
-                        if elapsed > minInterval {
-                            entry.connection.snd.nonRecoveryRtxCount += 1
-                            entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
-                            stats.tcpFastRecovery += 1
-                            doRetransmit = true
-                        }
                     }
-                }
-            } else {
-                let ackValue = seg.ack
-                if (ackValue &- entry.connection.snd.recover) < (1 << 31) {
-                    // Full ACK: ack >= recover — exit recovery
-                    entry.connection.snd.cwnd = min(entry.connection.snd.ssthresh, inFlight + UInt32(mss))
-                    entry.connection.snd.inRecovery = false
-                } else if unaAdvanced, inFlight > 0 {
-                    // Partial ACK: deflate cwnd by amount ACKed, inflate by MSS.
-                    entry.connection.snd.cwnd -= UInt32(unaDelta)
-                    entry.connection.snd.cwnd += UInt32(mss)
-                    doRetransmit = true
-                } else if !unaAdvanced, inFlight > 0 {
-                    // Dup ACK in recovery: inflate cwnd.
-                    entry.connection.snd.cwnd += UInt32(mss)
-                    doRetransmit = true
                 }
             }
             if doRetransmit {
                 retransmitHole(from: entry.connection, hostMAC: hostMAC,
                                transport: &transport, io: io)
             }
-            // RFC 5681 cwnd growth on new ACK (after recovery processing, per gVisor snd.go).
-            if unaDelta > 0 {
-                entry.connection.snd.growCwnd(bytesAcked: UInt32(unaDelta), smss: UInt32(mss))
-            }
-            // Advance SACK scoreboard past acknowledged data + trim OOO
+            // Trim OOO buffer past acknowledged data
             if entry.connection.rcv.nxt != oldRcvNxt {
-                entry.connection.sackBlocks.ackThrough(entry.connection.rcv.nxt)
-
-                // Trim any buffered OOO data already covered by the new rcv.nxt
-                // (handles partial overlap from gap-filling segments).
                 entry.connection.trimOOO(rcvNxt: entry.connection.rcv.nxt)
             }
             // Resume external reads if backpressure cleared
@@ -871,46 +738,15 @@ public struct NATTable {
                 entry.connection.pendingExternalFin = true
             }
 
-            for segToSend in toSend {
-                let isPureACK = segToSend.flags == .ack
-                if isPureACK {
-                    if entry.connection.pendingDelayedACK {
-                        // RFC 5681: duplicate ACKs MUST be sent immediately so the
-                        // sender can count them for fast retransmit (3 dup ACKs).
-                        // If the new ACK echoes the same rcv.nxt, flush the pending
-                        // ACK now and queue the new one — otherwise the sender would
-                        // never see ≥3 identical ACKs within the 200µs window.
-                        if entry.connection.delayedACKAck == segToSend.ack {
-                            _ = buildAckFrame(
-                                conn: entry.connection, seq: entry.connection.delayedACKSeq,
-                                ack: entry.connection.delayedACKAck,
-                                window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                                io: io, transport: &transport
-                            )
-                            stats.ackFlushedImmediate += 1
-                        } else {
-                            stats.ackOverwritten += 1
-                        }
-                    }
-                    stats.ackDeferred += 1
-                    entry.connection.pendingDelayedACK = true
-                    entry.connection.delayedACKDeadline = freshNowUs + 200
-                    entry.connection.delayedACKSeq = segToSend.seq
-                    // Use current rcv.nxt which may include OOO-drained data
-                    entry.connection.delayedACKAck = entry.connection.rcv.nxt
-                    entry.connection.delayedACKWindow = entry.connection.availableWindow
+            toSend.forEach { segToSend in
+                if segToSend.flags == .ack {
+                    _ = buildAckFrame(
+                        conn: entry.connection, seq: segToSend.seq,
+                        ack: entry.connection.rcv.nxt,
+                        window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
+                        io: io, transport: &transport
+                    )
                 } else {
-                    // Non-ACK segment — flush any pending delayed ACK first
-                    if entry.connection.pendingDelayedACK {
-                        _ = buildAckFrame(
-                            conn: entry.connection, seq: entry.connection.delayedACKSeq,
-                            ack: entry.connection.delayedACKAck,
-                            window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                            io: io, transport: &transport
-                        )
-                        stats.ackFlushedImmediate += 1
-                        entry.connection.pendingDelayedACK = false
-                    }
                     let hdrOfs = buildTCPHeader(
                         io: io, hostMAC: hostMAC, dstMAC: srcMAC,
                         srcIP: key.dstIP, dstIP: key.vmIP,
@@ -1070,11 +906,7 @@ public struct NATTable {
         guard inFlight > 0 else { stats.rtHoleNoInflight += 1; return }
         guard let epFD = transport.fdForEndpoint(conn.endpointID) else { stats.rtHoleNoEPFD += 1; return }
         guard let rtData = conn.peekRetransmitData(max: min(mss, conn.totalQueuedBytes)) else { stats.rtHoleNoData += 1; return }
-        var rtLen = rtData.len
-        if let firstSacked = conn.sackBlocks.firstSackedAfter(from: conn.snd.una) {
-            let sackedOffset = Int(firstSacked &- conn.snd.una)
-            if sackedOffset > 0, sackedOffset < rtLen { rtLen = sackedOffset }
-        }
+        let rtLen = rtData.len
         guard rtLen > 0 else { stats.rtHoleNoLen += 1; return }
         stats.rtHoleOK += 1
         let rr = sendOneDataSegment(
@@ -1110,11 +942,11 @@ public struct NATTable {
             while segCount < maxSegs {
                 let inFlight = conn.snd.nxt &- conn.snd.una
                 if inFlight == 0 { conn.snd.sndUnaSendTime = nowUs }
-                let effectiveWnd = Swift.min(conn.snd.wnd, conn.snd.cwnd)
+                let effectiveWnd = conn.snd.wnd
                 var canSend = Int(effectiveWnd) - Int(inFlight)
 
                 // Limited Transmit (RFC 3042): on 1st/2nd dup ACK, send one
-                // segment even when cwnd-limited, if receiver window allows.
+                // segment even when window-limited, if receiver window allows.
                 if canSend <= 0, conn.dupAckCount >= 1, conn.dupAckCount <= 2,
                    Int(conn.snd.wnd) > Int(inFlight) {
                     canSend = mss
@@ -1129,28 +961,10 @@ public struct NATTable {
                 }
                 if canSend > mss { canSend = mss }
                 guard let data = conn.peekSendData(max: canSend) else {
-                    // RFC 5681 fast retransmit: resend holes from snd.una.
-                    // Truncate at first SACK boundary to avoid resending
-                    // bytes the receiver already reported via SACK.
                     if conn.totalQueuedBytes > 0, inFlight > 0,
-                       (conn.dupAckCount >= 3 || conn.snd.inRecovery),
-                       let rtData = conn.peekRetransmitData(max: min(mss, conn.totalQueuedBytes)) {
-                        var rtLen = rtData.len
-                        if let firstSacked = conn.sackBlocks.firstSackedAfter(from: conn.snd.una) {
-                            let sackedOffset = Int(firstSacked &- conn.snd.una)
-                            if sackedOffset > 0, sackedOffset < rtLen {
-                                rtLen = sackedOffset
-                            }
-                        }
-                        guard rtLen > 0 else { break }
-                        let rr = sendOneDataSegment(
-                            to: conn, seq: conn.snd.una, ack: conn.rcv.nxt,
-                            flags: [.ack], data: (rtData.ptr, rtLen),
-                            via: epFD, hostMAC: hostMAC, io: io)
-                        if rr >= 0 {
-                            stats.tcpFastRetransmit += 1
-                            conn.rtoIsRetransmit = true  // Karn's algorithm
-                        }
+                       conn.dupAckCount >= 3 {
+                        retransmitHole(from: conn, hostMAC: hostMAC,
+                                       transport: &transport, io: io)
                     }
                     break
                 }
@@ -1217,18 +1031,6 @@ public struct NATTable {
             ) {
                 stats.ackFlushedImmediate += 1
             }
-            conn.pendingDelayedACK = false
-        } else if conn.pendingDelayedACK {
-            // Flush deferred ACK with current availableWindow (post-drain).
-            if buildAckFrame(
-                conn: conn, seq: conn.delayedACKSeq,
-                ack: conn.delayedACKAck,
-                window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale),
-                io: io, transport: &transport
-            ) {
-                stats.ackFlushedImmediate += 1
-            }
-            conn.pendingDelayedACK = false
         }
 
         // ── Forward pending FIN once externalSendQueue is drained ──
@@ -1246,17 +1048,13 @@ public struct NATTable {
         // ── Retry deferred external→VM FIN once sendQueue is drained ──
         if conn.pendingFinToVM, conn.totalQueuedBytes == 0 {
             debugLog("[NAT-TCP-FIN] deferred FIN to VM \(conn.vmIP):\(conn.vmPort)\n")
-            let dummySeg = TCPSegmentInfo(
-                seq: conn.rcv.nxt, ack: conn.snd.una,
-                flags: .ack, window: 65535
-            )
-            let (newState, toSend, _, _) = tcpProcess(
-                state: conn.state, seg: dummySeg,
-                payloadPtr: nil, payloadLen: 0,
-                snd: &conn.snd, rcv: &conn.rcv, appClose: true
+            let (newState, toSend) = tcpAppClose(
+                state: conn.state,
+                snd: &conn.snd,
+                rcv: &conn.rcv
             )
             conn.state = newState
-            for segToSend in toSend {
+            toSend.forEach { segToSend in
                 let hdrOfs = buildTCPHeader(
                     io: io, hostMAC: hostMAC, dstMAC: conn.vmMAC,
                     srcIP: conn.dstIP, dstIP: conn.vmIP,
@@ -1480,16 +1278,10 @@ public struct NATTable {
         transport.registerFD(newFD, events: Int16(POLLIN), kind: .stream)
 
         let wireWin = UInt16(min(synSeg.window >> conn.ourWindowScale, 65535))
-        // SYN options: WSCALE + SACK-Permitted [+ TSopt]
+        // SYN options: WSCALE
         var synOpts: [UInt8] = [
             3, 3, conn.ourWindowScale,  // WSCALE (3)
-            4, 2,                        // SACK-Permitted (2)
         ]
-        if conn.ourTSOK {
-            synOpts.append(1)  // NOP before TSopt
-            let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
-            synOpts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: 0))
-        }
         while synOpts.count % 4 != 0 { synOpts.append(1) }  // NOP padding
         let synTcpHdrLen = 20 + synOpts.count
         let synHdrLen = 14 + 20 + synTcpHdrLen
@@ -1651,13 +1443,11 @@ public struct NATTable {
         )
         conn.externalConnecting = true
         conn.peerWindowScale = seg.peerWindowScale
-        conn.sackOK = seg.sackOK
-        conn.tsOK = seg.tsOK && conn.ourTSOK
 
         let (newState, toSend, _, _) = tcpProcess(
             state: .listen, seg: seg,
             payloadPtr: payloadPtr, payloadLen: payloadLen,
-            snd: &conn.snd, rcv: &conn.rcv, appClose: false
+            snd: &conn.snd, rcv: &conn.rcv
         )
         conn.state = newState
         // Apply peer window scaling after FSM (FSM stores raw wire window)
@@ -1670,24 +1460,17 @@ public struct NATTable {
         tcpFdToKey[fd] = key
         transport.registerFD(fd, events: Int16(POLLIN | POLLOUT), kind: .stream)
 
-        for segToSend in toSend {
+        toSend.forEach { segToSend in
             let wireWin = wireWindow(conn.availableWindow, scale: conn.ourWindowScale)
             let isSynAck = segToSend.flags.contains(.syn) && segToSend.flags.contains(.ack)
             let hdrOfs: Int
             let hdrLen: Int
             var synAckTcpHdrLen: Int = 20
             if isSynAck {
-                // SYN-ACK options: WSCALE + SACK-Permitted [+ TSopt]
+                // SYN-ACK options: WSCALE
                 var opts: [UInt8] = [
                     3, 3, conn.ourWindowScale,  // WSCALE (3)
-                    4, 2,                        // SACK-Permitted (2)
                 ]
-                if conn.ourTSOK {
-                    opts.append(1)  // NOP before TSopt
-                    let tsval = UInt32(monotonicMicros() & 0xFFFFFFFF)
-                    let tsecr = seg.tsval
-                    opts.append(contentsOf: buildTSoptOption(tsval: tsval, tsecr: tsecr))
-                }
                 while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
                 synAckTcpHdrLen = 20 + opts.count
                 hdrLen = 14 + 20 + synAckTcpHdrLen
@@ -1764,19 +1547,14 @@ public struct NATTable {
             return
         }
 
-        // Create a synthetic ACK segment to trigger FSM close processing
-        let dummySeg = TCPSegmentInfo(
-            seq: entry.connection.rcv.nxt, ack: entry.connection.snd.una,
-            flags: .ack, window: 65535
-        )
-        let (newState, toSend, _, _) = tcpProcess(
-            state: entry.connection.state, seg: dummySeg,
-            payloadPtr: nil, payloadLen: 0,
-            snd: &entry.connection.snd, rcv: &entry.connection.rcv, appClose: true
+        let (newState, toSend) = tcpAppClose(
+            state: entry.connection.state,
+            snd: &entry.connection.snd,
+            rcv: &entry.connection.rcv
         )
         entry.connection.state = newState
 
-        for segToSend in toSend {
+        toSend.forEach { segToSend in
             let hdrOfs = buildTCPHeader(
                 io: io, hostMAC: hostMAC, dstMAC: entry.connection.vmMAC,
                 srcIP: entry.connection.dstIP, dstIP: entry.connection.vmIP,

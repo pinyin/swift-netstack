@@ -2,15 +2,16 @@ import Darwin
 
 // MARK: - Socket buffer sizing
 
-private let kSocketSendBufferSize: Int = 1 * 1024 * 1024
-private let kSocketRecvBufferSize: Int = 4 * kSocketSendBufferSize
+/// SO_RCVBUF for virtio-net VM endpoint fds.
+/// Large enough to absorb TCP recovery bursts without bufferbloat.
+/// SO_SNDBUF is left at OS default — the BDP poll loop is tight enough
+/// that a large send buffer only hides backpressure.
+private let kVNicRecvBufferSize: Int = 4 * 1024 * 1024
 
 private func configureNetworkFD(_ fd: Int32) {
     let flags = fcntl(fd, F_GETFL, 0)
     if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-    var sndSize = kSocketSendBufferSize
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndSize, socklen_t(MemoryLayout<Int>.size))
-    var rcvSize = kSocketRecvBufferSize
+    var rcvSize = kVNicRecvBufferSize
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvSize, socklen_t(MemoryLayout<Int>.size))
     var one: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))

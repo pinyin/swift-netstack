@@ -26,15 +26,6 @@ final class TCPConnection {
     /// RFC 1323 window scale shift received from the VM in SYN (their receive window scale).
     public var peerWindowScale: UInt8 = 0
 
-    // MARK: - RFC 2018 SACK
-
-    /// True when peer advertised SACK-Permitted option.
-    public var sackOK: Bool = false
-    /// Always true — we always advertise SACK-Permitted in SYN/SYN-ACK.
-    public var ourSackOK: Bool = true
-    /// SACK scoreboard tracking out-of-order data.
-    public var sackBlocks: SACKScoreboard = .init()
-
     // MARK: - RFC 5681 Fast Retransmit
 
     /// Count of consecutive duplicate ACKs received (same ack number, no data).
@@ -42,23 +33,6 @@ final class TCPConnection {
     public var dupAckCount: UInt8 = 0
     /// The last ACK value received (to detect duplicates).
     public var lastAckValue: UInt32 = 0
-
-    // MARK: - RFC 7323 Timestamps
-
-    /// True when TSopt negotiated (both sides sent TSopt during handshake).
-    public var tsOK: Bool = false
-    /// Always true — we always advertise TSopt in SYN/SYN-ACK.
-    public var ourTSOK: Bool = true
-    /// TSval from the most recent valid segment (for PAWS).
-    public var tsRecent: UInt32 = 0
-    /// Monotonic timestamp when tsRecent was recorded (for PAWS age check).
-    public var tsRecentAge: UInt64 = 0
-
-    // MARK: - Extended ACK template (66-byte, with NOP+NOP+TSopt)
-
-    /// 66-byte ACK template: Ethernet(14) + IPv4(20) + TCP(32=20+12).
-    /// TCP header includes NOP(1)+NOP(1)+TSopt(kind=8,len=10,TSval,Tsecr).
-    public var ackTemplateExt: [UInt8]? = nil
 
     /// VM→external send queue.
     public var externalSendQueue: SendQueue
@@ -70,14 +44,6 @@ final class TCPConnection {
 
     /// Whether POLLOUT should be requested for this connection's fd.
     public func wantsPOLLOUT() -> Bool { externalConnecting || externalSendQueued > 0 }
-
-    // MARK: - Delayed ACK
-
-    public var pendingDelayedACK: Bool = false
-    public var delayedACKDeadline: UInt64 = 0
-    public var delayedACKSeq: UInt32 = 0
-    public var delayedACKAck: UInt32 = 0
-    public var delayedACKWindow: UInt32 = 262144
 
     // MARK: - ACK frame template
 

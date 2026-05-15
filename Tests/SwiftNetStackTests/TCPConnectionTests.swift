@@ -257,7 +257,7 @@ import Darwin
     let data = [UInt8](repeating: 0x42, count: 100)
     conn.writeSendBuf(data, data.count)
     #expect(conn.totalQueuedBytes == 100)
-    // persistDeadline starts at 0, canSend = min(0, cwnd) - inFlight <= 0
+    // persistDeadline starts at 0, canSend = wnd - inFlight <= 0
     // This is the condition that arms persist in flushOneConnection
     #expect(conn.persistDeadline == 0, "persistDeadline starts at 0")
 }
@@ -277,18 +277,6 @@ import Darwin
     #expect(conn.persistBackoffCount == 0)
 }
 
-@Test func persistDeadline_not_armed_when_cwnd_blocked() {
-    let conn = makeTestConnection()
-    // cwnd limited but receiver window is open
-    conn.snd.wnd = 65535
-    conn.snd.cwnd = 0  // cwnd blocks
-    conn.persistDeadline = 0
-
-    // persist timer should NOT arm when blocked by cwnd (not zero window)
-    // The condition in NATTable checks: conn.snd.wnd == 0
-    #expect(conn.snd.wnd > 0, "receiver window open → persist should NOT be armed")
-    #expect(conn.persistDeadline == 0)
-}
 
 // MARK: - helpers
 

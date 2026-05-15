@@ -1053,7 +1053,9 @@ public struct NATTable {
         }
 
         // ── Drain externalSendQueue (VM→external) ──
-        while conn.externalSendQueued > 0 {
+        var extDrainIters = 0
+        while conn.externalSendQueued > 0, extDrainIters < kMaxDrainIterations {
+            extDrainIters += 1
             guard let (ptr, len) = conn.externalSendQueue.peek(max: min(conn.externalSendQueued, 65536)) else { break }
             let written = transport.writeStream(ptr, len, to: conn.posixFD)
             if written < 0 {
@@ -1073,6 +1075,9 @@ public struct NATTable {
                     hostMAC: hostMAC)
             }
             conn.drainExternalSend(written)
+        }
+        if extDrainIters >= kMaxDrainIterations {
+            sanityLog("external drain cap hit for \(conn.vmIP):\(conn.vmPort), q=\(conn.externalSendQueued)")
         }
         // Revert to POLLIN-only when queue is drained, so we don't spin on POLLOUT.
         if conn.externalSendQueued == 0 {
@@ -1597,7 +1602,9 @@ public struct NATTable {
         var finDrainComplete = true
         if entry.connection.totalQueuedBytes > 0 {
             guard let epFD = transport.fdForEndpoint(entry.connection.endpointID) else { return }
-            while entry.connection.totalQueuedBytes > 0 {
+            var drainIters = 0
+            while entry.connection.totalQueuedBytes > 0, drainIters < kMaxDrainIterations {
+                drainIters += 1
                 let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
                 var canSend = Int(entry.connection.snd.wnd) - Int(inFlight)
                 if canSend <= 0 { break }
@@ -1613,6 +1620,9 @@ public struct NATTable {
                 }
                 entry.connection.snd.nxt = entry.connection.snd.nxt &+ UInt32(data.len)
                 entry.connection.sendQueueSent += data.len
+            }
+            if drainIters >= kMaxDrainIterations {
+                sanityLog("FIN drain cap hit for \(key.vmIP):\(key.vmPort), q=\(entry.connection.totalQueuedBytes)")
             }
         }
 

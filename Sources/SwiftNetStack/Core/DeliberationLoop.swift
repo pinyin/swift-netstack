@@ -31,6 +31,8 @@ public struct DeliberationLoop {
     private var fragmentReassembly = FragmentReassembly(maxReassemblies: 16)
     /// Rate limiter for ICMP error messages (RFC 1812 §4.3.2.8).
     private var icmpErrorLimiter = RateLimiter<IPv4Address>(window: 1, maxRequests: 10)
+    /// BDP loop watchdog — tracks idle rounds to detect stalled pipelines.
+    private var watchdog = BDPWatchdog()
 
     /// Queue of reassembled datagrams awaiting re-injection as synthetic frames.
     /// Capped at 16 to bound memory. Each entry holds the full reassembled
@@ -367,6 +369,13 @@ public struct DeliberationLoop {
         phaseTiming.totalRounds += 1
         let wallEnd = monotonicMicros()
         phaseTiming.wallNanos &+= (wallEnd - nowUs) * 1000
+
+        // Watchdog: detect stalled pipeline (active connections but no progress)
+        let hadActivity = totalWritten > 0 || io.frameCount > 0
+            || !result.streamReads.isEmpty || !result.datagramReads.isEmpty
+        watchdog.tick(hadActivity: hadActivity,
+                      activeConnections: natTable.tcpCount + natTable.udpCount)
+
         return totalWritten
     }
 

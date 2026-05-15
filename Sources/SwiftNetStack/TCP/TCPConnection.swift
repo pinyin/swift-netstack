@@ -45,6 +45,14 @@ final class TCPConnection {
     /// Whether POLLOUT should be requested for this connection's fd.
     public func wantsPOLLOUT() -> Bool { externalConnecting || externalSendQueued > 0 }
 
+    // MARK: - Delayed ACK (RFC 1122)
+
+    public var pendingDelayedACK: Bool = false
+    public var delayedACKDeadline: UInt64 = 0
+    public var delayedACKSeq: UInt32 = 0
+    public var delayedACKAck: UInt32 = 0
+    public var delayedACKWindow: UInt32 = 262144
+
     // MARK: - ACK frame template
 
     public var ackTemplate: [UInt8]? = nil

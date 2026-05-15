@@ -41,6 +41,12 @@ public struct TransportStats {
 
 /// NAT-level ACK and checksum counters.
 public struct NATStats {
+    /// Number of ACKs deferred (delayed ACK batching).
+    public var ackDeferred: UInt64 = 0
+    /// Number of deferred ACKs overwritten by a newer ACK before being sent.
+    public var ackOverwritten: UInt64 = 0
+    /// Number of ACKs flushed by timer expiry (200µs delayed ACK timeout).
+    public var ackFlushedTimer: UInt64 = 0
     /// Number of proactive ACKs sent (window updates, etc.).
     public var ackFlushedImmediate: UInt64 = 0
     /// Number of ACK frames built from the pre-built 54-byte template.
@@ -226,6 +232,9 @@ public func printStats(
     if t.sendBytes > 0     { parts.append("sendMB=\(t.sendBytes / 1_000_000)") }
 
     // ── NAT counters ──
+    if n.ackDeferred + n.ackOverwritten + n.ackFlushedTimer > 0 {
+        parts.append("ack[def=\(n.ackDeferred) ovw=\(n.ackOverwritten) tmr=\(n.ackFlushedTimer)]")
+    }
     if n.ackFlushedImmediate > 0 {
         parts.append("ackImm=\(n.ackFlushedImmediate)")
     }

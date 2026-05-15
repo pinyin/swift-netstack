@@ -239,17 +239,22 @@ public struct NATTable {
 
     /// Returns the earliest deadline for each timer category, or nil if none.
     /// Scans tcpEntries once instead of three separate passes.
-    public func nextDeadlines() -> (rto: UInt64?, persist: UInt64?) {
+    public func nextDeadlines() -> (ack: UInt64?, rto: UInt64?, persist: UInt64?) {
+        var ackDL: UInt64?
         var rtoDL: UInt64?
         var persistDL: UInt64?
         for entry in tcpEntries.values {
             let c = entry.connection
+            if c.pendingDelayedACK {
+                let dl = c.delayedACKDeadline
+                if ackDL == nil || dl < ackDL! { ackDL = dl }
+            }
             let rdl = c.rtoDeadline
             if rdl != 0, rtoDL == nil || rdl < rtoDL! { rtoDL = rdl }
             let pdl = c.persistDeadline
             if pdl != 0, persistDL == nil || pdl < persistDL! { persistDL = pdl }
         }
-        return (rtoDL, persistDL)
+        return (ackDL, rtoDL, persistDL)
     }
 
     // MARK: - Unified timer processing (single pass over tcpEntries)
@@ -295,6 +300,18 @@ public struct NATTable {
                         c.rtoDeadline = 0  // all data ACKed
                     }
                 }
+            }
+
+            // ── Delayed ACK flush ──
+            if c.pendingDelayedACK, c.delayedACKDeadline <= nowUs {
+                if buildAckFrame(
+                    conn: c, seq: c.delayedACKSeq, ack: c.delayedACKAck,
+                    window: wireWindow(c.delayedACKWindow, scale: c.ourWindowScale),
+                    io: io, transport: &transport
+                ) {
+                    stats.ackFlushedTimer += 1
+                }
+                c.pendingDelayedACK = false
             }
 
             // ── Persist timer (RFC 1122 §4.2.2.17) ──
@@ -384,11 +401,8 @@ public struct NATTable {
         conn.lastACKAck = ack
         conn.lastACKWindow = window
         conn.lastAdvertisedWindow = UInt32(window) << conn.ourWindowScale
-        if conn.ackChecksumValid {
-        } else if conn.ackTemplate != nil {
-            conn.ackChecksumValid = true
-            conn.lastACKChecksum = outCK
-        }
+        conn.lastACKChecksum = outCK
+        conn.ackChecksumValid = true
 
         if let pw = self.externalPcap {
             let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
@@ -740,13 +754,43 @@ public struct NATTable {
 
             toSend.forEach { segToSend in
                 if segToSend.flags == .ack {
-                    _ = buildAckFrame(
-                        conn: entry.connection, seq: segToSend.seq,
-                        ack: entry.connection.rcv.nxt,
-                        window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                        io: io, transport: &transport
-                    )
+                    // Delayed ACK (RFC 1122): batch ACKs to reduce overhead.
+                    // On virtio-net (lossless, sub-100µs RTT), sending an ACK
+                    // for every segment doubles CPU cost at 5+ Gbps without
+                    // improving throughput.
+                    if entry.connection.pendingDelayedACK {
+                        // RFC 5681: duplicate ACKs MUST be sent immediately so
+                        // the sender can count them for fast retransmit.
+                        if entry.connection.delayedACKAck == segToSend.ack {
+                            _ = buildAckFrame(
+                                conn: entry.connection, seq: entry.connection.delayedACKSeq,
+                                ack: entry.connection.delayedACKAck,
+                                window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
+                                io: io, transport: &transport
+                            )
+                            stats.ackFlushedImmediate += 1
+                        } else {
+                            stats.ackOverwritten += 1
+                        }
+                    }
+                    stats.ackDeferred += 1
+                    entry.connection.pendingDelayedACK = true
+                    entry.connection.delayedACKDeadline = freshNowUs + 200
+                    entry.connection.delayedACKSeq = segToSend.seq
+                    entry.connection.delayedACKAck = entry.connection.rcv.nxt
+                    entry.connection.delayedACKWindow = entry.connection.availableWindow
                 } else {
+                    // Non-ACK segment — flush any pending delayed ACK first
+                    if entry.connection.pendingDelayedACK {
+                        _ = buildAckFrame(
+                            conn: entry.connection, seq: entry.connection.delayedACKSeq,
+                            ack: entry.connection.delayedACKAck,
+                            window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
+                            io: io, transport: &transport
+                        )
+                        stats.ackFlushedImmediate += 1
+                        entry.connection.pendingDelayedACK = false
+                    }
                     let hdrOfs = buildTCPHeader(
                         io: io, hostMAC: hostMAC, dstMAC: srcMAC,
                         srcIP: key.dstIP, dstIP: key.vmIP,
@@ -935,6 +979,18 @@ public struct NATTable {
         // TCP's own sequence-number state machine to drive retry, avoiding
         // external bookkeeping.
         if conn.totalQueuedBytes > 0 {
+            // Flush any pending delayed ACK before sending data
+            if conn.pendingDelayedACK {
+                _ = buildAckFrame(
+                    conn: conn, seq: conn.delayedACKSeq,
+                    ack: conn.delayedACKAck,
+                    window: wireWindow(conn.delayedACKWindow, scale: conn.ourWindowScale),
+                    io: io, transport: &transport
+                )
+                stats.ackFlushedImmediate += 1
+                conn.pendingDelayedACK = false
+            }
+
             guard let epFD = transport.fdForEndpoint(conn.endpointID) else { return }
             var segCount = 0
             let maxSegs = 64
@@ -1031,6 +1087,21 @@ public struct NATTable {
             ) {
                 stats.ackFlushedImmediate += 1
             }
+        }
+
+        // Flush any pending delayed ACK (may have been deferred from
+        // the FSM toSend loop and not yet flushed by data-send path).
+        // Uses current availableWindow since queues may have drained.
+        if conn.pendingDelayedACK {
+            if buildAckFrame(
+                conn: conn, seq: conn.delayedACKSeq,
+                ack: conn.delayedACKAck,
+                window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale),
+                io: io, transport: &transport
+            ) {
+                stats.ackFlushedImmediate += 1
+            }
+            conn.pendingDelayedACK = false
         }
 
         // ── Forward pending FIN once externalSendQueue is drained ──

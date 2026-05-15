@@ -52,17 +52,7 @@ public final class PCAPWriter {
         }
     }
 
-    /// Legacy PacketBuffer-based write (kept for source compatibility).
-    @available(*, deprecated, message: "Use writeRaw or writeRawSplit")
-    public func write(packet: PacketBuffer) {
-        guard fd >= 0 else { return }
-        packet.withUnsafeReadableBytes { ptr in
-            write(raw: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                  length: ptr.count)
-        }
-    }
-
-    /// Append a raw byte range to the capture.
+/// Append a raw byte range to the capture.
     public func write(raw: UnsafePointer<UInt8>, length: Int) {
         guard fd >= 0, length > 0 else { return }
 

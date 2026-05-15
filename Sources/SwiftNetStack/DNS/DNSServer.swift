@@ -238,11 +238,14 @@ public struct DNSServer {
     ) -> Bool {
         guard let fd = upstreamFD, let upstream = upstreamAddr else { return false }
 
-        // Avoid txID collisions on wraparound (e.g. after 65535 queries a
-        // long-pending txID 1 may still be active).
-        while pendingQueries[nextTxID] != nil {
+        // Avoid txID collisions on wraparound. Bounded by the size of the
+        // pending query dictionary — if every possible txID is pending (5 s
+        // timeout), the table is full and forwarding would fail anyway.
+        var tried = 0
+        while pendingQueries[nextTxID] != nil, tried < pendingQueries.count + 1 {
             nextTxID = nextTxID &+ 1
             if nextTxID == 0 { nextTxID = 1 }
+            tried += 1
         }
         let ourTxID = nextTxID
         nextTxID = nextTxID &+ 1

@@ -13,7 +13,7 @@ public struct DNSQuestion {
 /// pointers in the query QNAME are rejected (real VM resolvers send
 /// uncompressed single questions).
 ///
-/// All methods operate on raw pointers — no PacketBuffer or RoundContext.
+/// All methods operate on raw pointers.
 public enum DNSPacket {
 
     // MARK: - DNS protocol constants

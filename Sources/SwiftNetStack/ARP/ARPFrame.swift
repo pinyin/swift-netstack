@@ -53,38 +53,4 @@ public struct ARPFrame {
         )
     }
 
-    /// Parse an ARP frame from a PacketBuffer (Ethernet payload).
-    /// Returns nil if the buffer is too short or fields don't match Ethernet/IPv4 ARP.
-    public static func parse(from pkt: PacketBuffer) -> ARPFrame? {
-        var pkt = pkt
-        // ARP packet: 2(hw) + 2(proto) + 1(hwSize) + 1(protoSize) + 2(op)
-        // + hwSize + protoSize + hwSize + protoSize = 8 + 2*(6+4) = 28 bytes
-        guard pkt.totalLength >= 28 else { return nil }
-        guard pkt.pullUp(28) else { return nil }
-
-        return pkt.withUnsafeReadableBytes { buf -> ARPFrame? in
-            let hwType   = (UInt16(buf[0]) << 8) | UInt16(buf[1])
-            let protoType = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-            let hwSize   = buf[4]
-            let protoSize = buf[5]
-            let rawOp    = (UInt16(buf[6]) << 8) | UInt16(buf[7])
-
-            guard hwType == 1, protoType == 0x0800,
-                  hwSize == 6, protoSize == 4,
-                  let op = ARPOperation(rawValue: rawOp) else { return nil }
-
-            let senderMAC = MACAddress(UnsafeRawBufferPointer(rebasing: buf[8..<14]))
-            let senderIP  = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[14..<18]))
-            let targetMAC = MACAddress(UnsafeRawBufferPointer(rebasing: buf[18..<24]))
-            let targetIP  = IPv4Address(UnsafeRawBufferPointer(rebasing: buf[24..<28]))
-
-            return ARPFrame(
-                hardwareType: hwType, protocolType: protoType,
-                hardwareSize: hwSize, protocolSize: protoSize,
-                operation: op,
-                senderMAC: senderMAC, senderIP: senderIP,
-                targetMAC: targetMAC, targetIP: targetIP
-            )
-        }
-    }
 }

@@ -394,7 +394,7 @@ public struct PollingTransport {
                     msg_iov: iovPtr, msg_iovlen: 1,
                     msg_control: nil, msg_controllen: 0, msg_flags: 0
                 )
-                return Darwin.sendmsg(fd, &msg, 0)
+                return Darwin.sendmsg(fd, &msg, Int32(MSG_NOSIGNAL))
             }
         }
     }
@@ -404,6 +404,6 @@ public struct PollingTransport {
         guard len > 0 else { return 0 }
         stats.sendmsgCalls += 1
         stats.sendBytes += UInt64(len)
-        return Darwin.send(fd, ptr, len, 0)
+        return Darwin.send(fd, ptr, len, Int32(MSG_NOSIGNAL))
     }
 }

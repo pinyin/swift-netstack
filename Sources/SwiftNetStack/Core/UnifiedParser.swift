@@ -133,6 +133,9 @@ private func parseOneIPv4(
         return
     }
 
+    // Validate IPv4 header checksum (single pass over the header).
+    guard internetChecksum(UnsafeRawBufferPointer(start: ipPtr, count: ihl * 4)) == 0 else { return }
+
     let ipHeaderLen = ihl * 4
     let ipPayloadOfs = ipOfs + ipHeaderLen
     let ipPayloadLen = min(totalLength - ipHeaderLen, frameLen - ipPayloadOfs)
@@ -183,6 +186,18 @@ private func parseOneICMP(
     let sequenceNumber = readUInt16BE(ptr, 6)
 
     if icmpType == 8, icmpCode == 0 {
+        // Compute payload checksum first — reused for both validation and
+        // incremental checksum update in the echo reply path (single pass).
+        let payloadSum = checksumAdd(0, UnsafeRawPointer(ptr.advanced(by: 8)), len - 8)
+
+        // Validate full ICMP checksum by combining header sum with payload sum.
+        let headerSum = checksumAdd(0, ptr, 8)
+        var fullSum = UInt64(headerSum) &+ UInt64(payloadSum)
+        while fullSum >> 16 != 0 {
+            fullSum = (fullSum & 0xFFFF) + (fullSum >> 16)
+        }
+        guard ~UInt16(fullSum & 0xFFFF) == 0 else { return }
+
         let idx = out.icmpEcho.count
         guard idx < out.icmpEcho.capacity else { return }
         let totalPayloadOfs = baseOfs + ipPayloadOfs
@@ -190,7 +205,7 @@ private func parseOneICMP(
             endpointID: epID, srcMAC: srcMAC, srcIP: srcIP, dstIP: dstIP,
             identifier: identifier, sequenceNumber: sequenceNumber,
             payloadOfs: totalPayloadOfs + 8, payloadLen: len - 8,
-            payloadSum: checksumAdd(0, UnsafeRawPointer(ptr.advanced(by: 8)), len - 8))
+            payloadSum: payloadSum)
         out.icmpEcho.count += 1
     }
     // Non-echo ICMP is silently ignored

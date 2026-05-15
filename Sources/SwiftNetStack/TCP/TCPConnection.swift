@@ -258,19 +258,21 @@ final class TCPConnection {
             }
         }
 
-        // Trim overlap with next segment (new extends into next)
+        // Trim overlap with next segment (new extends into next).
+        // Check containment BEFORE trimming — endSeq is the original range end.
         if idx < oooSegments.count {
             let nextSeq = oooSegments[idx].seq
             if endSeq > nextSeq {
-                let overlap = Int(endSeq &- nextSeq)
-                if overlap >= len { base.deallocate(); return }
-
-                len -= overlap
-                // If next is fully contained in the new segment, remove it
                 if oooSegments[idx].seq &+ UInt32(oooSegments[idx].len) <= endSeq {
+                    // Next is fully contained → discard it, keep new segment intact.
                     oooTotalBytes -= oooSegments[idx].len
                     oooSegments[idx].base.deallocate()
                     oooSegments.remove(at: idx)
+                } else {
+                    // Partial overlap: trim new segment's end.
+                    let overlap = Int(endSeq &- nextSeq)
+                    if overlap >= len { base.deallocate(); return }
+                    len -= overlap
                 }
             }
         }

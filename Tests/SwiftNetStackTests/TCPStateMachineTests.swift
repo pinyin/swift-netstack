@@ -181,7 +181,6 @@ import Testing
 }
 
 @Test func established_appClose_transitions_to_finWait1() {
-    let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .ack, window: 65535)
     var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
     var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
 

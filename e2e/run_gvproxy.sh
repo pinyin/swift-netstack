@@ -92,7 +92,7 @@ sleep 1
 
 # ── Run test ──────────────────────────────────────────────────────────
 
-TMPLOG="$(mktemp /tmp/swiftnetstack-gvproxy.XXXXXX.log)"
+TMPLOG="$(mktemp /tmp/swiftnetstack-gvproxy.log.XXXXXX)"
 trap 'stop_local_services; stop_external_services; remove_chaos "$EXT_TARGET"; [ -n "$GVPROXY_PID" ] && kill "$GVPROXY_PID" 2>/dev/null; rm -f "$TMPLOG" "$GVPROXY_SOCK"' EXIT
 
 echo "========================================="

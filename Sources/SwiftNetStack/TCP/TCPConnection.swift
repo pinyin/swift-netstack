@@ -95,7 +95,7 @@ final class TCPConnection {
 
     public var sendQueue: SendQueue
     public var sendQueueSent: Int = 0
-    public static let maxQueueBytes: Int = 4 * 1024 * 1024
+    public static let maxQueueBytes: Int = 512 * 1024
 
     /// True when the send queue is full and the external socket should not be
     /// read from until the queue drains.

@@ -76,7 +76,7 @@ apply_chaos "$EXT_TARGET" "$CHAOS_CMD"
 
 # ── Run test ──────────────────────────────────────────────────────────
 
-TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.XXXXXX.log)"
+TMPLOG="$(mktemp /tmp/swiftnetstack-e2e.log.XXXXXX)"
 trap 'stop_local_services; stop_external_services; remove_chaos "$EXT_TARGET"; rm -f "$TMPLOG"' EXIT
 
 echo "========================================="

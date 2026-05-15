@@ -915,7 +915,8 @@ public struct NATTable {
             srcIP: conn.dstIP, dstIP: conn.vmIP,
             srcPort: conn.dstPort, dstPort: conn.vmPort,
             seqNumber: seq, ackNumber: ack,
-            flags: flags, window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale))
+            flags: flags, window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale),
+            payloadLen: data.len)
         guard hdrOfs >= 0 else { return -2 }
         finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
             srcIP: conn.dstIP, dstIP: conn.vmIP,

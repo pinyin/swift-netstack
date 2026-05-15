@@ -4,15 +4,16 @@ import Darwin
 
 /// Write a complete Ethernet+IPv4+TCP header into an IOBuffer output slot.
 /// Returns the slot offset, or -1 if output buffer is full.
-/// On success, the header is written to `io.output + offset` and caller must
-/// track the payload reference separately using OutBatch.
+/// When `payloadLen` is provided (non-zero), the IPv4 totalLength is written
+/// correctly from the start, eliminating the need for a second checksum pass.
 public func buildTCPHeader(
     io: IOBuffer,
     hostMAC: MACAddress, dstMAC: MACAddress,
     srcIP: IPv4Address, dstIP: IPv4Address,
     srcPort: UInt16, dstPort: UInt16,
     seqNumber: UInt32, ackNumber: UInt32,
-    flags: TCPFlags, window: UInt16
+    flags: TCPFlags, window: UInt16,
+    payloadLen: Int = 0
 ) -> Int {
     let hdrLen = 54  // Ethernet(14) + IPv4(20) + TCP(20)
     guard let ptr = io.allocOutput(hdrLen) else { return -1 }
@@ -23,11 +24,10 @@ public func buildTCPHeader(
     hostMAC.write(to: ptr.advanced(by: 6))
     writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
 
-    // IPv4 — totalLength = 20 (IP hdr) + 20 (TCP hdr) + payloadLen
-    // Payload length is written separately by caller after building the header.
-    // We write totalLength as 40 (just headers) — caller adjusts if needed.
+    // IPv4 — totalLength includes payload from the start, avoiding a
+    // second checksum pass in finalizeTCPChecksum.
     let ipPtr = ptr.advanced(by: ethHeaderLen)
-    writeIPv4Header(to: ipPtr, totalLength: 40, protocol: .tcp,
+    writeIPv4Header(to: ipPtr, totalLength: UInt16(40 + payloadLen), protocol: .tcp,
                     srcIP: srcIP, dstIP: dstIP)
 
     // TCP
@@ -180,16 +180,7 @@ public func finalizeTCPChecksum(
     }
     let ck = finalizeChecksum(ckSum)
     writeUInt16BE(ck, to: tcpPtr.advanced(by: 16))
-
-    // Update IPv4 totalLength if payload present
-    if payloadLen > 0 {
-        let ipPtr = io.output.baseAddress!.advanced(by: hdrOfs + ethHeaderLen)
-        let ipTotal = UInt16(ipv4HeaderLen + tcpTotalLen)
-        writeUInt16BE(ipTotal, to: ipPtr.advanced(by: 2))
-        // Recompute IPv4 checksum — totalLength changed, so the checksum
-        // computed by writeIPv4Header is now stale.
-        finalizeIPv4Checksum(io: io, hdrOfs: hdrOfs)
-    }
+    sanityReadBackTCPChecksum(io: io, hdrOfs: hdrOfs, expected: ck)
 }
 
 /// Write IPv4 header checksum for a frame built by buildTCPHeader.

@@ -998,8 +998,11 @@ public struct NATTable {
 
             guard let epFD = transport.fdForEndpoint(conn.endpointID) else { return }
             var segCount = 0
-            let maxSegs = 64
+            let maxSegs = kMaxBatchedSegments  // 64
             let sndNxtBefore = conn.snd.nxt
+            // Per-segment sendmsg: VM fd is datagram-oriented — each sendmsg
+            // delivers one Ethernet frame. Batching iovecs would concatenate
+            // multiple frames into one corrupt blob.
             while segCount < maxSegs {
                 let inFlight = conn.snd.nxt &- conn.snd.una
                 if inFlight == 0 { conn.snd.sndUnaSendTime = nowUs }
@@ -1054,31 +1057,28 @@ public struct NATTable {
         }
 
         // ── Drain externalSendQueue (VM→external) ──
-        var extDrainIters = 0
-        while conn.externalSendQueued > 0, extDrainIters < kMaxDrainIterations {
-            extDrainIters += 1
-            guard let (ptr, len) = conn.externalSendQueue.peek(max: min(conn.externalSendQueued, 65536)) else { break }
+        // Data in SendQueue is always contiguous after enqueue compaction,
+        // so one write() sends everything. TCP stream semantics (unlike
+        // VM's datagram fd) permit large single writes.
+        if conn.externalSendQueued > 0,
+           let (ptr, len) = conn.externalSendQueue.peek(max: conn.externalSendQueued) {
             let written = transport.writeStream(ptr, len, to: conn.posixFD)
             if written < 0 {
                 if errno == EAGAIN {
                     transport.setFDEvents(conn.posixFD, events: Int16(POLLIN | POLLOUT))
-                    break
+                } else {
+                    debugLog("[NAT-TCP-EXT] write to \(key.dstIP):\(key.dstPort) failed: errno=\(errno)\n")
                 }
-                debugLog("[NAT-TCP-EXT] write to \(key.dstIP):\(key.dstPort) failed: errno=\(errno)\n")
-                break
+            } else if written > 0 {
+                debugLog("[NAT-TCP-EXT] flushed \(written)B to \(key.dstIP):\(key.dstPort)\n")
+                if let pw = self.externalPcap {
+                    let sentChunk = [UInt8](UnsafeRawBufferPointer(start: ptr, count: written))
+                    captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
+                        conn: conn, flags: [.ack, .psh], payload: sentChunk,
+                        hostMAC: hostMAC)
+                }
+                conn.drainExternalSend(written)
             }
-            if written == 0 { break }
-            debugLog("[NAT-TCP-EXT] flushed \(written)B to \(key.dstIP):\(key.dstPort)\n")
-            if let pw = self.externalPcap {
-                let sentChunk = [UInt8](UnsafeRawBufferPointer(start: ptr, count: written))
-                captureExternalPacket(pcap: pw, fd: conn.posixFD, direction: .toExternal,
-                    conn: conn, flags: [.ack, .psh], payload: sentChunk,
-                    hostMAC: hostMAC)
-            }
-            conn.drainExternalSend(written)
-        }
-        if extDrainIters >= kMaxDrainIterations {
-            sanityLog("external drain cap hit for \(conn.vmIP):\(conn.vmPort), q=\(conn.externalSendQueued)")
         }
         // Revert to POLLIN-only when queue is drained, so we don't spin on POLLOUT.
         if conn.externalSendQueued == 0 {

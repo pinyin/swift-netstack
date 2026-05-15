@@ -108,3 +108,144 @@ import Testing
     // ack=50 is ahead of una=(max-100) in 32-bit wrap space
     #expect(snd.una == 50, "closeWait ACK must handle 32-bit wraparound correctly")
 }
+
+// MARK: - Basic state transition tests (moved from BDPDebug)
+
+@Test func listen_syn_transitions_to_synReceived() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 0, flags: .syn, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, toSend, _, _) = _tcpProcessImpl(state: .listen, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .synReceived)
+    #expect(toSend.count == 1)
+    #expect(toSend.first!.flags == [.syn, .ack])
+}
+
+@Test func listen_nonSyn_stays_in_listen() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 0, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, toSend, _, _) = _tcpProcessImpl(state: .listen, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .listen)
+    #expect(toSend.isEmpty)
+}
+
+@Test func synReceived_matchingAck_transitions_to_established() {
+    let seg = TCPSegmentInfo(seq: 2001, ack: 1001, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1001, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2001, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .synReceived, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .established)
+}
+
+@Test func synReceived_nonMatchingAck_stays_in_synReceived() {
+    let seg = TCPSegmentInfo(seq: 2001, ack: 999, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1001, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2001, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .synReceived, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .synReceived)
+}
+
+@Test func established_fin_transitions_to_closeWait() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .fin, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, toSend, _, _) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .closeWait)
+    #expect(!toSend.isEmpty)
+}
+
+@Test func established_data_advances_rcv_nxt() {
+    let dataBuf = UnsafeMutableRawBufferPointer.allocate(byteCount: 10, alignment: 8)
+    dataBuf.initializeMemory(as: UInt8.self, repeating: 0x41)
+    defer { dataBuf.deallocate() }
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, dataPtr, dataLen) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: UnsafeRawPointer(dataBuf.baseAddress!), payloadLen: 10, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .established)
+    #expect(dataPtr != nil && dataLen == 10)
+    #expect(rcv.nxt == 2010)
+}
+
+@Test func established_appClose_transitions_to_finWait1() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, toSend) = tcpAppClose(state: .established, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .finWait1)
+    #expect(!toSend.isEmpty && toSend.first!.flags.isFin)
+}
+
+@Test func finWait1_ack_transitions_to_finWait2() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1001, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1001, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .finWait1, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .finWait2)
+}
+
+@Test func finWait2_fin_transitions_to_closed() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1000, flags: .fin, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .finWait2, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .closed)
+}
+
+@Test func closeWait_appClose_transitions_to_lastAck() {
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _) = tcpAppClose(state: .closeWait, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .lastAck)
+}
+
+@Test func lastAck_matchingAck_transitions_to_closed() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 1001, flags: .ack, window: 65535)
+    var snd = SendSequence(nxt: 1001, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .lastAck, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .closed)
+}
+
+@Test func established_rst_transitions_to_closed() {
+    let seg = TCPSegmentInfo(seq: 0, ack: 0, flags: .rst, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .established, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .closed)
+}
+
+@Test func closed_syn_stays_closed() {
+    let seg = TCPSegmentInfo(seq: 2000, ack: 0, flags: .syn, window: 65535)
+    var snd = SendSequence(nxt: 1000, una: 1000, wnd: 65535)
+    var rcv = RecvSequence(nxt: 2000, initialSeq: 2000)
+
+    let (newState, _, _, _) = _tcpProcessImpl(state: .closed, seg: seg, payloadPtr: nil, payloadLen: 0, snd: &snd, rcv: &rcv)
+
+    #expect(newState == .closed)
+}

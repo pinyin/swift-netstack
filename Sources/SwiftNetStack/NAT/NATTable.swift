@@ -1708,10 +1708,10 @@ public struct NATTable {
             let reason: String
             switch entry.connection.state {
             case .established:
-                tooOld = age > 300
+                tooOld = age > 1800  // 30 min (RFC 5382 §5)
                 reason = "established idle timeout"
             case .finWait1, .finWait2, .closeWait, .lastAck:
-                tooOld = age > 120
+                tooOld = age > 300   // 5 min (TIME_WAIT substitute)
                 reason = "half-closed idle timeout"
             case .synReceived, .listen, .closed:
                 tooOld = age > 60

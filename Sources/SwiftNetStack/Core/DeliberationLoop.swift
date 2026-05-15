@@ -64,10 +64,6 @@ public struct DeliberationLoop {
         self.parseOutput = ParseOutput(maxFrames: maxFrames)
         self.fwdBatch = OutBatch(maxFrames: maxFrames)
         self.outBatch = OutBatch(maxFrames: maxFrames)
-
-#if DEBUG
-        debugRunTCPFSMTests()
-#endif
     }
 
     // MARK: - Dynamic port forwarding
@@ -95,9 +91,10 @@ public struct DeliberationLoop {
         let nowSec = UInt64(Darwin.time(nil))
         let nowUs = monotonicMicros()
 
-        // Periodic ARP reap (every 60 seconds)
+        // Periodic ARP reap and rate limiter pruning (every 60 seconds)
         if nowSec - lastARPReapSec > 60 {
             arpMapping.reapExpired(now: nowSec)
+            icmpErrorLimiter.pruneExpired()
             lastARPReapSec = nowSec
         }
         // Pick the earliest deadline among ACK, RTO, and persist timers

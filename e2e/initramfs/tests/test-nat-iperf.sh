@@ -1,15 +1,11 @@
 #!/bin/sh
-# Test: NAT TCP throughput with iperf3 (upload = VM→host, northbound).
-#
-# Download testing via iperf3 -R is tracked as a known issue:
-# gvproxy achieves 1.83 Gbps download, SwiftNetStack returns 0/exits 1.
-# Southbound data correctness is verified by all other TCP tests.
 . /tests/lib.sh
 
-echo "--- NAT iperf3 Throughput (upload) ---"
+echo "--- NAT iperf3 Throughput ---"
 
 NAT_TARGET=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_target=' | cut -d= -f2)
 IPERF_PORT=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_iperf_port=' | cut -d= -f2)
+NAT_TCP_PORT=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_tcp_port=' | cut -d= -f2)
 
 if [ -z "$NAT_TARGET" ] || [ -z "$IPERF_PORT" ]; then
     echo "  SKIP: nat_target or nat_iperf_port not in cmdline"; return 0
@@ -30,11 +26,22 @@ check_iperf() {
     echo "  $_label: ${_gbps} Gbits/sec"
 }
 
-json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 1 -P 8 --json 2>/dev/null); rc=$?
-check_iperf "Upload-1s" "$json" $rc
+# Upload: VM→host, 8 streams
+json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P 8 --json 2>/dev/null); rc=$?
+check_iperf "Upload" "$json" $rc
 sleep 1
 
-json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P 8 --json 2>/dev/null); rc=$?
-check_iperf "Upload-3s" "$json" $rc
+# Bulk download: nc via TCP echo (port 7777), 64KB. Tests southbound integrity.
+echo "  === Bulk download: 64KB via TCP echo ==="
+dd if=/dev/urandom bs=1024 count=64 of=/tmp/dl-in.bin 2>/dev/null
+nc -w 10 "$NAT_TARGET" "${NAT_TCP_PORT:-7777}" < /tmp/dl-in.bin > /tmp/dl-out.bin 2>/dev/null
+IN_SIZE=$(wc -c < /tmp/dl-in.bin 2>/dev/null)
+OUT_SIZE=$(wc -c < /tmp/dl-out.bin 2>/dev/null)
+if [ "$IN_SIZE" -eq "$OUT_SIZE" ] && [ "$IN_SIZE" -gt 60000 ]; then
+    echo "  Download: $OUT_SIZE bytes OK"
+else
+    echo "  Download: FAIL (sent=$IN_SIZE recv=$OUT_SIZE)"
+    FAIL=1
+fi
 
 if [ $FAIL -eq 0 ]; then test_pass "nat-iperf"; else test_fail "nat-iperf"; fi

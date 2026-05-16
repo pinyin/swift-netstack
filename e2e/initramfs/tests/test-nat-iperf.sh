@@ -2,16 +2,16 @@
 # Test: NAT TCP throughput — local (host) bidirectional + multi-connection.
 . /tests/lib.sh
 
-echo "--- NAT iperf3 Throughput (host) ---"
+echo '--- NAT iperf3 Throughput (host) ---'
 
 NAT_TARGET=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_target=' | cut -d= -f2)
 IPERF_PORT=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_iperf_port=' | cut -d= -f2)
 
 if [ -z "$NAT_TARGET" ] || [ -z "$IPERF_PORT" ]; then
-    echo "  SKIP: nat_target or nat_iperf_port not in cmdline"; return 0
+    echo '  SKIP: nat_target or nat_iperf_port not in cmdline'; return 0
 fi
 if [ ! -x /bin/iperf3 ]; then
-    echo "  SKIP: /bin/iperf3 not found"; return 0
+    echo '  SKIP: /bin/iperf3 not found'; return 0
 fi
 
 FAIL=0
@@ -22,21 +22,22 @@ check_iperf() {
     _bps=$(echo "$_json" | grep 'bits_per_second' | tail -1 | sed 's/.*bits_per_second": *//' | sed 's/[^0-9.e+]//g')
     if [ -z "$_bps" ] || [ "$_bps" = "0" ]; then echo "  $_label: ZERO"; FAIL=1; return; fi
     _gbps=$(awk "BEGIN { printf \"%.2f\", $_bps / 1000000000 }" 2>/dev/null)
-    echo "  $_label: ${_gbps} Gbits/sec"
+    _mbps=$(awk "BEGIN { printf \"%.0f\", $_bps / 1000000 }" 2>/dev/null)
+    echo "  $_label: ${_gbps} Gbits/sec (${_mbps} Mbps)"
 }
 
-# Upload: VM→host, 1/8/32 streams
-for P in 1 8 32; do
-    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 2 -P $P --json 2>/dev/null); rc=$?
+# Upload: VM→host
+for P in 1 8 128; do
+    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P $P --json 2>/dev/null); rc=$?
     check_iperf "Upload-${P}p" "$json" $rc
     sleep 1
 done
 
-# Download: host→VM via -R, 1/8 streams
-for P in 1 8; do
-    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 2 -P $P -R --json 2>/dev/null); rc=$?
+# Download: host→VM via -R
+for P in 1 8 128; do
+    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P $P -R --json 2>/dev/null); rc=$?
     check_iperf "Download-${P}p" "$json" $rc
     sleep 1
 done
 
-if [ $FAIL -eq 0 ]; then test_pass "nat-iperf"; else test_fail "nat-iperf"; fi
+if [ $FAIL -eq 0 ]; then test_pass 'nat-iperf'; else test_fail 'nat-iperf'; fi

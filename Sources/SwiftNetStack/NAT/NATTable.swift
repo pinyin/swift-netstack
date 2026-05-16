@@ -831,12 +831,6 @@ public struct NATTable {
             guard !entry.connection.externalEOF else { continue }
             entry.lastActivity = nowSec
             entry.connection.sendQueue.commitRecv(bytesRead)
-            // Preemptively block when queue is near full to prevent
-            // data loss via recvScratch fallback next round.
-            if entry.connection.totalQueuedBytes >= TCPConnection.maxQueueBytes && !entry.connection.sendQueueBlocked {
-                entry.connection.sendQueueBlocked = true
-                transport.setFDEvents(fd, events: 0)
-            }
             dirtyConnections.insert(key)
         }
 
@@ -1333,11 +1327,15 @@ public struct NATTable {
         transport.clearRecvTargets()
         for (_, entry) in tcpEntries {
             let c = entry.connection
-            if !c.sendQueueBlocked, !c.externalEOF {
-                let (buf, cap) = c.sendQueue.recvTarget()
-                if cap > 0 {
-                    transport.setRecvTarget(fd: c.posixFD, buffer: buf, capacity: cap)
-                }
+            if c.sendQueueBlocked || c.externalEOF {
+                continue
+            }
+            let (buf, cap) = c.sendQueue.recvTarget()
+            if cap > 0 {
+                transport.setRecvTarget(fd: c.posixFD, buffer: buf, capacity: cap)
+            } else {
+                // sendQueue full — don't recv, let kernel buffer backpressure
+                transport.skipRecv(fd: c.posixFD)
             }
         }
     }

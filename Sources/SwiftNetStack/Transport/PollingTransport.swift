@@ -62,6 +62,8 @@ public struct PollingTransport {
     private var recvTargetFDs: [Int32] = []
     private var recvTargetBufs: [UnsafeMutableRawPointer] = []
     private var recvTargetCaps: [Int] = []
+    /// FDs to skip in the fallback recv path (sendQueue full, data stays in kernel).
+    private var skipRecvFDs: Set<Int32> = []
 
     /// Reusable recv scratch buffer — used as fallback when no recv target.
     private var recvScratch: [UInt8]
@@ -88,11 +90,15 @@ public struct PollingTransport {
         }
     }
 
-    /// Remove all recv targets (call after each round).
+    /// Mark fd to skip in fallback recv path (sendQueue full).
+    public mutating func skipRecv(fd: Int32) { skipRecvFDs.insert(fd) }
+
+    /// Remove all recv targets and skip flags (call each round).
     public mutating func clearRecvTargets() {
         recvTargetFDs.removeAll(keepingCapacity: true)
         recvTargetBufs.removeAll(keepingCapacity: true)
         recvTargetCaps.removeAll(keepingCapacity: true)
+        skipRecvFDs.removeAll(keepingCapacity: true)
     }
 
     public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil,
@@ -238,6 +244,8 @@ public struct PollingTransport {
                         if totalRead > 0 {
                             result.zeroCopyReads.append((fd, totalRead))
                         }
+                    } else if skipRecvFDs.contains(fd) {
+                        continue  // sendQueue full, data stays in kernel buffer
                     } else {
                         // Fallback: recv into scratch buffer
                         while true {

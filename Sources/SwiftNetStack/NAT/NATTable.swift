@@ -1676,26 +1676,16 @@ public struct NATTable {
         // State advances only on successful sendmsg — if EAGAIN/ENOBUFS
         // strikes, we set pendingFinToVM so flushOneConnection retries later.
         var finDrainComplete = true
-        // Drain all queued data before sending FIN.
         if entry.connection.totalQueuedBytes > 0 {
             guard let epFD = transport.fdForEndpoint(entry.connection.endpointID) else { return }
-            let drainTarget = entry.connection.totalQueuedBytes
-            var drainSent = 0
             var drainIters = 0
-            while drainIters < kMaxDrainIterations {
+            while entry.connection.totalQueuedBytes > 0, drainIters < kMaxDrainIterations {
+                drainIters += 1
                 let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
                 var canSend = Int(entry.connection.snd.wnd) - Int(inFlight)
-                if canSend <= 0 {
-                    // Window full but data remains: arm persist timer so
-                    // flushOneConnection retries. Don't send FIN yet.
-                    if entry.connection.peekSendData(max: 1) != nil {
-                        finDrainComplete = false
-                    }
-                    break
-                }
+                if canSend <= 0 { break }
                 if canSend > mss { canSend = mss }
                 guard let data = entry.connection.peekSendData(max: canSend) else { break }
-                drainIters += 1
                 let r = sendOneDataSegment(
                     to: entry.connection, seq: entry.connection.snd.nxt, ack: entry.connection.rcv.nxt,
                     flags: [.ack, .psh], data: data,
@@ -1706,10 +1696,6 @@ public struct NATTable {
                 }
                 entry.connection.snd.nxt = entry.connection.snd.nxt &+ UInt32(data.len)
                 entry.connection.sendQueueSent += data.len
-                drainSent += data.len
-            }
-            if drainSent < drainTarget {
-                fputs("[NAT-FIN-DRAIN] partial: sent \(drainSent)/\(drainTarget) bytes, snd.wnd=\(entry.connection.snd.wnd) inFlight=\(entry.connection.snd.nxt &- entry.connection.snd.una)\n", stderr)
             }
             if drainIters >= kMaxDrainIterations {
                 sanityLog("FIN drain cap hit for \(key.vmIP):\(key.vmPort), q=\(entry.connection.totalQueuedBytes)")

@@ -278,6 +278,183 @@ import Darwin
 }
 
 
+// MARK: - sendQueue drain simulates flushOneConnection download path
+
+@Test func sendQueue_drain_exact_bytes() {
+    // Reproduce the 1-byte-loss bug: enqueue N bytes, drain via
+    // peekSendData loops, verify total drained == N.
+    let conn = makeTestConnection()
+    let N = 64240  // 44 × 1460, perfectly aligned
+    let data = [UInt8](repeating: 0xAB, count: N)
+    conn.writeSendBuf(data, data.count)
+    #expect(conn.totalQueuedBytes == N)
+
+    var totalSent = 0
+    let mss = 1460
+    while true {
+        guard let d = conn.peekSendData(max: mss) else { break }
+        totalSent += d.len
+        conn.sendQueueSent += d.len
+        conn.snd.nxt = conn.snd.nxt &+ UInt32(d.len)
+    }
+    #expect(totalSent == N, "drained \(totalSent) bytes, expected \(N)")
+    #expect(conn.sendQueueSent == N)
+    #expect(conn.totalQueuedBytes == N, "totalQueuedBytes unchanged until ACK")
+}
+
+@Test func sendQueue_drain_unaligned() {
+    // Test with non-MSS-aligned size (like 65536 which doesn't divide by 1460)
+    let conn = makeTestConnection()
+    let N = 65536
+    let data = [UInt8](repeating: 0xCD, count: N)
+    conn.writeSendBuf(data, data.count)
+
+    var totalSent = 0
+    let mss = 1460
+    while true {
+        guard let d = conn.peekSendData(max: mss) else { break }
+        totalSent += d.len
+        conn.sendQueueSent += d.len
+        conn.snd.nxt = conn.snd.nxt &+ UInt32(d.len)
+    }
+    #expect(totalSent == N, "drained \(totalSent) bytes, expected \(N)")
+}
+
+@Test func sendQueue_drain_small() {
+    // Test with sizes around the suspected boundary
+    for N in [1, 2, 3, 1460, 1461, 2919, 2920, 2921] {
+        let conn = makeTestConnection()
+        let data = [UInt8](repeating: 0xEF, count: N)
+        conn.writeSendBuf(data, data.count)
+
+        var totalSent = 0
+        let mss = 1460
+        while true {
+            guard let d = conn.peekSendData(max: mss) else { break }
+            totalSent += d.len
+            conn.sendQueueSent += d.len
+        }
+        #expect(totalSent == N, "N=\(N): drained \(totalSent) bytes")
+    }
+}
+
+@Test func sendQueue_drain_after_compaction() {
+    // Simulate compaction (memmove when readPos > 0) then drain
+    let conn = makeTestConnection()
+    let N = 64240
+    let data = [UInt8](repeating: 0x11, count: N)
+    conn.writeSendBuf(data, data.count)
+
+    // Simulate ACK of first 30000 bytes → triggers deque + potential compaction
+    conn.ackSendBuf(delta: 30000)
+    #expect(conn.totalQueuedBytes == N - 30000)
+
+    var totalSent = 0
+    let mss = 1460
+    while true {
+        guard let d = conn.peekSendData(max: mss) else { break }
+        totalSent += d.len
+        conn.sendQueueSent += d.len
+    }
+    #expect(totalSent == N - 30000, "after ack: drained \(totalSent), expected \(N - 30000)")
+}
+
+// MARK: - recvTarget + commitRecv + drain: full download pipeline
+
+@Test func recvTarget_commitRecv_drain_no_loss() {
+    // Simulate the full download receive pipeline:
+    // 1. recvTarget() → get write buffer
+    // 2. Simulate recv() writing data into the buffer
+    // 3. commitRecv(len) → advance writePos
+    // 4. Drain via peekSendData + sendQueueSent
+    let conn = makeTestConnection()
+    let N = 64240
+    let pattern = [UInt8](unsafeUninitializedCapacity: N) { buf, count in
+        for i in 0..<N { buf[i] = UInt8((i * 0x9E3779B9) & 0xFF) }
+        count = N
+    }
+
+    // Step 1: get recv target
+    var sendQueue = conn.sendQueue
+    let (writePtr, avail) = sendQueue.recvTarget()
+    #expect(avail >= N, "recvTarget should have space")
+
+    // Step 2: simulate recv() writing directly into sendQueue buffer
+    writePtr.copyMemory(from: pattern, byteCount: N)
+
+    // Step 3: commitRecv
+    sendQueue.commitRecv(N)
+    conn.sendQueue = sendQueue
+    #expect(conn.totalQueuedBytes == N, "totalQueuedBytes after commitRecv")
+
+    // Step 4: drain
+    var totalSent = 0
+    let mss = 1460
+    while true {
+        guard let d = conn.peekSendData(max: mss) else { break }
+        totalSent += d.len
+        conn.sendQueueSent += d.len
+        conn.snd.nxt = conn.snd.nxt &+ UInt32(d.len)
+    }
+    #expect(totalSent == N, "after commitRecv+drain: \(totalSent) != \(N)")
+
+    // Verify data content
+    let rt = conn.peekRetransmitData(max: N)
+    #expect(rt != nil)
+    if let rt {
+        #expect(rt.len == N)
+        let buf = UnsafeRawBufferPointer(start: rt.ptr, count: rt.len)
+        for i in 0..<min(N, 100) {
+            let expected = UInt8((i * 0x9E3779B9) & 0xFF)
+            #expect(buf[i] == expected, "byte \(i): \(buf[i]) != \(expected)")
+        }
+    }
+}
+
+@Test func recvTarget_compaction_preserves_data() {
+    // recvTarget memmoves to compact → verify no data loss
+    let conn = makeTestConnection()
+    let N = 64240
+    let pattern = [UInt8](unsafeUninitializedCapacity: N) { buf, count in
+        for i in 0..<N { buf[i] = UInt8((i * 0x9E3779B9) & 0xFF) }
+        count = N
+    }
+
+    // First recv: 30000 bytes
+    var sq = conn.sendQueue
+    var (wp, _) = sq.recvTarget()
+    wp.copyMemory(from: pattern, byteCount: 30000)
+    sq.commitRecv(30000)
+
+    // Dequeue 20000 (simulating an ACK)
+    sq.dequeue(20000)
+
+    // Second recvTarget: should compact remaining 10000 bytes to front
+    (wp, _) = sq.recvTarget()
+    pattern.withUnsafeBytes { buf in
+        wp.copyMemory(from: buf.baseAddress!.advanced(by: 30000), byteCount: 34240)
+    }
+    sq.commitRecv(34240)
+
+    // Total in queue: 10000 + 34240 = 44240
+    let conn2 = makeTestConnection()
+    var sq2 = conn2.sendQueue
+    sq2 = sq  // copy the mutated sendQueue
+    #expect(sq2.count == 44240, "count after compact+recv: \(sq2.count)")
+
+    // Drain
+    var totalSent = 0
+    // We need to peek via the connection's sendQueue... but we modified sq directly
+    // Use the mutated sq by reading from buf directly
+    let peeked = sq2.peek(max: 44240)
+    #expect(peeked != nil)
+    if let (ptr, len) = peeked {
+        #expect(len == 44240)
+        totalSent = len
+    }
+    #expect(totalSent == 44240)
+}
+
 // MARK: - helpers
 
 private func makeTestConnection() -> TCPConnection {

@@ -172,21 +172,69 @@ def _handle_bidi(conn: socket.socket, addr: tuple) -> None:
         conn.close()
 
 
+
+def tcp_dl_integrity(port: int) -> None:
+    """Download integrity: client triggers, server sends 64KB deterministic pattern.
+
+    Client sends 1 byte trigger, server responds with full pattern then echoes
+    any remaining client data for optional upload verification.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(8)
+    SIZE = 64240
+    pat = bytes((i * 0x9E3779B9) & 0xFF for i in range(SIZE))
+    print(f"TCP dl-integrity listening on 0.0.0.0:{port} ({SIZE}B pattern)", flush=True)
+    while True:
+        conn, addr = s.accept()
+        t = threading.Thread(target=_handle_dl_integrity, args=(conn, pat), daemon=True)
+        t.start()
+
+def _handle_dl_integrity(conn: socket.socket, pattern: bytes) -> None:
+    try:
+        # Try to read a trigger byte with short timeout.
+        # If the client sends nothing (close-first mode), send pattern anyway.
+        conn.settimeout(0.05)
+        try:
+            trigger = conn.recv(1)
+        except socket.timeout:
+            trigger = None
+        conn.settimeout(None)
+        # Always send the full pattern
+        conn.sendall(pattern)
+        # If the client sent a trigger, read+echo remaining data
+        if trigger:
+            data = trigger
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) > 1:  # more than just the trigger
+                conn.sendall(data[1:])
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
 def main() -> None:
-    if len(sys.argv) != 6:
-        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port> <tcp_close_port> <bidi_port>", file=sys.stderr)
+    if len(sys.argv) != 7:
+        print(f"Usage: {sys.argv[0]} <tcp_port> <udp_port> <http_port> <tcp_close_port> <bidi_port> <dl_integrity_port>", file=sys.stderr)
         sys.exit(1)
     tcp_port = int(sys.argv[1])
     udp_port = int(sys.argv[2])
     http_port = int(sys.argv[3])
     tcp_close_port = int(sys.argv[4])
     bidi_port = int(sys.argv[5])
+    dl_integrity_port = int(sys.argv[6])
 
     threading.Thread(target=tcp_echo, args=(tcp_port,), daemon=True).start()
     threading.Thread(target=udp_echo, args=(udp_port,), daemon=True).start()
     threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
     threading.Thread(target=tcp_close_first, args=(tcp_close_port,), daemon=True).start()
     threading.Thread(target=tcp_bidi, args=(bidi_port,), daemon=True).start()
+    threading.Thread(target=tcp_dl_integrity, args=(dl_integrity_port,), daemon=True).start()
 
     try:
         threading.Event().wait()

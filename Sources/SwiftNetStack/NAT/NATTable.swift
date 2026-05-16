@@ -627,7 +627,14 @@ public struct NATTable {
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
             if unaDelta > 0 {
-                entry.connection.ackSendBuf(delta: unaDelta)
+                // The SYN flag consumes 1 sequence number but has no
+                // corresponding byte in sendQueue.  Skip one byte when
+                // the handshake completes so we don't dequeue real data.
+                let dequeueDelta = oldState == .synReceived
+                    ? unaDelta - 1 : unaDelta
+                if dequeueDelta > 0 {
+                    entry.connection.ackSendBuf(delta: dequeueDelta)
+                }
                 entry.connection.dupAckCount = 0
                 entry.connection.lastAckValue = entry.connection.snd.una
                 entry.connection.snd.nonRecoveryRtxCount = 0  // new hole position, reset escalation
@@ -1575,10 +1582,9 @@ public struct NATTable {
             Darwin.connect(fd, sa, saLen)
         }
         if connectOK < 0 && errno != EINPROGRESS {
-            debugLog("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) failed: errno=\(errno)\n")
+            fputs("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) failed: errno=\(errno)\n", stderr)
             close(fd); return
         }
-        debugLog("[NAT-TCP-OUT] connect() to \(connectIP):\(key.dstPort) OK (fd=\(fd), errno=\(errno))\n")
 
         let conn = TCPConnection(
             connectionID: nextID(), posixFD: fd, state: .listen,
@@ -1670,16 +1676,26 @@ public struct NATTable {
         // State advances only on successful sendmsg — if EAGAIN/ENOBUFS
         // strikes, we set pendingFinToVM so flushOneConnection retries later.
         var finDrainComplete = true
+        // Drain all queued data before sending FIN.
         if entry.connection.totalQueuedBytes > 0 {
             guard let epFD = transport.fdForEndpoint(entry.connection.endpointID) else { return }
+            let drainTarget = entry.connection.totalQueuedBytes
+            var drainSent = 0
             var drainIters = 0
-            while entry.connection.totalQueuedBytes > 0, drainIters < kMaxDrainIterations {
-                drainIters += 1
+            while drainIters < kMaxDrainIterations {
                 let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
                 var canSend = Int(entry.connection.snd.wnd) - Int(inFlight)
-                if canSend <= 0 { break }
+                if canSend <= 0 {
+                    // Window full but data remains: arm persist timer so
+                    // flushOneConnection retries. Don't send FIN yet.
+                    if entry.connection.peekSendData(max: 1) != nil {
+                        finDrainComplete = false
+                    }
+                    break
+                }
                 if canSend > mss { canSend = mss }
                 guard let data = entry.connection.peekSendData(max: canSend) else { break }
+                drainIters += 1
                 let r = sendOneDataSegment(
                     to: entry.connection, seq: entry.connection.snd.nxt, ack: entry.connection.rcv.nxt,
                     flags: [.ack, .psh], data: data,
@@ -1690,6 +1706,10 @@ public struct NATTable {
                 }
                 entry.connection.snd.nxt = entry.connection.snd.nxt &+ UInt32(data.len)
                 entry.connection.sendQueueSent += data.len
+                drainSent += data.len
+            }
+            if drainSent < drainTarget {
+                fputs("[NAT-FIN-DRAIN] partial: sent \(drainSent)/\(drainTarget) bytes, snd.wnd=\(entry.connection.snd.wnd) inFlight=\(entry.connection.snd.nxt &- entry.connection.snd.una)\n", stderr)
             }
             if drainIters >= kMaxDrainIterations {
                 sanityLog("FIN drain cap hit for \(key.vmIP):\(key.vmPort), q=\(entry.connection.totalQueuedBytes)")

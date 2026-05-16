@@ -21,7 +21,9 @@ HTTP_PORT="${HTTP_PORT:-7779}"
 TCP_CLOSE_PORT="${TCP_CLOSE_PORT:-7780}"
 BIDI_PORT="${BIDI_PORT:-7781}"
 IPERF_PORT="${IPERF_PORT:-7782}"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
 EXT_IPERF_PORT="${EXT_IPERF_PORT:-7782}"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
 EXT_HTTP_PORT="${EXT_HTTP_PORT:-7783}"
 EXT_TCP_ECHO_PORT="${EXT_TCP_ECHO_PORT:-7784}"
 TIMEOUT="${TIMEOUT:-120}"
@@ -99,13 +101,14 @@ start_local_services() {
     fi
 
     python3 "$script_dir/echo_servers.py" \
-        "$TCP_PORT" "$UDP_PORT" "$HTTP_PORT" "$TCP_CLOSE_PORT" "$BIDI_PORT" &
+        "$TCP_PORT" "$UDP_PORT" "$HTTP_PORT" "$TCP_CLOSE_PORT" "$BIDI_PORT" "$DL_INTEGRITY_PORT" &
     ECHO_PID=$!
     sleep 0.5
 
     if kill -0 "$ECHO_PID" 2>/dev/null; then
-        NAT_CMD="nat_target=$host_ip nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT nat_tcp_bidi_port=$BIDI_PORT nat_iperf_port=$IPERF_PORT"
-        echo "Echo servers: TCP:$TCP_PORT UDP:$UDP_PORT HTTP:$HTTP_PORT CLOSE:$TCP_CLOSE_PORT BIDI:$BIDI_PORT (target=$host_ip)"
+        NAT_CMD="nat_target=$host_ip nat_tcp_port=$TCP_PORT nat_udp_port=$UDP_PORT nat_http_port=$HTTP_PORT nat_tcp_close_port=$TCP_CLOSE_PORT nat_tcp_bidi_port=$BIDI_PORT nat_iperf_port=$IPERF_PORT nat_dl_integrity_port=$DL_INTEGRITY_PORT"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
+        echo "Echo servers: TCP:$TCP_PORT UDP:$UDP_PORT HTTP:$HTTP_PORT CLOSE:$TCP_CLOSE_PORT BIDI:$BIDI_PORT DL_INT:$DL_INTEGRITY_PORT (target=$host_ip)"
     else
         ECHO_PID=""
         echo "WARNING: Echo servers failed to start, NAT tests will skip"
@@ -114,8 +117,10 @@ start_local_services() {
     # iperf3 server (independent of echo_servers.py)
     if [ -n "$host_ip" ] && command -v iperf3 &>/dev/null; then
         iperf3 -s -p "$IPERF_PORT" --daemon 2>/dev/null && IPERF_PID=$!
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
         if [ -n "$IPERF_PID" ]; then
             echo "iperf3 server: port $IPERF_PORT (pid $IPERF_PID)"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
         fi
     fi
 }
@@ -134,13 +139,17 @@ start_external_iperf() {
     EXT_IPERF_SSH_PID=""
     if ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$target" \
         "iperf3 -c 127.0.0.1 -p $EXT_IPERF_PORT -t 1 2>&1" >/dev/null 2>&1; then
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
         echo "iperf3 already running on $target:$EXT_IPERF_PORT"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
     else
         ssh -o ConnectTimeout=3 -o BatchMode=yes "pinyin@$target" \
             "killall iperf3 2>/dev/null; nohup iperf3 -s -p $EXT_IPERF_PORT --daemon" 2>/dev/null &
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
         EXT_IPERF_SSH_PID=$!
         sleep 0.5
         echo "Started iperf3 on $target:$EXT_IPERF_PORT"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
     fi
 }
 
@@ -189,6 +198,7 @@ start_external_services() {
     start_external_tcp_echo "$target"
 
     EXT_CMD="ext_target=$target ext_iperf_port=$EXT_IPERF_PORT ext_http_port=$EXT_HTTP_PORT ext_tcp_echo_port=$EXT_TCP_ECHO_PORT"
+DL_INTEGRITY_PORT="${DL_INTEGRITY_PORT:-7785}"
 }
 
 # stop_external_services

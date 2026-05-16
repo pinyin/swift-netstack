@@ -1,7 +1,8 @@
 #!/bin/sh
+# Test: NAT TCP throughput — local (host) bidirectional + multi-connection.
 . /tests/lib.sh
 
-echo "--- NAT iperf3 Throughput ---"
+echo "--- NAT iperf3 Throughput (host) ---"
 
 NAT_TARGET=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_target=' | cut -d= -f2)
 IPERF_PORT=$(cat /proc/cmdline | tr ' ' '\n' | grep '^nat_iperf_port=' | cut -d= -f2)
@@ -12,7 +13,6 @@ fi
 if [ ! -x /bin/iperf3 ]; then
     echo "  SKIP: /bin/iperf3 not found"; return 0
 fi
-echo "  Target: $NAT_TARGET:$IPERF_PORT"
 
 FAIL=0
 
@@ -25,13 +25,18 @@ check_iperf() {
     echo "  $_label: ${_gbps} Gbits/sec"
 }
 
-# Upload (northbound): 8 streams
-json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P 8 --json 2>/dev/null); rc=$?
-check_iperf "Upload" "$json" $rc
-sleep 1
+# Upload: VM→host, 1/8/32 streams
+for P in 1 8 32; do
+    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 2 -P $P --json 2>/dev/null); rc=$?
+    check_iperf "Upload-${P}p" "$json" $rc
+    sleep 1
+done
 
-# Download (southbound via -R): 1 stream
-json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 3 -P 1 -R --json 2>/dev/null); rc=$?
-check_iperf "Download" "$json" $rc
+# Download: host→VM via -R, 1/8 streams
+for P in 1 8; do
+    json=$(/bin/iperf3 -c "$NAT_TARGET" -p "$IPERF_PORT" -t 2 -P $P -R --json 2>/dev/null); rc=$?
+    check_iperf "Download-${P}p" "$json" $rc
+    sleep 1
+done
 
 if [ $FAIL -eq 0 ]; then test_pass "nat-iperf"; else test_fail "nat-iperf"; fi

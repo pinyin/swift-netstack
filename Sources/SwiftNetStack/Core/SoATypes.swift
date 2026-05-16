@@ -429,4 +429,26 @@ public struct SendQueue {
     }
 
     public func free() { buf.deallocate() }
+
+    // MARK: - Direct recv support (zero-copy southbound)
+
+    /// Prepare contiguous free space for direct `recv()`. Compacts if fragmented.
+    /// Returns (writePtr, availableBytes). May memmove — call before poll.
+    public mutating func recvTarget() -> (UnsafeMutableRawPointer, Int) {
+        if readPos > 0 {
+            let cnt = count
+            if cnt > 0 {
+                memmove(buf.baseAddress!, buf.baseAddress! + readPos, cnt)
+            }
+            writePos = cnt
+            readPos = 0
+        }
+        let avail = capacity - writePos
+        return (buf.baseAddress! + writePos, avail)
+    }
+
+    /// Commit bytes received via direct `recv()` into this buffer.
+    public mutating func commitRecv(_ len: Int) {
+        writePos += len
+    }
 }

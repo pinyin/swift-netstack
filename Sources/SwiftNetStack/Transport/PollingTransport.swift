@@ -29,10 +29,12 @@ public enum ExternalFDKind {
 
 /// All data read by a single readPackets() call.
 public struct TransportResult {
-    /// Flat buffer backing streamReads offsets. All stream data for a round
-    /// is accumulated here, avoiding per-recv() [UInt8] heap allocations.
+    /// Zero-copy stream reads: fd → bytesRead. Data was recv'd directly into
+    /// the connection's sendQueue buffer, avoiding copies.
+    public var zeroCopyReads: [(fd: Int32, bytesRead: Int)] = []
+    /// Flat buffer backing streamReads offsets (fallback when no recv target).
     public var streamDataBuffer: [UInt8] = []
-    /// Stream reads as (fd, offset, len) into streamDataBuffer.
+    /// Stream reads as (fd, offset, len) into streamDataBuffer (fallback).
     public var streamReads: [(fd: Int32, offset: Int, len: Int)] = []
     public var streamAccepts: [(listenerFD: Int32, newFD: Int32, remoteAddr: sockaddr_in)] = []
     public var streamHangup: [Int32] = []
@@ -53,14 +55,44 @@ public struct PollingTransport {
     public var pollTimeout: Int32
     public var stats: TransportStats
 
-    /// Reusable recv scratch buffer — allocated once, reused every round.
-    /// Avoids 64KB alloc+zero-fill per external recv() call.
+    /// Per-fd direct-recv targets. When a stream fd has a target, readPackets
+    /// recvs directly into that buffer (zero-copy), eliminating recvScratch
+    /// and streamDataBuffer copies. Capacity reserved at init — no allocs in
+    /// the hot path.
+    private var recvTargetFDs: [Int32] = []
+    private var recvTargetBufs: [UnsafeMutableRawPointer] = []
+    private var recvTargetCaps: [Int] = []
+
+    /// Reusable recv scratch buffer — used as fallback when no recv target.
     private var recvScratch: [UInt8]
 
     // MARK: - Endpoint fd lookup
 
     public func fdForEndpoint(_ id: Int) -> Int32? {
         fdByEndpointID[id]
+    }
+
+    // MARK: - Zero-copy recv targets
+
+    /// Register a direct-recv buffer for a stream fd. During readPackets,
+    /// data is recv'd directly into this buffer (zero-copy), skipping
+    /// recvScratch and streamDataBuffer.
+    public mutating func setRecvTarget(fd: Int32, buffer: UnsafeMutableRawPointer, capacity: Int) {
+        if let idx = recvTargetFDs.firstIndex(of: fd) {
+            recvTargetBufs[idx] = buffer
+            recvTargetCaps[idx] = capacity
+        } else {
+            recvTargetFDs.append(fd)
+            recvTargetBufs.append(buffer)
+            recvTargetCaps.append(capacity)
+        }
+    }
+
+    /// Remove all recv targets (call after each round).
+    public mutating func clearRecvTargets() {
+        recvTargetFDs.removeAll(keepingCapacity: true)
+        recvTargetBufs.removeAll(keepingCapacity: true)
+        recvTargetCaps.removeAll(keepingCapacity: true)
     }
 
     public init(endpoints: [VMEndpoint], shutdownFD: Int32? = nil,
@@ -78,6 +110,9 @@ public struct PollingTransport {
         self.onShutdown = onShutdown
         self.pollTimeout = pollTimeout
         self.stats = TransportStats()
+        recvTargetFDs.reserveCapacity(256)
+        recvTargetBufs.reserveCapacity(256)
+        recvTargetCaps.reserveCapacity(256)
         self.recvScratch = [UInt8](repeating: 0, count: 65536)
     }
 
@@ -179,21 +214,42 @@ public struct PollingTransport {
                 switch kind {
                 case .stream:
                     var isListener = false
-                    while true {
-                        let n = recvScratch.withUnsafeMutableBytes {
+                    // Zero-copy path: recv directly into the connection's sendQueue
+                    if let tIdx = recvTargetFDs.firstIndex(of: fd) {
+                        while true {
+                            let buf = recvTargetBufs[tIdx]
+                            let cap = recvTargetCaps[tIdx]
+                            guard cap > 0 else { break }
                             stats.recvCalls += 1
-                            return Darwin.recv(fd, $0.baseAddress!, 65536, 0)
+                            let n = Darwin.recv(fd, buf, cap, 0)
+                            if n > 0 {
+                                result.zeroCopyReads.append((fd, n))
+                            } else if n == 0 {
+                                result.streamHangup.append(fd); break
+                            } else {
+                                if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { break }
+                                if errno == ENOTCONN { isListener = true; break }
+                                result.deadFDs.append(fd); break
+                            }
                         }
-                        if n > 0 {
-                            let off = result.streamDataBuffer.count
-                            result.streamDataBuffer.append(contentsOf: recvScratch[0..<n])
-                            result.streamReads.append((fd, off, n))
-                        } else if n == 0 {
-                            result.streamHangup.append(fd); break
-                        } else {
-                            if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { break }
-                            if errno == ENOTCONN { isListener = true; break }
-                            result.deadFDs.append(fd); break
+                    } else {
+                        // Fallback: recv into scratch buffer
+                        while true {
+                            let n = recvScratch.withUnsafeMutableBytes {
+                                stats.recvCalls += 1
+                                return Darwin.recv(fd, $0.baseAddress!, 65536, 0)
+                            }
+                            if n > 0 {
+                                let off = result.streamDataBuffer.count
+                                result.streamDataBuffer.append(contentsOf: recvScratch[0..<n])
+                                result.streamReads.append((fd, off, n))
+                            } else if n == 0 {
+                                result.streamHangup.append(fd); break
+                            } else {
+                                if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { break }
+                                if errno == ENOTCONN { isListener = true; break }
+                                result.deadFDs.append(fd); break
+                            }
                         }
                     }
                     if isListener {

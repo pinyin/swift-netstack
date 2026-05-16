@@ -462,6 +462,7 @@ public struct NATTable {
         streamDataBuffer: [UInt8],
         streamHangup: [Int32],
         streamConnects: [Int32],
+        zeroCopyReads: [(fd: Int32, bytesRead: Int)],
         transport: inout PollingTransport,
         hostMAC: MACAddress,
         arpMapping: ARPMapping,
@@ -729,14 +730,12 @@ public struct NATTable {
                     + "wnd=\(seg.window) dataLen=\(payloadLen) "
                     + "rcv.nxt=\(entry.connection.rcv.nxt) snd.nxt=\(entry.connection.snd.nxt) snd.una=\(entry.connection.snd.una)\n")
             }
-            // Queue FSM data FIRST (lower sequence numbers — gap-filling data).
-            // OOO data (higher sequence numbers) is queued after to preserve order.
+            // Queue FSM data to externalSendQueue. Copy cost is offset by
+            // batched write in flushOneConnection (1 syscall vs N per segment).
+            // TODO: zero-copy writev if io.input stability extends past here.
             if dataLen > 0, let ptr = dataPtr {
-                debugLog("[NAT-TCP-PROC] buffering \(dataLen)B for external \(key.dstIP):\(key.dstPort)\n")
                 let queued = entry.connection.appendExternalSend(ptr, dataLen)
-                if queued == 0, payloadLen > 0 {
-                    // Safety net — should be rare with backpressure pre-check.
-                    // Data was ACKed to VM but not queued for external send.
+                if queued == 0 {
                     fputs("[NAT-TCP-ERR] external send queue full, \(dataLen)B dropped for \(key.dstIP):\(key.dstPort) extQ=\(entry.connection.externalSendQueued) maxQ=\(TCPConnection.maxQueueBytes)\n", stderr)
                 }
             }
@@ -821,6 +820,20 @@ public struct NATTable {
 
         // ── Step 3: Process external→VM reads ──
         let tExtR = cpuNanos()
+
+        // Zero-copy reads: data was recv'd directly into sendQueue.buf.
+        // Just advance writePos — no copy needed.
+        for (fd, bytesRead) in zeroCopyReads {
+            guard let key = tcpFdToKey[fd], let entry = tcpEntries[key] else { continue }
+            let st = entry.connection.state
+            guard st == .synReceived || st == .established || st == .finWait1 || st == .finWait2
+                || st == .closeWait || st == .lastAck else { continue }
+            guard !entry.connection.externalEOF else { continue }
+            entry.lastActivity = nowSec
+            entry.connection.sendQueue.commitRecv(bytesRead)
+            dirtyConnections.insert(key)
+        }
+
         if !streamReads.isEmpty {
             debugLog("[NAT-TCP-RD-RAW] streamReads count=\(streamReads.count), fds=\(streamReads.map { $0.fd }), tcpFdToKey=\(tcpFdToKey.keys.sorted())\n")
         }
@@ -1307,6 +1320,21 @@ public struct NATTable {
     }
 
     // MARK: - External FD registration (for unified poll)
+
+    /// Refresh zero-copy recv targets only. Call every round before poll.
+    /// Lighter than syncExternalFDs — does not re-register FDs.
+    public mutating func refreshRecvTargets(with transport: inout PollingTransport) {
+        transport.clearRecvTargets()
+        for (_, entry) in tcpEntries {
+            let c = entry.connection
+            if !c.sendQueueBlocked, !c.externalEOF {
+                let (buf, cap) = c.sendQueue.recvTarget()
+                if cap > 0 {
+                    transport.setRecvTarget(fd: c.posixFD, buffer: buf, capacity: cap)
+                }
+            }
+        }
+    }
 
     public mutating func syncExternalFDs(with transport: inout PollingTransport) {
         for (fd, _) in tcpListeners { transport.registerFD(fd, events: Int16(POLLIN), kind: .stream) }

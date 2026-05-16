@@ -301,6 +301,7 @@ public struct DeliberationLoop {
             streamDataBuffer: result.streamDataBuffer,
             streamHangup: result.streamHangup,
             streamConnects: result.streamConnects,
+            zeroCopyReads: result.zeroCopyReads,
             transport: &transport,
             hostMAC: hostMAC,
             arpMapping: arpMapping,
@@ -576,6 +577,7 @@ public struct DeliberationLoop {
         natTable.externalPcap = pcapWriter
         var roundCount: UInt64 = 0
         while shouldContinue() {
+            natTable.refreshRecvTargets(with: &transport)
             runOneRound(transport: &transport, roundNumber: roundCount)
             roundCount += 1
             if roundCount % 1000 == 0 {

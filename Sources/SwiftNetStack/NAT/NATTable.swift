@@ -831,6 +831,12 @@ public struct NATTable {
             guard !entry.connection.externalEOF else { continue }
             entry.lastActivity = nowSec
             entry.connection.sendQueue.commitRecv(bytesRead)
+            // Preemptively block when queue is near full to prevent
+            // data loss via recvScratch fallback next round.
+            if entry.connection.totalQueuedBytes >= TCPConnection.maxQueueBytes && !entry.connection.sendQueueBlocked {
+                entry.connection.sendQueueBlocked = true
+                transport.setFDEvents(fd, events: 0)
+            }
             dirtyConnections.insert(key)
         }
 

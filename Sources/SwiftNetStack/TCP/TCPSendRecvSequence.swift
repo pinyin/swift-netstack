@@ -17,6 +17,11 @@ struct SendSequence {
     /// virtio-net links. Set lower if congestion (loss) is detected.
     var ssthresh: UInt32 = UInt32.max
 
+    /// True once the SYN has been ACKed.  The SYN flag consumes 1 sequence
+    /// number but has no corresponding byte in sendQueue.  The first ACK
+    /// must not deque application data for that phantom byte.
+    var synAcked: Bool = false
+
     /// Bytes in flight (sent but not acknowledged).
     var bytesInFlight: UInt32 { nxt &- una }
 }

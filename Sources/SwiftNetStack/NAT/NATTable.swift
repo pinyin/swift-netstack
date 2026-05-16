@@ -627,13 +627,15 @@ public struct NATTable {
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
             if unaDelta > 0 {
-                // The SYN flag consumes 1 sequence number but has no
-                // corresponding byte in sendQueue.  Skip one byte when
-                // the handshake completes so we don't dequeue real data.
-                let dequeueDelta = oldState == .synReceived
-                    ? unaDelta - 1 : unaDelta
-                if dequeueDelta > 0 {
-                    entry.connection.ackSendBuf(delta: dequeueDelta)
+                // SYN flag uses 1 seq number but has no sendQueue byte.
+                // Skip it on the first ACK so we don't dequeue real data.
+                if !entry.connection.snd.synAcked {
+                    entry.connection.snd.synAcked = true
+                    if unaDelta > 1 {
+                        entry.connection.ackSendBuf(delta: unaDelta - 1)
+                    }
+                } else {
+                    entry.connection.ackSendBuf(delta: unaDelta)
                 }
                 entry.connection.dupAckCount = 0
                 entry.connection.lastAckValue = entry.connection.snd.una

@@ -6,7 +6,7 @@ import Darwin
 /// Large enough to absorb TCP recovery bursts without bufferbloat.
 /// SO_SNDBUF is left at OS default — the BDP poll loop is tight enough
 /// that a large send buffer only hides backpressure.
-private let kVNicRecvBufferSize: Int = 4 * 1024 * 1024
+private let kVNicRecvBufferSize: Int = 8 * 1024 * 1024
 
 private func configureNetworkFD(_ fd: Int32) {
     let flags = fcntl(fd, F_GETFL, 0)

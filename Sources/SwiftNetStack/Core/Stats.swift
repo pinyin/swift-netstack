@@ -37,6 +37,8 @@ public struct TransportStats {
     }
 }
 
+extension TransportStats: Sendable {}
+
 // MARK: - NATStats
 
 /// NAT-level ACK and checksum counters.
@@ -129,6 +131,8 @@ public struct NATStats {
         return s
     }
 }
+
+extension NATStats: Sendable {}
 
 // MARK: - PhaseTiming
 
@@ -303,3 +307,5 @@ public func printStats(
     _ = line.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }
     _ = "\n".withCString { Darwin.write(STDERR_FILENO, $0, 1) }
 }
+
+extension PhaseTiming: Sendable {}

@@ -220,9 +220,7 @@ public func writeAckFromTemplate(
     // Overwrite dynamic fields
     writeUInt32BE(seq, to: ptr.advanced(by: 38))
     writeUInt32BE(ack, to: ptr.advanced(by: 42))
-    if window != 65535 {
-        writeUInt16BE(window, to: ptr.advanced(by: 48))
-    }
+    writeUInt16BE(window, to: ptr.advanced(by: 48))
 
     let ck: UInt16
     if let precomputed = checksum {

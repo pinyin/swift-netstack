@@ -236,7 +236,17 @@ private struct DHCPPool {
     let leaseTime: UInt32          // seconds before confirmed lease expires
     let offerTimeout: UInt64       // seconds before unconfirmed OFFER expires
 
-    private var available: Set<UInt32>
+    /// First allocatable IP in the subnet (network addr + 1, skipping gateway).
+    private let poolStart: UInt32
+    /// One past the last allocatable IP (broadcast addr).
+    private let poolEnd: UInt32
+
+    /// Pre-populated set of free IPs. Only used when poolSize ≤ 65536 (up to /16).
+    /// When nil, allocation falls back to linear probing from `nextProbe`.
+    private var available: Set<UInt32>?
+    /// Next IP to probe for allocation (only used when available == nil).
+    private var nextProbe: UInt32 = 0
+
     /// Confirmed leases: ip.addr → (clientMAC, deadline as seconds-since-epoch).
     private var leases: [UInt32: (mac: MACAddress, deadline: UInt64)] = [:]
     /// Reverse index for O(1) MAC→IP lookup. Maintained alongside `leases`.
@@ -252,24 +262,37 @@ private struct DHCPPool {
         self.offerTimeout = offerTimeout
         self.leaseTime = leaseTime
 
-        // Available: all IPs in subnet except network, gateway, and broadcast
         let netAddr = subnet.network.addr
         let bcAddr = subnet.broadcast.addr
         let gwAddr = gateway.addr
         precondition(netAddr != 0xFFFFFFFF,
             "DHCP subnet network address 255.255.255.255 is invalid")
-        var ips: Set<UInt32> = []
+
         let start = netAddr + 1
         let end = bcAddr
-        if start < end {
-            let count = min(end - start, 65536)
-            for i: UInt32 in 0..<count {
+        self.poolStart = start
+        self.poolEnd = end
+
+        guard start < end else {
+            self.available = []
+            return
+        }
+        let poolSize = end - start
+        if poolSize <= 65536 {
+            // Pre-populated set for O(1) allocation on typical /16-or-smaller subnets.
+            var ips: Set<UInt32> = []
+            ips.reserveCapacity(Int(poolSize))
+            for i: UInt32 in 0..<poolSize {
                 let addr = start + i
                 if addr == gwAddr { continue }
                 ips.insert(addr)
             }
+            self.available = ips
+        } else {
+            // Subnet too large for pre-population — use linear probing.
+            self.available = nil
+            self.nextProbe = start == gwAddr ? start &+ 1 : start
         }
-        self.available = ips
     }
 
     // MARK: - Time
@@ -289,7 +312,7 @@ private struct DHCPPool {
         }
         for addr in reclaimed {
             pendingOffers.removeValue(forKey: addr)
-            available.insert(addr)
+            if available != nil { available?.insert(addr) }
         }
     }
 
@@ -304,7 +327,7 @@ private struct DHCPPool {
             if let entry = leases.removeValue(forKey: addr) {
                 macToIP.removeValue(forKey: entry.mac)
             }
-            available.insert(addr)
+            if available != nil { available?.insert(addr) }
         }
     }
 
@@ -316,7 +339,16 @@ private struct DHCPPool {
         reapExpiredLeases()
 
         guard rateLimiter.allow(clientMAC) else { return nil }
-        guard let addr = available.popFirst() else { return nil }
+
+        let addr: UInt32
+        if var av = available {
+            guard let a = av.popFirst() else { return nil }
+            addr = a
+            self.available = av
+        } else {
+            guard let found = probeFreeAddr() else { return nil }
+            addr = found
+        }
 
         let deadline = Self.now() + offerTimeout
         pendingOffers[addr] = (mac: clientMAC, deadline: deadline)
@@ -328,9 +360,28 @@ private struct DHCPPool {
         return IPv4Address(addr: addr)
     }
 
+    /// Linear-probe for an unallocated IP. Used only when the subnet is too large
+    /// to pre-populate a Set (> 65536 IPs, i.e. larger than /16).
+    /// Wraps around; returns nil if no free IP exists after a full scan.
+    private mutating func probeFreeAddr() -> UInt32? {
+        let gwAddr = gateway.addr
+        var probe = nextProbe
+        for _ in 0..<min(poolEnd &- poolStart, 65536) {
+            if probe >= poolEnd { probe = poolStart }
+            if probe == gwAddr { probe &+= 1; continue }
+            if leases[probe] == nil && pendingOffers[probe] == nil {
+                nextProbe = probe &+ 1
+                if nextProbe >= poolEnd || nextProbe < poolStart { nextProbe = poolStart }
+                return probe
+            }
+            probe &+= 1
+        }
+        return nil  // pool exhausted
+    }
+
     /// Confirm a lease (REQUEST → ACK). Moves IP from available to leases.
     mutating func confirm(_ ip: IPv4Address, mac: MACAddress) {
-        available.remove(ip.addr)
+        if available != nil { available?.remove(ip.addr) }
         let deadline = Self.now() + UInt64(leaseTime)
         leases[ip.addr] = (mac: mac, deadline: deadline)
         macToIP[mac] = ip.addr
@@ -350,7 +401,7 @@ private struct DHCPPool {
         if let entry = leases.removeValue(forKey: ip.addr) {
             macToIP.removeValue(forKey: entry.mac)
         }
-        available.insert(ip.addr)
+        if available != nil { available?.insert(ip.addr) }
     }
 
     /// Get the IP leased to a given MAC, if any. O(1) via reverse index.
@@ -372,15 +423,19 @@ private struct DHCPPool {
 
     #if DEBUG
     private func debugCheckPoolIntegrity() {
-        let totalTracked = available.count + leases.count + pendingOffers.count
+        guard available != nil else { return }  // skip for probing-based pools
+        let totalTracked = available!.count + leases.count + pendingOffers.count
         let netAddr = subnet.network.addr
         let bcAddr = subnet.broadcast.addr
         let gwAddr = gateway.addr
-        let start = max(netAddr + 1, gwAddr + 1)
+        let start = netAddr &+ 1
         if start < bcAddr {
-            let expectedTotal = Int(min(bcAddr - start, 65536))
+            let poolSize = bcAddr &- start
+            let totalIPs = Int(min(poolSize, 65536))
+            let gwExcluded = (gwAddr >= start && gwAddr < bcAddr) ? 1 : 0
+            let expectedTotal = totalIPs - gwExcluded
             precondition(totalTracked == expectedTotal,
-                "DHCP pool integrity violation: available(\(available.count)) + leased(\(leases.count)) + pending(\(pendingOffers.count)) = \(totalTracked), expected \(expectedTotal)")
+                "DHCP pool integrity violation: available(\(available!.count)) + leased(\(leases.count)) + pending(\(pendingOffers.count)) = \(totalTracked), expected \(expectedTotal)")
         }
     }
     #endif

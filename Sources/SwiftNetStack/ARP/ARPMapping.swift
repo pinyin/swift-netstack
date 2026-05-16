@@ -41,6 +41,9 @@ public struct ARPEntry {
 public struct ARPMapping {
     public let hostMAC: MACAddress
     private var entries: [UInt32: ARPEntry] = [:]
+    /// MAC→endpointID reverse index. Maintained alongside `entries` for O(1)
+    /// L2-forwarding lookups (was O(N) via value scan).
+    private var macToEndpoint: [MACAddress: Int] = [:]
     private var rateLimiter = RateLimiter<MACAddress>(window: 1, maxRequests: 100)
 
     /// Build from VMEndpoint list. Gateway IPs are registered with hostMAC.
@@ -48,6 +51,7 @@ public struct ARPMapping {
         self.hostMAC = hostMAC
         for ep in endpoints {
             entries[ep.gateway.addr] = ARPEntry(ip: ep.gateway, mac: hostMAC, endpointID: ep.id)
+            macToEndpoint[hostMAC] = ep.id
         }
     }
 
@@ -60,12 +64,14 @@ public struct ARPMapping {
         return entry.mac
     }
 
-    /// Look up the endpoint ID for a MAC address. Returns nil if unknown or expired.
+    /// Look up the endpoint ID for a MAC address. O(1) via reverse index.
     public func lookupEndpoint(mac: MACAddress, now: UInt64 = UInt64(Darwin.time(nil)),
                                timeout: UInt64 = 3600) -> Int? {
+        guard let epID = macToEndpoint[mac] else { return nil }
+        // Cross-validate: the MAC→IP mapping must still be alive.
+        // Walk entries to confirm at least one non-expired entry points to this MAC.
         for entry in entries.values where entry.mac == mac {
-            if entry.isExpired(now: now, timeout: timeout) { return nil }
-            return entry.endpointID
+            if !entry.isExpired(now: now, timeout: timeout) { return epID }
         }
         return nil
     }
@@ -87,17 +93,27 @@ public struct ARPMapping {
         } else {
             entries[ip.addr] = ARPEntry(ip: ip, mac: mac, endpointID: endpointID)
         }
+        macToEndpoint[mac] = endpointID
     }
 
     /// Remove expired entries. Call periodically (every ~60s).
     public mutating func reapExpired(now: UInt64 = UInt64(Darwin.time(nil)),
                                       timeout: UInt64 = 3600) {
         entries = entries.filter { !$0.value.isExpired(now: now, timeout: timeout) }
+        // Rebuild macToEndpoint from remaining entries.
+        macToEndpoint.removeAll(keepingCapacity: true)
+        for (_, entry) in entries {
+            macToEndpoint[entry.mac] = entry.endpointID
+        }
     }
 
     /// Remove an entry. Called by DHCP server on lease release.
     public mutating func remove(ip: IPv4Address) {
-        entries.removeValue(forKey: ip.addr)
+        if let entry = entries.removeValue(forKey: ip.addr) {
+            // Only remove from reverse index if no other IP maps to this MAC.
+            let stillPresent = entries.values.contains { $0.mac == entry.mac }
+            if !stillPresent { macToEndpoint.removeValue(forKey: entry.mac) }
+        }
     }
 
     // MARK: - Proxy ARP

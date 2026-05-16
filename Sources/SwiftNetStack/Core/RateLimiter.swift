@@ -5,7 +5,7 @@ import Darwin
 /// A sliding-window rate limiter keyed by a Hashable type.
 /// Used for ARP reply rate limiting, DHCP DISCOVER rate limiting,
 /// and ICMP error message rate limiting (RFC 1812 §4.3.2.8).
-struct RateLimiter<Key: Hashable> {
+struct RateLimiter<Key: Hashable & Sendable>: Sendable {
     let window: UInt64       // window duration in seconds
     let maxRequests: Int     // max requests per window
 

@@ -10,7 +10,7 @@ func setNonBlocking(_ fd: Int32) {
 /// A larger receive buffer absorbs TCP recovery bursts from lossy links,
 /// preventing receive-window collapse under chaos.
 /// SO_SNDBUF is left at OS default to avoid bufferbloat and poll-loop imbalance.
-func setSocketBuffers(_ fd: Int32, rcvBytes: Int = 4_194_304) {
+func setSocketBuffers(_ fd: Int32, rcvBytes: Int = 8_388_608) {
     var r = rcvBytes
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &r, socklen_t(MemoryLayout<Int>.size))
 }

@@ -8,6 +8,11 @@ public func monotonicMicros() -> UInt64 {
     return UInt64(ts.tv_sec) * 1_000_000 + UInt64(ts.tv_nsec) / 1_000
 }
 
+/// RFC 1122 delayed ACK timeout in microseconds.
+/// 500µs batches more ACKs than the typical 200µs without perceivable latency impact
+/// on a sub-100µs virtio-net RTT. Reduces per-byte CPU overhead for bulk transfers.
+private let delayedACKMicros: UInt64 = 500
+
 /// NAT connection tracker and TCP/UDP proxy.
 ///
 /// Manages proxied connections with TCP/UDP symmetry:
@@ -626,6 +631,18 @@ public struct NATTable {
                 entry.connection.dupAckCount = 0
                 entry.connection.lastAckValue = entry.connection.snd.una
                 entry.connection.snd.nonRecoveryRtxCount = 0  // new hole position, reset escalation
+                // RFC 5681 slow start: cwnd += MSS per ACK.
+                // Adaptive cap: scales inversely with total connections to
+                // prevent incast. 1 conn → full window; 32 conns → window/8.
+                let n = UInt32(max(1, tcpEntries.count))
+                // Floor at 3×MSS: ensures 2+ segments/round for immediate ACK.
+                let cap = max(UInt32(6 * mss),
+                    entry.connection.snd.wnd &* 8 / n)
+                if entry.connection.snd.cwnd < entry.connection.snd.ssthresh {
+                    entry.connection.snd.cwnd = min(
+                        entry.connection.snd.cwnd &+ UInt32(mss),
+                        min(entry.connection.snd.wnd, cap))
+                }
                 // Approximate send time of the new oldest in-flight segment.
                 // Uses rtoSendTime (time of last send) as a conservative proxy —
                 // errs on the side of reordering tolerance.
@@ -778,7 +795,7 @@ public struct NATTable {
                     }
                     stats.ackDeferred += 1
                     entry.connection.pendingDelayedACK = true
-                    entry.connection.delayedACKDeadline = freshNowUs + 200
+                    entry.connection.delayedACKDeadline = freshNowUs + delayedACKMicros
                     entry.connection.delayedACKSeq = segToSend.seq
                     entry.connection.delayedACKAck = entry.connection.rcv.nxt
                     entry.connection.delayedACKWindow = entry.connection.availableWindow
@@ -893,16 +910,30 @@ public struct NATTable {
 
         stats.tcpExtReadNs &+= cpuNanos() - tExtR
 
-        // ── Step 5: Flush dirty connections (drain queues, forward FIN) ──
+        // ── Step 5: Flush dirty + queued connections (drain queues, forward FIN) ──
         let tFlush = cpuNanos()
-        for key in dirtyConnections {
-            guard let entry = tcpEntries[key] else { continue }
-            guard entry.connection.state == .established || entry.connection.state == .closeWait
-                  || entry.connection.state == .finWait1 || entry.connection.state == .finWait2
-                  || entry.connection.state == .lastAck else { continue }
-
-            flushOneConnection(key: key, conn: entry.connection, hostMAC: hostMAC,
-                               transport: &transport, io: io, nowUs: freshNowUs)
+        let totalConns = tcpEntries.count
+        if totalConns <= 16 {
+            // Few connections: iterate dirty only (O(dirty) ≪ O(N)).
+            for key in dirtyConnections {
+                guard let entry = tcpEntries[key] else { continue }
+                guard entry.connection.state == .established || entry.connection.state == .closeWait
+                      || entry.connection.state == .finWait1 || entry.connection.state == .finWait2
+                      || entry.connection.state == .lastAck else { continue }
+                flushOneConnection(key: key, conn: entry.connection, hostMAC: hostMAC,
+                                   transport: &transport, io: io, nowUs: freshNowUs,
+                                   totalConnections: totalConns)
+            }
+        } else {
+            // Many connections: scan all to prevent incast starvation.
+            for (key, entry) in tcpEntries {
+                guard entry.connection.state == .established || entry.connection.state == .closeWait
+                      || entry.connection.state == .finWait1 || entry.connection.state == .finWait2
+                      || entry.connection.state == .lastAck else { continue }
+                flushOneConnection(key: key, conn: entry.connection, hostMAC: hostMAC,
+                                   transport: &transport, io: io, nowUs: freshNowUs,
+                                   totalConnections: totalConns)
+            }
         }
         stats.tcpFlushNs &+= cpuNanos() - tFlush
         dirtyConnections.removeAll(keepingCapacity: true)
@@ -987,7 +1018,8 @@ public struct NATTable {
         hostMAC: MACAddress,
         transport: inout PollingTransport,
         io: IOBuffer,
-        nowUs: UInt64
+        nowUs: UInt64,
+        totalConnections: Int = 1
     ) {
         // ── Drain sendQueue (external→VM) with inline writes ──
         // Each frame is sent immediately via sendmsg. TCP state (snd.nxt,
@@ -1011,15 +1043,13 @@ public struct NATTable {
 
             guard let epFD = transport.fdForEndpoint(conn.endpointID) else { return }
             var segCount = 0
-            let maxSegs = kMaxBatchedSegments  // 64
+            let effectiveWnd = min(conn.snd.wnd, conn.snd.cwnd)
+            // At least 2 segments/round to trigger per-2-segment ACK in VM.
+            let maxSegsPerRound = kMaxBatchedSegments
             let sndNxtBefore = conn.snd.nxt
-            // Per-segment sendmsg: VM fd is datagram-oriented — each sendmsg
-            // delivers one Ethernet frame. Batching iovecs would concatenate
-            // multiple frames into one corrupt blob.
-            while segCount < maxSegs {
+            while segCount < maxSegsPerRound {
                 let inFlight = conn.snd.nxt &- conn.snd.una
                 if inFlight == 0 { conn.snd.sndUnaSendTime = nowUs }
-                let effectiveWnd = conn.snd.wnd
                 var canSend = Int(effectiveWnd) - Int(inFlight)
 
                 // Limited Transmit (RFC 3042): on 1st/2nd dup ACK, send one
@@ -1391,9 +1421,11 @@ public struct NATTable {
         transport.registerFD(newFD, events: Int16(POLLIN), kind: .stream)
 
         let wireWin = UInt16(min(synSeg.window >> conn.ourWindowScale, 65535))
-        // SYN options: WSCALE
+        // SYN options: MSS + WSCALE. VM uses TCP timestamps; subtract 20 for TS+SACK.
+        let vmMSS = mss - 20
         var synOpts: [UInt8] = [
-            3, 3, conn.ourWindowScale,  // WSCALE (3)
+            2, 4, UInt8(vmMSS >> 8), UInt8(vmMSS & 0xFF),  // MSS
+            3, 3, conn.ourWindowScale,  // WSCALE
         ]
         while synOpts.count % 4 != 0 { synOpts.append(1) }  // NOP padding
         let synTcpHdrLen = 20 + synOpts.count
@@ -1580,9 +1612,14 @@ public struct NATTable {
             let hdrLen: Int
             var synAckTcpHdrLen: Int = 20
             if isSynAck {
-                // SYN-ACK options: WSCALE
+                // SYN-ACK options: MSS + WSCALE.
+                // VM enables TCP timestamps (+12 bytes) by default, so the
+                // effective MSS is MTU-20(IP)-20(TCP)-12(ts) = MTU-52.
+                // Our send path uses MTU-40 since we don't set timestamps.
+                let vmMSS = mss - 20  // 1440 for MTU 1500; headroom for TS+SACK
                 var opts: [UInt8] = [
-                    3, 3, conn.ourWindowScale,  // WSCALE (3)
+                    2, 4, UInt8(vmMSS >> 8), UInt8(vmMSS & 0xFF),  // MSS
+                    3, 3, conn.ourWindowScale,  // WSCALE
                 ]
                 while opts.count % 4 != 0 { opts.append(1) }  // NOP padding
                 synAckTcpHdrLen = 20 + opts.count

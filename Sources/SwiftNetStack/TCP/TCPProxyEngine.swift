@@ -497,6 +497,190 @@ struct TCPProxyEngine {
 
         return (needsCleanup, cleanupFD)
     }
+
+    // MARK: - Per-segment FSM processing helpers
+
+    /// Process the ACK side effects after FSM advances snd.una:
+    /// send queue dequeue, congestion window growth, RTT measurement, RTO re-arm.
+    mutating func processACK(
+        conn: TCPConnection,
+        unaDelta: Int,
+        oldUna: UInt32,
+        nowUs: UInt64,
+        totalConnections: Int,
+        stats: inout NATStats
+    ) {
+        // SYN flag uses 1 seq number but has no sendQueue byte.
+        if !conn.snd.synAcked {
+            conn.snd.synAcked = true
+            if unaDelta > 1 {
+                conn.ackSendBuf(delta: unaDelta - 1)
+            }
+        } else {
+            conn.ackSendBuf(delta: unaDelta)
+        }
+        conn.dupAckCount = 0
+        conn.lastAckValue = conn.snd.una
+        conn.snd.nonRecoveryRtxCount = 0
+
+        // RFC 5681 slow start: cwnd += MSS per ACK.
+        let n = UInt32(max(1, totalConnections))
+        let cap = max(UInt32(6 * mss), conn.snd.wnd &* 8 / n)
+        if conn.snd.cwnd < conn.snd.ssthresh {
+            conn.snd.cwnd = min(
+                conn.snd.cwnd &+ UInt32(mss),
+                min(conn.snd.wnd, cap))
+        }
+        conn.snd.sndUnaSendTime = conn.rtoSendTime
+
+        // RFC 6298 RTT measurement
+        let measurable = conn.rtoMeasuredSeq != 0
+            && (conn.snd.una &- conn.rtoMeasuredSeq) < (1 << 31)
+        if measurable, !conn.rtoIsRetransmit {
+            let sampleRTT = nowUs &- conn.rtoSendTime
+            let srtt = conn.srtt
+            if srtt == 0 {
+                conn.srtt = sampleRTT
+                conn.rttvar = sampleRTT >> 1
+            } else {
+                let delta = sampleRTT > srtt ? sampleRTT &- srtt : srtt &- sampleRTT
+                conn.rttvar = conn.rttvar &- (conn.rttvar >> 2) &+ (delta >> 2)
+                conn.srtt = srtt &- (srtt >> 3) &+ (sampleRTT >> 3)
+            }
+            let minRTTVar = max(100_000, conn.rttvar << 2)
+            conn.rtoValue = clampRTO(conn.srtt &+ minRTTVar)
+            conn.rtoBackoffCount = 0
+            stats.rttSamples += 1
+        }
+        conn.rtoMeasuredSeq = 0
+        conn.rtoIsRetransmit = false
+
+        // Restart RTO timer if data still in flight
+        let inFlight = conn.snd.nxt &- conn.snd.una
+        if inFlight > 0 {
+            conn.rtoDeadline = monotonicMicros() &+ conn.rtoValue
+        } else {
+            conn.rtoDeadline = 0
+        }
+    }
+
+    /// Track duplicate ACKs and trigger fast retransmit when threshold reached.
+    /// Returns true if retransmit was attempted.
+    mutating func checkRetransmit(
+        conn: TCPConnection,
+        seg: TCPSegmentInfo,
+        payloadLen: Int,
+        unaDelta: Int,
+        nowUs: UInt64,
+        hostMAC: MACAddress,
+        transport: inout PollingTransport,
+        io: IOBuffer,
+        stats: inout NATStats
+    ) -> Bool {
+        if unaDelta > 0 { return false }
+
+        // Track pure ACKs that didn't advance snd.una
+        if seg.flags.isAck, !seg.flags.isSyn, payloadLen == 0 {
+            let ackVal = seg.ack
+            if ackVal == conn.lastAckValue, conn.lastAckValue != 0 {
+                let (sum, didOverflow) = conn.dupAckCount.addingReportingOverflow(1 as UInt8)
+                if !didOverflow { conn.dupAckCount = sum }
+            } else {
+                conn.lastAckValue = ackVal
+                conn.dupAckCount = 1
+            }
+        }
+
+        // Loss-tolerant fast retransmit on 3 dup ACKs
+        let inFlight = conn.snd.nxt &- conn.snd.una
+        guard conn.dupAckCount >= 3, inFlight > 0 else { return false }
+
+        if conn.snd.nonRecoveryRtxCount == 0 {
+            conn.snd.nonRecoveryRtxCount = 1
+            conn.snd.lastNonRecoveryRtxTime = nowUs
+            stats.tcpFastRecovery += 1
+        } else {
+            let elapsed = nowUs &- conn.snd.lastNonRecoveryRtxTime
+            let minInterval = conn.srtt > 0 ? conn.srtt : 200_000
+            guard elapsed > minInterval else { return false }
+            conn.snd.nonRecoveryRtxCount += 1
+            conn.snd.lastNonRecoveryRtxTime = nowUs
+            stats.tcpFastRecovery += 1
+        }
+        retransmitHole(from: conn, hostMAC: hostMAC,
+                       transport: &transport, io: io, stats: &stats)
+        return true
+    }
+
+    /// Send segments produced by the FSM response (`toSend`).
+    /// Handles delayed ACK batching and immediate non-ACK segment writes.
+    mutating func sendFSMResponses(
+        conn: TCPConnection,
+        toSend: TCPSegmentResult,
+        key: NATKey,
+        srcMAC: MACAddress,
+        endpointID: Int,
+        nowUs: UInt64,
+        hostMAC: MACAddress,
+        transport: inout PollingTransport,
+        io: IOBuffer,
+        stats: inout NATStats,
+        pcap: PCAPWriter?
+    ) {
+        toSend.forEach { segToSend in
+            if segToSend.flags == .ack {
+                if conn.pendingDelayedACK {
+                    if conn.delayedACKAck == segToSend.ack {
+                        _ = buildAckFrame(
+                            conn: conn, seq: conn.delayedACKSeq,
+                            ack: conn.delayedACKAck,
+                            window: wireWindow(conn.delayedACKWindow, scale: conn.ourWindowScale),
+                            io: io, transport: &transport, stats: &stats, pcap: pcap
+                        )
+                        stats.ackFlushedImmediate += 1
+                    } else {
+                        stats.ackOverwritten += 1
+                    }
+                }
+                stats.ackDeferred += 1
+                conn.pendingDelayedACK = true
+                conn.delayedACKDeadline = nowUs + 500  // delayedACKMicros
+                conn.delayedACKSeq = segToSend.seq
+                conn.delayedACKAck = conn.rcv.nxt
+                conn.delayedACKWindow = conn.availableWindow
+            } else {
+                if conn.pendingDelayedACK {
+                    _ = buildAckFrame(
+                        conn: conn, seq: conn.delayedACKSeq,
+                        ack: conn.delayedACKAck,
+                        window: wireWindow(conn.delayedACKWindow, scale: conn.ourWindowScale),
+                        io: io, transport: &transport, stats: &stats, pcap: pcap
+                    )
+                    stats.ackFlushedImmediate += 1
+                    conn.pendingDelayedACK = false
+                }
+                let hdrOfs = buildTCPHeader(
+                    io: io, hostMAC: hostMAC, dstMAC: srcMAC,
+                    srcIP: key.dstIP, dstIP: key.vmIP,
+                    srcPort: key.dstPort, dstPort: key.vmPort,
+                    seqNumber: segToSend.seq, ackNumber: segToSend.ack,
+                    flags: segToSend.flags,
+                    window: wireWindow(conn.availableWindow, scale: conn.ourWindowScale))
+                if hdrOfs >= 0 {
+                    finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
+                        srcIP: key.dstIP, dstIP: key.vmIP,
+                        payloadPtr: nil, payloadLen: 0)
+                    if let pw = pcap {
+                        let hdrPtr = io.output.baseAddress!.advanced(by: hdrOfs)
+                        pw.writeRaw(framePtr: hdrPtr, len: 54)
+                    }
+                    _ = transport.writeSingleFrame(endpointID: endpointID, io: io,
+                                                  hdrOfs: hdrOfs, hdrLen: 54,
+                                                  payPtr: nil, payLen: 0)
+                }
+            }
+        }
+    }
 }
 
 // MARK: - External packet capture helper

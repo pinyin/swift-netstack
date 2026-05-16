@@ -278,7 +278,7 @@ public struct DNSServer {
 // MARK: - UDP frame builder (IOBuffer-based)
 
 /// Build a complete Ethernet+IPv4+UDP+payload frame in IOBuffer.output and
-/// add to outBatch. Used by DNSServer for all DNS reply paths.
+/// add to outBatch. Uses the shared buildUDPFrame for header+payload construction.
 private func buildUDPFrameInIO(
     hostMAC: MACAddress, dstMAC: MACAddress,
     srcIP: IPv4Address, dstIP: IPv4Address,
@@ -286,41 +286,13 @@ private func buildUDPFrameInIO(
     payload: [UInt8], endpointID: Int,
     io: IOBuffer, outBatch: OutBatch
 ) {
-    let udpTotalLen = 8 + payload.count
-    let ipTotalLen = 20 + udpTotalLen
-    let frameLen = 14 + ipTotalLen
-
-    guard let ptr = io.allocOutput(frameLen) else { return }
-    let ofs = ptr - io.output.baseAddress!
-
-    // Ethernet
-    dstMAC.write(to: ptr)
-    hostMAC.write(to: ptr.advanced(by: 6))
-    writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
-
-    // IPv4
-    let ipPtr = ptr.advanced(by: ethHeaderLen)
-    writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
-                    srcIP: srcIP, dstIP: dstIP)
-
-    // UDP
-    let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
-    writeUInt16BE(srcPort, to: udpPtr)
-    writeUInt16BE(dstPort, to: udpPtr.advanced(by: 2))
-    writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
-    writeUInt16BE(0, to: udpPtr.advanced(by: 6))
-
-    // Payload
-    payload.withUnsafeBytes { buf in
-        udpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: buf.count)
-    }
-
-    // UDP checksum
-    let ck = computeUDPChecksum(
-        pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
-        udpData: udpPtr, udpLen: udpTotalLen
-    )
-    writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
+    let frameLen = 14 + 20 + 8 + payload.count
+    guard let ofs = payload.withUnsafeBytes({ buf in
+        buildUDPFrame(io: io, dstMAC: dstMAC, srcMAC: hostMAC,
+                      srcIP: srcIP, dstIP: dstIP,
+                      srcPort: srcPort, dstPort: dstPort,
+                      payloadPtr: buf.baseAddress!, payloadLen: buf.count)
+    }) else { return }
 
     let idx = outBatch.count
     guard idx < outBatch.maxFrames else { return }

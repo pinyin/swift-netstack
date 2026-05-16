@@ -47,42 +47,13 @@ public struct DHCPServer {
         pools[endpointID] = pool
         guard let (dhcpBytes, yiaddr) = result else { return nil }
 
-        // Build complete Ethernet+IPv4+UDP+DHCP frame in IOBuffer.output
-        let udpTotalLen = 8 + dhcpBytes.count
-        let ipTotalLen = 20 + udpTotalLen
-        let frameLen = 14 + ipTotalLen
-
-        guard let ptr = io.allocOutput(frameLen) else { return nil }
-        let ofs = ptr - io.output.baseAddress!
-
-        // Ethernet
-        srcMAC.write(to: ptr)
-        hostMAC.write(to: ptr.advanced(by: 6))
-        writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
-
-        // IPv4
-        let ipPtr = ptr.advanced(by: ethHeaderLen)
-        writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
-                        srcIP: pool.gateway, dstIP: yiaddr)
-
-        // UDP
-        let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
-        writeUInt16BE(67, to: udpPtr)
-        writeUInt16BE(68, to: udpPtr.advanced(by: 2))
-        writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
-        writeUInt16BE(0, to: udpPtr.advanced(by: 6))
-
-        // DHCP payload
-        dhcpBytes.withUnsafeBytes { buf in
-            udpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: buf.count)
-        }
-
-        // UDP checksum
-        let ck = computeUDPChecksum(
-            pseudoSrcAddr: pool.gateway, pseudoDstAddr: yiaddr,
-            udpData: udpPtr, udpLen: udpTotalLen
-        )
-        writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
+        let frameLen = 14 + 20 + 8 + dhcpBytes.count
+        guard let ofs = dhcpBytes.withUnsafeBytes({ buf in
+            buildUDPFrame(io: io, dstMAC: srcMAC, srcMAC: hostMAC,
+                          srcIP: pool.gateway, dstIP: yiaddr,
+                          srcPort: 67, dstPort: 68,
+                          payloadPtr: buf.baseAddress!, payloadLen: buf.count)
+        }) else { return nil }
 
         return (ofs, frameLen, endpointID)
     }

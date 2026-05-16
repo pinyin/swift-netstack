@@ -499,117 +499,15 @@ public struct NATTable {
             }
             let unaDelta = Int(entry.connection.snd.una &- oldUna)
             if unaDelta > 0 {
-                // SYN flag uses 1 seq number but has no sendQueue byte.
-                // Skip it on the first ACK so we don't dequeue real data.
-                if !entry.connection.snd.synAcked {
-                    entry.connection.snd.synAcked = true
-                    if unaDelta > 1 {
-                        entry.connection.ackSendBuf(delta: unaDelta - 1)
-                    }
-                } else {
-                    entry.connection.ackSendBuf(delta: unaDelta)
-                }
-                entry.connection.dupAckCount = 0
-                entry.connection.lastAckValue = entry.connection.snd.una
-                entry.connection.snd.nonRecoveryRtxCount = 0  // new hole position, reset escalation
-                // RFC 5681 slow start: cwnd += MSS per ACK.
-                // Adaptive cap: scales inversely with total connections to
-                // prevent incast. 1 conn → full window; 32 conns → window/8.
-                let n = UInt32(max(1, tcpEntries.count))
-                // Floor at 3×MSS: ensures 2+ segments/round for immediate ACK.
-                let cap = max(UInt32(6 * mss),
-                    entry.connection.snd.wnd &* 8 / n)
-                if entry.connection.snd.cwnd < entry.connection.snd.ssthresh {
-                    entry.connection.snd.cwnd = min(
-                        entry.connection.snd.cwnd &+ UInt32(mss),
-                        min(entry.connection.snd.wnd, cap))
-                }
-                // Approximate send time of the new oldest in-flight segment.
-                // Uses rtoSendTime (time of last send) as a conservative proxy —
-                // errs on the side of reordering tolerance.
-                entry.connection.snd.sndUnaSendTime = entry.connection.rtoSendTime
-
-                // RFC 6298 RTT measurement: compute sample if we have a valid send timestamp
-                // and this ACK acknowledges new (non-retransmitted) data.
-                let measurable = entry.connection.rtoMeasuredSeq != 0
-                    && (entry.connection.snd.una &- entry.connection.rtoMeasuredSeq) < (1 << 31)
-                if measurable, !entry.connection.rtoIsRetransmit {
-                    let sampleRTT = freshNowUs &- entry.connection.rtoSendTime
-                    let srtt = entry.connection.srtt
-                    let rttvar = entry.connection.rttvar
-                    if srtt == 0 {
-                        entry.connection.srtt = sampleRTT
-                        entry.connection.rttvar = sampleRTT >> 1
-                    } else {
-                        // RFC 6298 §2: SRTT = 7/8*SRTT + 1/8*R', RTTVAR = 3/4*RTTVAR + 1/4*|SRTT - R'|
-                        let delta = sampleRTT > srtt ? sampleRTT &- srtt : srtt &- sampleRTT
-                        entry.connection.rttvar = rttvar &- (rttvar >> 2) &+ (delta >> 2)
-                        entry.connection.srtt = srtt &- (srtt >> 3) &+ (sampleRTT >> 3)
-                    }
-                    // RFC 6298 §2.4: RTO = SRTT + max(G, 4*RTTVAR), G = 100ms clock granularity
-                    let minRTTVar = max(100_000, entry.connection.rttvar << 2)
-                    entry.connection.rtoValue = clampRTO(entry.connection.srtt &+ minRTTVar)
-                    entry.connection.rtoBackoffCount = 0
-                    stats.rttSamples += 1
-                }
-                entry.connection.rtoMeasuredSeq = 0
-                entry.connection.rtoIsRetransmit = false
-
-                // Restart RTO timer if there's still data in flight.
-                // Keep rtoSendTime from flushOneConnection (the actual send time)
-                // so RTT samples don't include local processing delay.
-                let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
-                if inFlight > 0 {
-                    entry.connection.rtoDeadline = monotonicMicros() &+ entry.connection.rtoValue
-                } else {
-                    entry.connection.rtoDeadline = 0
-                }
-            } else if seg.flags.isAck, !seg.flags.isSyn, payloadLen == 0 {
-                // Pure ACK that didn't advance snd.una — track dup ACKs (RFC 5681)
-                // Use seg.ack (the received ACK value), not snd.una, so that
-                // ACKs with different ack values aren't conflated as duplicates.
-                let ackVal = seg.ack
-                if ackVal == entry.connection.lastAckValue, entry.connection.lastAckValue != 0 {
-                    let (sum, didOverflow) = entry.connection.dupAckCount.addingReportingOverflow(1 as UInt8)
-                    if !didOverflow { entry.connection.dupAckCount = sum }
-                } else {
-                    entry.connection.lastAckValue = ackVal
-                    entry.connection.dupAckCount = 1
-                }
+                tcpEngine.processACK(
+                    conn: entry.connection, unaDelta: unaDelta,
+                    oldUna: oldUna, nowUs: freshNowUs,
+                    totalConnections: tcpEntries.count, stats: &stats)
             }
-            // Loss-tolerant fast retransmit.
-            // virtio-net has zero real congestion — all apparent "loss" is
-            // buffer pressure, not network congestion. On 3 dup ACKs,
-            // retransmit snd.una immediately.
-            let inFlight = entry.connection.snd.nxt &- entry.connection.snd.una
-            let unaAdvanced = unaDelta > 0
-            var doRetransmit = false
-            if entry.connection.dupAckCount >= 3 && !unaAdvanced, inFlight > 0 {
-                if entry.connection.snd.nonRecoveryRtxCount == 0 {
-                    // First retransmit for this hole: immediate.
-                    entry.connection.snd.nonRecoveryRtxCount = 1
-                    entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
-                    stats.tcpFastRecovery += 1
-                    doRetransmit = true
-                } else {
-                    // Already retransmitted this hole. Retransmit again
-                    // at most once per RTT (srtt-based interval).
-                    let elapsed = freshNowUs &- entry.connection.snd.lastNonRecoveryRtxTime
-                    let minInterval = entry.connection.srtt > 0
-                        ? entry.connection.srtt
-                        : 200_000
-                    if elapsed > minInterval {
-                        entry.connection.snd.nonRecoveryRtxCount += 1
-                        entry.connection.snd.lastNonRecoveryRtxTime = freshNowUs
-                        stats.tcpFastRecovery += 1
-                        doRetransmit = true
-                    }
-                }
-            }
-            if doRetransmit {
-                retransmitHole(from: entry.connection, hostMAC: hostMAC,
-                               transport: &transport, io: io)
-            }
+            _ = tcpEngine.checkRetransmit(
+                conn: entry.connection, seg: seg, payloadLen: payloadLen,
+                unaDelta: unaDelta, nowUs: freshNowUs,
+                hostMAC: hostMAC, transport: &transport, io: io, stats: &stats)
             // Trim OOO buffer past acknowledged data
             if entry.connection.rcv.nxt != oldRcvNxt {
                 entry.connection.trimOOO(rcvNxt: entry.connection.rcv.nxt)
@@ -653,59 +551,11 @@ public struct NATTable {
                 entry.connection.pendingExternalFin = true
             }
 
-            toSend.forEach { segToSend in
-                if segToSend.flags == .ack {
-                    // Delayed ACK (RFC 1122): batch ACKs to reduce overhead.
-                    // On virtio-net (lossless, sub-100µs RTT), sending an ACK
-                    // for every segment doubles CPU cost at 5+ Gbps without
-                    // improving throughput.
-                    if entry.connection.pendingDelayedACK {
-                        // RFC 5681: duplicate ACKs MUST be sent immediately so
-                        // the sender can count them for fast retransmit.
-                        if entry.connection.delayedACKAck == segToSend.ack {
-                            _ = buildAckFrame(
-                                conn: entry.connection, seq: entry.connection.delayedACKSeq,
-                                ack: entry.connection.delayedACKAck,
-                                window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                                io: io, transport: &transport
-                            )
-                            stats.ackFlushedImmediate += 1
-                        } else {
-                            stats.ackOverwritten += 1
-                        }
-                    }
-                    stats.ackDeferred += 1
-                    entry.connection.pendingDelayedACK = true
-                    entry.connection.delayedACKDeadline = freshNowUs + delayedACKMicros
-                    entry.connection.delayedACKSeq = segToSend.seq
-                    entry.connection.delayedACKAck = entry.connection.rcv.nxt
-                    entry.connection.delayedACKWindow = entry.connection.availableWindow
-                } else {
-                    // Non-ACK segment — flush any pending delayed ACK first
-                    if entry.connection.pendingDelayedACK {
-                        _ = buildAckFrame(
-                            conn: entry.connection, seq: entry.connection.delayedACKSeq,
-                            ack: entry.connection.delayedACKAck,
-                            window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale),
-                            io: io, transport: &transport
-                        )
-                        stats.ackFlushedImmediate += 1
-                        entry.connection.pendingDelayedACK = false
-                    }
-                    let hdrOfs = buildTCPHeader(
-                        io: io, hostMAC: hostMAC, dstMAC: srcMAC,
-                        srcIP: key.dstIP, dstIP: key.vmIP,
-                        srcPort: key.dstPort, dstPort: key.vmPort,
-                        seqNumber: segToSend.seq, ackNumber: segToSend.ack,
-                        flags: segToSend.flags, window: wireWindow(entry.connection.availableWindow, scale: entry.connection.ourWindowScale))
-                    if hdrOfs >= 0 {
-                        finalizeTCPChecksum(io: io, hdrOfs: hdrOfs,
-                            srcIP: key.dstIP, dstIP: key.vmIP,
-                            payloadPtr: nil, payloadLen: 0)
-                        _ = addTCPOutput(hdrOfs: hdrOfs, endpointID: ep, io: io, transport: &transport)
-                    }
-                }
-            }
+            tcpEngine.sendFSMResponses(
+                conn: entry.connection, toSend: toSend,
+                key: key, srcMAC: srcMAC, endpointID: ep,
+                nowUs: freshNowUs, hostMAC: hostMAC,
+                transport: &transport, io: io, stats: &stats, pcap: externalPcap)
 
             dirtyConnections.insert(key)
 
@@ -1065,42 +915,13 @@ public struct NATTable {
         payload: [UInt8], endpointID: Int,
         io: IOBuffer, transport: inout PollingTransport
     ) {
-        let udpTotalLen = 8 + payload.count
-        let ipTotalLen = 20 + udpTotalLen
-        let frameLen = 14 + ipTotalLen
-
-        guard let ptr = io.allocOutput(frameLen) else { return }
-        let ofs = ptr - io.output.baseAddress!
-
-        // Ethernet
-        dstMAC.write(to: ptr)
-        hostMAC.write(to: ptr.advanced(by: 6))
-        writeUInt16BE(EtherType.ipv4.rawValue, to: ptr.advanced(by: 12))
-
-        // IPv4
-        let ipPtr = ptr.advanced(by: ethHeaderLen)
-        writeIPv4Header(to: ipPtr, totalLength: UInt16(ipTotalLen), protocol: .udp,
-                        srcIP: srcIP, dstIP: dstIP)
-
-        // UDP
-        let udpPtr = ipPtr.advanced(by: ipv4HeaderLen)
-        writeUInt16BE(srcPort, to: udpPtr)
-        writeUInt16BE(dstPort, to: udpPtr.advanced(by: 2))
-        writeUInt16BE(UInt16(udpTotalLen), to: udpPtr.advanced(by: 4))
-        writeUInt16BE(0, to: udpPtr.advanced(by: 6))
-
-        // Payload
-        payload.withUnsafeBytes { buf in
-            udpPtr.advanced(by: 8).copyMemory(from: buf.baseAddress!, byteCount: buf.count)
-        }
-
-        // UDP checksum
-        let ck = computeUDPChecksum(
-            pseudoSrcAddr: srcIP, pseudoDstAddr: dstIP,
-            udpData: udpPtr, udpLen: udpTotalLen
-        )
-        writeUInt16BE(ck, to: udpPtr.advanced(by: 6))
-
+        let frameLen = 14 + 20 + 8 + payload.count
+        guard let ofs = payload.withUnsafeBytes({ buf in
+            buildUDPFrame(io: io, dstMAC: dstMAC, srcMAC: hostMAC,
+                          srcIP: srcIP, dstIP: dstIP,
+                          srcPort: srcPort, dstPort: dstPort,
+                          payloadPtr: buf.baseAddress!, payloadLen: buf.count)
+        }) else { return }
         _ = transport.writeSingleFrame(endpointID: endpointID, io: io,
                                         hdrOfs: ofs, hdrLen: frameLen,
                                         payPtr: nil, payLen: 0)

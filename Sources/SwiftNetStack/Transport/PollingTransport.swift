@@ -214,16 +214,19 @@ public struct PollingTransport {
                 switch kind {
                 case .stream:
                     var isListener = false
-                    // Zero-copy path: recv directly into the connection's sendQueue
+                    // Zero-copy path: recv directly into the connection's sendQueue.
+                    // Advance buffer pointer after each recv to avoid overwriting.
                     if let tIdx = recvTargetFDs.firstIndex(of: fd) {
+                        var totalRead = 0
                         while true {
-                            let buf = recvTargetBufs[tIdx]
                             let cap = recvTargetCaps[tIdx]
                             guard cap > 0 else { break }
+                            let buf = recvTargetBufs[tIdx].advanced(by: totalRead)
                             stats.recvCalls += 1
                             let n = Darwin.recv(fd, buf, cap, 0)
                             if n > 0 {
-                                result.zeroCopyReads.append((fd, n))
+                                totalRead += n
+                                recvTargetCaps[tIdx] = cap - n
                             } else if n == 0 {
                                 result.streamHangup.append(fd); break
                             } else {
@@ -231,6 +234,9 @@ public struct PollingTransport {
                                 if errno == ENOTCONN { isListener = true; break }
                                 result.deadFDs.append(fd); break
                             }
+                        }
+                        if totalRead > 0 {
+                            result.zeroCopyReads.append((fd, totalRead))
                         }
                     } else {
                         // Fallback: recv into scratch buffer
